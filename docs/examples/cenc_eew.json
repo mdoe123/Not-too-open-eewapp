@@ -1,0 +1,29 @@
+{
+  "format": "eew-app-source-pack",
+  "version": 1,
+  "exportedAt": 1721300000000,
+  "exportedBy": "示例源 - CENC EEW",
+  "sources": [
+    {
+      "type": "customSource",
+      "name": "中国地震台网 EEW 预警",
+      "enabled": false,
+      "priority": 100,
+      "category": "eew",
+      "protocol": "http",
+      "endpoint": "https://your-eew-source.example.com/cenc_eew.json",
+      "pollIntervalMs": 2000,
+      "note": "示例：地震预警源。HTTP 2s 轮询。时间字段为 UTC+8 字符串，使用 Date.parse() 解析。请替换 endpoint 为实际数据源地址。",
+      "fieldMapping": {
+        "eventId": "$.EventID",
+        "originTime": "Date.parse($.OriginTime)",
+        "magnitude": "$.Magnitude",
+        "depth": "$.Depth",
+        "lat": "$.Latitude",
+        "lng": "$.Longitude",
+        "location": "$.HypoCenter",
+        "intensity": "$.MaxIntensity"
+      }
+    }
+  ]
+}

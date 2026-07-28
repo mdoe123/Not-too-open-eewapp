@@ -1,0 +1,106 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 网络通信 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- 位置权限（Task 10 引导页请求，用于计算震中距离与预估烈度） -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+    <!-- 通知权限（Android 13+ 运行时请求，Task 10 引导页请求） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- 悬浮窗（Task 7） -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- 震动（Task 8 锁屏报警） -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- 相机/闪光灯（地震预警灯光警报，DB/T 113.1-2026 标准） -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- 前台服务（Task 9 自启动占位服务 + Task 4 后台服务） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!-- 前台服务细粒度权限（Android 14+ 要求，对应 BootStarterService 的 dataSync 类型） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- 开机自启动（Task 9） -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- 唤醒锁（锁屏报警点亮屏幕） -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- 解除键盘锁（锁屏预警 Activity 自动解除无密码键盘锁） -->
+    <uses-permission android:name="android.permission.DISABLE_KEYGUARD" />
+
+    <!-- 全屏 Intent（Android 10+ 锁屏预警 Activity 通过 Notification.fullScreenIntent 启动，绕过 MIUI 后台 Activity 启动拦截） -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+
+    <!-- 定位权限（geolocation 获取用户位置，用于距离/烈度/倒计时计算） -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- 电池优化白名单（申请加入白名单，避免后台预警服务被系统杀掉） -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <application
+      android:name=".MainApplication"
+      android:label="@string/app_name"
+      android:icon="@mipmap/ic_launcher"
+      android:roundIcon="@mipmap/ic_launcher_round"
+      android:allowBackup="false"
+      android:theme="@style/AppTheme"
+      android:usesCleartextTraffic="${usesCleartextTraffic}"
+      android:supportsRtl="true">
+
+      <!-- 主界面 -->
+      <activity
+        android:name=".MainActivity"
+        android:label="@string/app_name"
+        android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+        android:launchMode="singleTask"
+        android:windowSoftInputMode="adjustResize"
+        android:exported="true">
+        <intent-filter>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent-filter>
+      </activity>
+
+      <!-- 锁屏预警 Activity（EewBackgroundService 在锁屏时启动，显示在锁屏界面之上） -->
+      <activity
+        android:name=".floatingwindow.LockScreenAlertActivity"
+        android:showWhenLocked="true"
+        android:turnScreenOn="true"
+        android:excludeFromRecents="true"
+        android:taskAffinity=""
+        android:launchMode="singleInstance"
+        android:exported="false"
+        android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+      <!-- 开机自启动广播接收器（Task 9） -->
+      <receiver
+        android:name=".autostart.BootReceiver"
+        android:enabled="true"
+        android:exported="true">
+        <intent-filter>
+            <action android:name="android.intent.action.BOOT_COMPLETED" />
+            <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+        </intent-filter>
+      </receiver>
+
+      <!-- 占位前台服务（Task 9，待 Task 4 替换为真正的 EewBackgroundService） -->
+      <service
+        android:name=".autostart.BootStarterService"
+        android:enabled="true"
+        android:exported="false"
+        android:foregroundServiceType="dataSync" />
+
+      <!-- 后台保活服务（ForegroundService + 常驻通知，防止锁屏后应用暂停） -->
+      <service
+        android:name=".background.EewBackgroundService"
+        android:enabled="true"
+        android:exported="false"
+        android:foregroundServiceType="dataSync" />
+
+    </application>
+</manifest>

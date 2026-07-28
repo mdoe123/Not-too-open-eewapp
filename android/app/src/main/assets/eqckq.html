@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>地震信息与预估烈度显示器</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        
+        body {
+            background-color: #f0f2f5;
+            color: #333;
+            line-height: 1.6;
+            overflow-x: hidden;
+            transition: background-color 0.3s ease, color 0.3s ease; /* 添加过渡效果 */
+        }
+        
+        /* 深色模式下的body样式 */
+        body.dark-mode {
+            background-color: #121212;
+            color: #e0e0e0;
+        }
+        
+        .container {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            max-width: 100%;
+        }
+        
+        .map-container {
+            height: 50vh;
+            width: 100%;
+            position: relative;
+            z-index: 1;
+        }
+        
+        #map {
+            height: 100%;
+            width: 100%;
+        }
+        /* 深色模式下的地图控件样式覆盖 */
+        body.dark-mode .leaflet-control-attribution,
+        body.dark-mode .leaflet-bar {
+            background-color: #333 !important;
+            color: #ccc;
+        }
+        body.dark-mode .leaflet-bar a {
+            color: #ccc !important;
+            background-color: #444 !important;
+        }
+        body.dark-mode .leaflet-bar a:hover {
+            background-color: #555 !important;
+        }
+        
+        .info-container {
+            height: 50vh;
+            padding: 16px;
+            overflow-y: auto;
+            background-color: white;
+            border-radius: 20px 20px 0 0;
+            box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.1);
+            transition: background-color 0.3s ease, color 0.3s ease; /* 添加过渡效果 */
+        }
+        
+        /* 深色模式下的信息容器样式 */
+        body.dark-mode .info-container {
+            background-color: #1e1e1e;
+            color: #e0e0e0;
+            box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.3);
+        }
+        
+        .earthquake-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid #eee;
+            transition: border-color 0.3s ease;
+        }
+        /* 深色模式下的标题边框 */
+        body.dark-mode .earthquake-header {
+            border-bottom: 1px solid #444;
+        }
+        
+        .magnitude {
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: #e74c3c;
+        }
+        
+        .location {
+            font-size: 1.2rem;
+            font-weight: 600;
+        }
+        
+        .details-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+        
+        .detail-card {
+            background: #f8f9fa;
+            border-radius: 12px;
+            padding: 12px;
+            text-align: center;
+            transition: background-color 0.3s ease, color 0.3s ease;
+        }
+        /* 深色模式下的详情卡片 */
+        body.dark-mode .detail-card {
+            background: #2d2d2d;
+            color: #e0e0e0;
+        }
+        
+        .detail-label {
+            font-size: 0.85rem;
+            color: #666;
+            margin-bottom: 4px;
+            transition: color 0.3s ease;
+        }
+        /* 深色模式下的标签文字 */
+        body.dark-mode .detail-label {
+            color: #aaa;
+        }
+        
+        .detail-value {
+            font-size: 1.1rem;
+            font-weight: 600;
+        }
+        
+        .section-title {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin: 16px 0 10px;
+            color: #2c3e50;
+            transition: color 0.3s ease;
+        }
+        /* 深色模式下的分区标题 */
+        body.dark-mode .section-title {
+            color: #bbbbbb;
+        }
+        
+        .safety-tips {
+            background: #fff8e1;
+            padding: 15px;
+            border-radius: 12px;
+            margin-top: 15px;
+            transition: background-color 0.3s ease, color 0.3s ease;
+        }
+        /* 深色模式下的安全提示框 */
+        body.dark-mode .safety-tips {
+            background: #332d00;
+            color: #e0e0e0;
+        }
+        
+        .tip-item {
+            display: flex;
+            align-items: flex-start;
+            margin-bottom: 10px;
+        }
+        
+        .tip-icon {
+            min-width: 24px;
+            height: 24px;
+            background: #ffc107;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 10px;
+            font-weight: bold;
+            color: white;
+        }
+        
+        .timestamp {
+            text-align: center;
+            font-size: 0.9rem;
+            color: #7f8c8d;
+            margin-top: 10px;
+            transition: color 0.3s ease;
+        }
+        /* 深色模式下的时间戳 */
+        body.dark-mode .timestamp {
+            color: #aaa;
+        }
+        
+        .intensity-legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 10px;
+            justify-content: center;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            font-size: 0.85rem;
+        }
+        
+        .legend-color {
+            width: 16px;
+            height: 16px;
+            border-radius: 3px;
+            margin-right: 5px;
+        }
+        
+        @media (max-width: 480px) {
+            .details-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .magnitude {
+                font-size: 2rem;
+            }
+            
+            .location {
+                font-size: 1rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- 地图部分 -->
+        <div class="map-container">
+            <div id="map"></div>
+        </div>
+        
+        <!-- 信息部分 -->
+        <div class="info-container">
+            <div class="earthquake-header">
+                <div class="magnitude" id="magnitude-display">6.7</div>
+                <div class="location" id="location-display">中国四川省泸定县</div>
+            </div>
+            
+            <div class="details-grid">
+                <div class="detail-card">
+                    <div class="detail-label">震源深度</div>
+                    <div class="detail-value" id="depth-display">16公里</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-label">震发时间</div>
+                    <div class="detail-value" id="time-display">2023-09-05 12:52</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-label">预估最大烈度</div>
+                    <div class="detail-value" id="max-intensity-display">Ⅷ度</div>
+                </div>
+            </div>
+            
+            <div class="section-title">预估烈度分布范围</div>
+            <div class="intensity-legend" id="intensity-legend">
+                <!-- 烈度图例将通过JavaScript生成 -->
+            </div>
+            
+            <div class="section-title">安全提示</div>
+            <div class="safety-tips">
+                <div class="tip-item">
+                    <div class="tip-icon">!</div>
+                    <div>保持冷静，迅速寻找坚固掩体躲避</div>
+                </div>
+                <div class="tip-item">
+                    <div class="tip-icon">!</div>
+                    <div>远离窗户、玻璃、吊灯等危险物品</div>
+                </div>
+                <div class="tip-item">
+                    <div class="tip-icon">!</div>
+                    <div>地震停止后，迅速撤离到开阔地带</div>
+                </div>
+                <div class="tip-item">
+                    <div class="tip-icon">!</div>
+                    <div>不要使用电梯，选择楼梯逃生</div>
+                </div>
+            </div>
+            
+            <div class="timestamp" id="update-time">最后更新: 2023-09-05 13:15:24</div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // 解析URL参数
+        const urlParams = new URLSearchParams(window.location.search);
+        
+        // 获取地震参数值，如果没有则使用默认值
+        const elat = parseFloat(urlParams.get('elat')) || 29.95;
+        const elon = parseFloat(urlParams.get('elon')) || 102.22;
+        const dph = parseFloat(urlParams.get('dph')) || 16;
+        const m = parseFloat(urlParams.get('m')) || 6.7;
+        const name = urlParams.get('name') || '四川省泸定县';
+        const time = urlParams.get('time') || '2023-09-05 12:52';
+        
+        // --- 新增：获取并应用深色模式参数 ---
+        const theme = urlParams.get('theme');
+        if (theme && theme.toLowerCase() === 'dark') {
+            document.body.classList.add('dark-mode');
+        }
+        // ---------------------------------
+        
+        // 更新页面显示
+        document.getElementById('magnitude-display').textContent = m.toFixed(1);
+        document.getElementById('location-display').textContent = name;
+        document.getElementById('depth-display').textContent = dph + '公里';
+        document.getElementById('time-display').textContent = time;
+        
+        // 更新最后更新时间
+        const now = new Date();
+        const updateTime = `${now.getFullYear()}-${(now.getMonth()+1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
+        document.getElementById('update-time').textContent = '用户最后更新: ' + updateTime;
+        
+        // 烈度计算函数
+        const calcCsis = (m, dep, dis) => {
+            if (isNaN(m) || isNaN(dep) || isNaN(dis)) return 0;
+            if (dis > 10000) return 0;
+            
+            dep = dep >= 10 ? dep : (Math.max(dep, 0) + 10) / 2;
+            
+            const r = 6371;
+            const theta = dis / r;
+            const a = r - dep;
+            const lineDis = Math.sqrt(a * a + r * r - 2 * a * r * Math.cos(theta));
+            const k = 1 - 0.7 / Math.sqrt(dep / 10);
+            const hypoDis = lineDis - k * dep;
+            
+            const ceaCsis = 1.297 * m - 4.368 * Math.log10(hypoDis + 8) + 5.363;
+            const iclCsis = 1.363 * m - 1.494 * Math.log(hypoDis) + 2.941;
+            const avg = (ceaCsis + iclCsis) / 2;
+            
+            return avg;
+        };
+        
+        // 查找特定烈度对应的距离
+        const findDistanceForIntensity = (m, dep, targetIntensity) => {
+            let low = 0;
+            let high = 10000;
+            let mid;
+            let intensity;
+            let iterations = 0;
+            
+            // 使用二分查找法
+            while (high - low > 0.1 && iterations < 100) {
+                mid = (low + high) / 2;
+                intensity = calcCsis(m, dep, mid);
+                
+                if (intensity > targetIntensity) {
+                    low = mid;
+                } else {
+                    high = mid;
+                }
+                
+                iterations++;
+            }
+            
+            return mid;
+        };
+        
+        // 计算所有烈度范围
+        const calculateIntensityRanges = (m, dep) => {
+            const results = [];
+            
+            // 计算每个烈度对应的距离
+            for (let intensity = 1; intensity <= 12; intensity++) {
+                const distance = findDistanceForIntensity(m, dep, intensity);
+                results.push({
+                    intensity: intensity,
+                    distance: distance
+                });
+            }
+            
+            return results;
+        };
+        
+        // 初始化地图
+        const map = L.map('map').setView([elat, elon], 9);
+        
+        // 添加高德地图图层
+        // 可根据需要替换为深色风格的地图瓦片URL
+        L.tileLayer('https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}', {
+            subdomains: ['1', '2', '3', '4'],
+            attribution: '&copy; <a href="https://ditu.amap.com/">高德地图</a>'
+        }).addTo(map);
+        
+        // 添加地震震中标记
+        const epicenter = L.marker([elat, elon]).addTo(map);
+        epicenter.bindPopup(`<b>震中位置</b><br>${name}`).openPopup();
+        
+        // 烈度颜色映射
+        const intensityColors = [
+            '#B3D8B2', // 1 - 绿色
+            '#7FBF7B', // 2
+            '#4DAF4A', // 3
+            '#FFEDA0', // 4 - 黄色
+            '#FED976', // 5
+            '#FEB24C', // 6 - 橙色
+            '#FD8D3C', // 7
+            '#FC4E2A', // 8 - 红色
+            '#E31A1C', // 9
+            '#BD0026', // 10 - 深红
+            '#800026', // 11
+            '#4D0000'  // 12 - 深褐色
+        ];
+        
+        // 计算烈度范围并绘制在地图上
+        const intensityRanges = calculateIntensityRanges(m, dph);
+        
+        // 找出最大烈度
+        let maxIntensity = 0;
+        intensityRanges.forEach(range => {
+            if (range.distance >= 0.5 && range.intensity > maxIntensity) {
+                maxIntensity = range.intensity;
+            }
+        });
+        
+        // 更新最大烈度显示
+        document.getElementById('max-intensity-display').textContent = 
+            maxIntensity > 0 ? `${maxIntensity}度` : '未知';
+        
+        // 绘制烈度圈
+        intensityRanges.forEach((range, index) => {
+            // 过滤掉影响半径小于0.5km的烈度等级
+            if (range.distance >= 0.5) {
+                const circle = L.circle([elat, elon], {
+                    color: intensityColors[index],
+                    fillColor: intensityColors[index],
+                    fillOpacity: 0.2,
+                    radius: range.distance * 1000 // 转换为米
+                }).addTo(map);
+                
+                // 添加烈度标签
+                const label = L.marker([
+                    elat + (range.distance / 111), 
+                    elon
+                ], {
+                    icon: L.divIcon({
+                        className: 'intensity-label',
+                        html: `<div style="background: ${intensityColors[index]}; 
+                                color: white; 
+                                padding: 2px 6px; 
+                                border-radius: 10px;
+                                font-weight: bold;
+                                font-size: 12px;">${range.intensity}</div>`,
+                        iconSize: [30, 15]
+                    })
+                }).addTo(map);
+            }
+        });
+        
+        // 添加图例
+        const legend = L.control({position: 'bottomright'});
+        legend.onAdd = function(map) {
+            const div = L.DomUtil.create('div', 'info legend');
+            div.style.backgroundColor = 'white';
+            div.style.padding = '8px';
+            div.style.borderRadius = '5px';
+            div.style.boxShadow = '0 0 5px rgba(0,0,0,0.2)';
+            // 适配深色模式
+            if (document.body.classList.contains('dark-mode')) {
+                div.style.backgroundColor = '#2d2d2d';
+                div.style.color = '#e0e0e0';
+            }
+            
+            let html = '<div style="font-weight:bold; margin-bottom:5px;">烈度图例</div>';
+            for (let i = 0; i < intensityColors.length; i++) {
+                // 过滤掉影响半径小于0.5km的烈度等级
+                if (intensityRanges[i].distance >= 0.5) {
+                    html += `<div style="margin-bottom:3px;"><span style="display:inline-block; width:12px; height:12px; background:${intensityColors[i]}; margin-right:5px; border-radius:2px;"></span> ${i+1}度</div>`;
+                }
+            }
+            
+            div.innerHTML = html;
+            return div;
+        };
+        legend.addTo(map);
+        
+        // 在信息面板生成烈度范围图例
+        const legendContainer = document.getElementById('intensity-legend');
+        intensityRanges.forEach((range, index) => {
+            // 过滤掉影响半径小于0.5km的烈度等级
+            if (range.distance >= 0.5) {
+                const item = document.createElement('div');
+                item.className = 'legend-item';
+                item.innerHTML = `
+                    <div class="legend-color" style="background:${intensityColors[index]}"></div>
+                    <div>${range.intensity}度: ${range.distance.toFixed(1)}公里</div>
+                `;
+                legendContainer.appendChild(item);
+            }
+        });
+    </script>
+</body>
+</html>

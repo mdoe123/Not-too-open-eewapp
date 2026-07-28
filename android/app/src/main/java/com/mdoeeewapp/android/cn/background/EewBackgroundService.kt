@@ -1,0 +1,1451 @@
+package com.mdoeeewapp.android.cn.background
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.ComponentCallbacks2
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.res.Configuration
+import android.app.KeyguardManager
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.provider.Settings
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import com.facebook.react.modules.core.DeviceEventManagerModule
+import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.bridge.WritableNativeMap
+import com.mdoeeewapp.android.cn.floatingwindow.LockScreenAlertActivity
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import org.json.JSONObject
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * 地震预警后台保活服务（完整锁屏预警版）
+ *
+ * 在原有 ForegroundService 保活基础上新增：
+ * 1. **customSource 数据接收**：按用户配置的 customSource 连接 WebSocket 或 HTTP 轮询
+ * 2. **后台触发悬浮窗**：App 不在前台时（锁屏/后台），收到事件并满足触发条件时
+ *    直接调用 LockScreenAlertActivity 显示锁屏预警
+ * 3. **事件转发给 JS**：通过 DeviceEventEmitter 将事件转发给 RN 层（JS 还活着时）
+ * 4. **配置存储**：通过 SharedPreferences 存储 alert/位置/customSource 配置
+ * 5. **前后台检测**：通过 ComponentCallbacks2.onTrimMemory 检测 App 进入后台
+ *
+ * 触发条件（必须全部满足）：
+ * - alert.lockScreenEnabled == true
+ * - alert.floatingWindowEnabled == true
+ * - 事件震级 >= alert.minMagnitude
+ * - 计算预估烈度 >= alert.lockScreenIntensity
+ * - App 不在前台（避免与 JS 层重复触发）
+ *
+ * 注意：当 App 在前台时，由 JS 层 useFloatingWindow 处理（保留现有逻辑）。
+ */
+class EewBackgroundService : Service() {
+
+  companion object {
+    private const val TAG = "EewBackgroundService"
+    private const val CHANNEL_ID = "eew_service"
+    private const val CHANNEL_NAME = "地震预警服务"
+    private const val NOTIFICATION_ID = 1
+    private const val NOTIFICATION_CONTENT = "持续接收预警数据"
+
+    /** fullScreenIntent 通知渠道 ID（独立高优先级渠道，用于锁屏预警 Activity 启动） */
+    private const val FULL_SCREEN_INTENT_CHANNEL_ID = "eew_full_screen_alert"
+
+    /** fullScreenIntent 通知 ID（与保活通知区分，避免互相覆盖） */
+    private const val FULL_SCREEN_INTENT_NOTIF_ID = 2
+
+    /** SharedPreferences 文件名 */
+    private const val PREFS_NAME = "eew_alert_config"
+
+    /** SharedPreferences 键：当前活跃 customSource 配置（JSON 字符串） */
+    private const val KEY_ACTIVE_CUSTOM_SOURCE = "activeCustomSource"
+
+    /** RN 事件名：转发 EEW 事件给 JS 层 */
+    private const val EVENT_EEW_EVENT = "onEewEvent"
+
+    /** RN 事件名：WebSocket/HTTP 连接状态变化 */
+    private const val EVENT_WS_STATUS = "onWsStatus"
+
+    /**
+     * 测试预警广播 action（供 ADB 触发锁屏预警测试）
+     * 用法：adb shell am broadcast -a com.mdoeeewapp.android.cn.TEST_ALERT \
+     *        --es magnitude 6.0 --es depth 15 --es lat 40.0 --es lng 116.0 --ez forceTrigger true
+     */
+    const val ACTION_TEST_ALERT = "com.mdoeeewapp.android.cn.TEST_ALERT"
+
+    /** 启动幂等标志，防止重复触发 startForeground */
+    private val started = AtomicBoolean(false)
+
+    /**
+     * 当前 App 是否在前台
+     * 通过 ComponentCallbacks2.onTrimMemory 检测：
+     * - TRIM_MEMORY_UI_HIDDEN → App 进入后台
+     * - 其他级别 → App 在前台或内存压力
+     */
+    @Volatile
+    private var appInForeground: Boolean = true
+
+    /**
+     * 当前活跃的 EewBackgroundService 实例（供 BackgroundServiceModule 调用）
+     */
+    @Volatile
+    var instance: EewBackgroundService? = null
+  }
+
+  /** 主线程 Handler */
+  private val mainHandler = Handler(Looper.getMainLooper())
+
+  /** OkHttpClient（懒加载，第一次连接时初始化） */
+  private var httpClient: OkHttpClient? = null
+
+  /** 当前活跃 customSource 配置（从 SharedPreferences 读取） */
+  private var activeSourceConfig: CustomSourceConfig? = null
+
+  /** WebSocket 实例（protocol='ws' 时使用） */
+  private var webSocket: WebSocket? = null
+
+  /** WebSocket 是否为主动关闭（避免 onClosed 触发重连） */
+  private var isManualClose = false
+
+  /** 重连定时器（WS 指数退避） */
+  private var reconnectHandler: Handler? = null
+  private var reconnectRunnable: Runnable? = null
+
+  /** 当前重连延迟（指数退避） */
+  private var reconnectDelayMs = 1000L
+
+  /** HTTP 轮询定时器（protocol='http' 时使用） */
+  private var httpPollHandler: Handler? = null
+  private var httpPollRunnable: Runnable? = null
+
+  /** 上次去重的 eventId:reportId（避免重复触发同一报告） */
+  private var lastDedupKey: String? = null
+
+  /**
+   * 已触发过悬浮窗的事件 ID（仅 eventId，不包含 originTime）。
+   *
+   * 用于独立去重"触发悬浮窗"动作：同一个事件在前台时不触发，
+   * 切到后台后仍可触发一次（只要未过期）。触发后标记，避免重复触发。
+   */
+  private var lastTriggeredEventId: String? = null
+
+  /** ComponentCallbacks2 用于检测 App 前后台切换 */
+  private var componentCallbacks: ComponentCallbacks2? = null
+
+  /** 测试预警广播接收器（供 ADB 触发锁屏预警测试） */
+  private var testAlertReceiver: BroadcastReceiver? = null
+
+  /** 锁屏状态广播接收器（监听 SCREEN_OFF / USER_PRESENT） */
+  private var screenStateReceiver: BroadcastReceiver? = null
+
+  override fun onCreate() {
+    super.onCreate()
+    Log.i(TAG, "EewBackgroundService onCreate")
+    instance = this
+    createNotificationChannel()
+    registerComponentCallbacks()
+    registerScreenStateReceiver()
+    registerTestAlertReceiver()
+  }
+
+  override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    Log.i(TAG, "EewBackgroundService onStartCommand")
+    // 幂等启动前台服务
+    if (started.compareAndSet(false, true)) {
+      startForeground(NOTIFICATION_ID, buildNotification())
+    } else {
+      try {
+        startForeground(NOTIFICATION_ID, buildNotification())
+      } catch (_: Exception) {
+        // 忽略重复 startForeground 异常
+      }
+    }
+    // 读取 customSource 配置并启动连接
+    reloadCustomSource()
+    return START_STICKY
+  }
+
+  override fun onBind(intent: Intent?): IBinder? {
+    return null
+  }
+
+  override fun onDestroy() {
+    Log.i(TAG, "EewBackgroundService onDestroy")
+    stopConnection()
+    stopBackgroundFloatingWindowTick()
+    stopAlertsFromBackground()
+    unregisterComponentCallbacks()
+    unregisterScreenStateReceiver()
+    unregisterTestAlertReceiver()
+    started.set(false)
+    instance = null
+    super.onDestroy()
+  }
+
+  // ======================== customSource 配置加载 ========================
+
+  /**
+   * 重新加载 customSource 配置并重连
+   *
+   * 由以下场景调用：
+   * - onStartCommand：服务启动时
+   * - BackgroundServiceModule.updateCustomSourceJson：JS 层配置变化时
+   *
+   * 行为：
+   * 1. 停止现有 WS/HTTP 连接
+   * 2. 从 SharedPreferences 读取 activeCustomSource JSON
+   * 3. 解析为 [CustomSourceConfig]
+   * 4. 根据 protocol 启动 WS 或 HTTP 轮询
+   */
+  fun reloadCustomSource() {
+    stopConnection()
+    val config = readCustomSourceConfig()
+    activeSourceConfig = config
+    if (config == null) {
+      Log.i(TAG, "无 activeCustomSource 配置，不建立连接")
+      emitWsStatus("disconnected", "未配置数据源")
+      return
+    }
+    Log.i(TAG, "活跃 customSource: name=${config.name} protocol=${config.protocol} endpoint=${config.endpoint}")
+    when (config.protocol) {
+      "ws" -> startWebSocket()
+      "http" -> startHttpPolling()
+      else -> {
+        Log.w(TAG, "未知协议: ${config.protocol}，不建立连接")
+        emitWsStatus("error", "未知协议: ${config.protocol}")
+      }
+    }
+  }
+
+  /**
+   * 从 SharedPreferences 读取 activeCustomSource 并解析为 [CustomSourceConfig]
+   *
+   * @returns 配置对象，无配置或解析失败返回 null
+   */
+  private fun readCustomSourceConfig(): CustomSourceConfig? {
+    val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    val json = prefs.getString(KEY_ACTIVE_CUSTOM_SOURCE, null) ?: return null
+    return try {
+      val obj = JSONObject(json)
+      val fmObj = obj.optJSONObject("fieldMapping") ?: return null
+      val mapping = FieldMapping(
+        listPath = fmObj.optString("listPath", "").ifEmpty { null },
+        eventId = fmObj.optString("eventId", ""),
+        originTime = fmObj.optString("originTime", ""),
+        magnitude = fmObj.optString("magnitude", ""),
+        depth = fmObj.optString("depth", ""),
+        lat = fmObj.optString("lat", ""),
+        lng = fmObj.optString("lng", ""),
+        location = fmObj.optString("location", ""),
+        intensity = fmObj.optString("intensity", "").ifEmpty { null },
+        isFinal = fmObj.optString("isFinal", "").ifEmpty { null },
+        isCancel = fmObj.optString("isCancel", "").ifEmpty { null },
+      )
+      // 必填字段校验
+      if (mapping.eventId.isEmpty() || mapping.originTime.isEmpty() ||
+          mapping.magnitude.isEmpty() || mapping.depth.isEmpty() ||
+          mapping.lat.isEmpty() || mapping.lng.isEmpty() ||
+          mapping.location.isEmpty()) {
+        Log.e(TAG, "fieldMapping 必填字段缺失")
+        return null
+      }
+      CustomSourceConfig(
+        name = obj.optString("name", "customSource"),
+        endpoint = obj.optString("endpoint", ""),
+        protocol = obj.optString("protocol", "ws"),
+        authToken = obj.optString("authToken", "").ifEmpty { null },
+        pollIntervalMs = obj.optLong("pollIntervalMs", 30_000L),
+        fieldMapping = mapping,
+      )
+    } catch (e: Exception) {
+      Log.e(TAG, "解析 activeCustomSource 失败: ${e.message}")
+      null
+    }
+  }
+
+  // ======================== WebSocket 连接（protocol='ws'） ========================
+
+  /**
+   * 启动 WebSocket 连接
+   *
+   * URL 来自 [CustomSourceConfig.endpoint]，鉴权通过 URL 查询参数 ?token=<authToken>。
+   * 若已连接则不重复连接。
+   */
+  private fun startWebSocket() {
+    if (webSocket != null) {
+      Log.i(TAG, "WebSocket 已存在，跳过 startWebSocket")
+      return
+    }
+    val config = activeSourceConfig ?: return
+    if (config.endpoint.isEmpty()) {
+      Log.w(TAG, "endpoint 为空，跳过 WebSocket 连接")
+      emitWsStatus("error", "endpoint 为空")
+      return
+    }
+
+    isManualClose = false
+    reconnectDelayMs = 1000L
+
+    if (httpClient == null) {
+      httpClient = OkHttpClient.Builder()
+        .pingInterval(30, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.MILLISECONDS) // WebSocket 不超时
+        .build()
+    }
+
+    val url = buildWsUrl(config.endpoint, config.authToken)
+    Log.i(TAG, "WebSocket 连接 $url")
+    emitWsStatus("connecting", "连接中: ${config.name}")
+
+    val request = Request.Builder().url(url).build()
+    webSocket = httpClient?.newWebSocket(request, object : WebSocketListener() {
+      override fun onOpen(webSocket: WebSocket, response: Response) {
+        Log.i(TAG, "WebSocket 已连接: ${config.name}")
+        reconnectDelayMs = 1000L
+        emitWsStatus("connected", "${config.name} 已连接")
+      }
+
+      override fun onMessage(webSocket: WebSocket, text: String) {
+        handleSourceData(text)
+      }
+
+      override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+        Log.e(TAG, "WebSocket 错误: ${t.message}")
+        this@EewBackgroundService.webSocket = null
+        if (!isManualClose) {
+          emitWsStatus("error", "WebSocket 错误: ${t.message}")
+          scheduleReconnect()
+        }
+      }
+
+      override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+        Log.i(TAG, "WebSocket 已关闭: $code $reason")
+        this@EewBackgroundService.webSocket = null
+        if (!isManualClose) {
+          emitWsStatus("disconnected", "WebSocket 意外断开，准备重连")
+          scheduleReconnect()
+        }
+      }
+    })
+  }
+
+  /**
+   * 构建 WS URL（追加 token 查询参数，与 JS 层 CustomSourceAdapter.buildWsUrl 行为一致）
+   */
+  private fun buildWsUrl(endpoint: String, authToken: String?): String {
+    if (authToken.isNullOrEmpty()) return endpoint
+    val sep = if (endpoint.contains("?")) "&" else "?"
+    return "${endpoint}${sep}token=${java.net.URLEncoder.encode(authToken, "UTF-8")}"
+  }
+
+  /**
+   * 指数退避重连
+   * 初始 1s，倍数 2，上限 30s
+   */
+  private fun scheduleReconnect() {
+    if (isManualClose) return
+    if (reconnectHandler == null) {
+      reconnectHandler = Handler(Looper.getMainLooper())
+    }
+    reconnectRunnable?.let { reconnectHandler?.removeCallbacks(it) }
+    val delay = reconnectDelayMs
+    Log.i(TAG, "WebSocket ${delay}ms 后重连")
+    emitWsStatus("connecting", "${delay}ms 后重连")
+    val r = Runnable {
+      if (!isManualClose) {
+        reconnectDelayMs = minOf(reconnectDelayMs * 2, 30_000L)
+        startWebSocket()
+      }
+    }
+    reconnectRunnable = r
+    reconnectHandler?.postDelayed(r, delay)
+  }
+
+  // ======================== HTTP 轮询（protocol='http'） ========================
+
+  /**
+   * 启动 HTTP 轮询
+   *
+   * - 立即拉取一次，随后按 [CustomSourceConfig.pollIntervalMs] 定时轮询
+   * - 首次拉取成功后上报 connected
+   */
+  private fun startHttpPolling() {
+    val config = activeSourceConfig ?: return
+    if (config.endpoint.isEmpty()) {
+      Log.w(TAG, "endpoint 为空，跳过 HTTP 轮询")
+      emitWsStatus("error", "endpoint 为空")
+      return
+    }
+
+    if (httpClient == null) {
+      httpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .build()
+    }
+
+    if (httpPollHandler == null) {
+      httpPollHandler = Handler(Looper.getMainLooper())
+    }
+
+    val intervalMs = config.pollIntervalMs.coerceAtLeast(1000L)
+    Log.i(TAG, "HTTP 轮询启动: ${config.name} interval=${intervalMs}ms")
+    emitWsStatus("connecting", "连接中: ${config.name}")
+
+    val r = object : Runnable {
+      override fun run() {
+        pollHttpOnce()
+        // 调度下次轮询
+        httpPollHandler?.postDelayed(this, intervalMs)
+      }
+    }
+    httpPollRunnable = r
+    httpPollHandler?.post(r) // 立即执行第一次
+  }
+
+  /**
+   * 执行一次 HTTP 拉取（在后台线程）
+   *
+   * 鉴权：添加 Authorization: Bearer <authToken> 请求头（与 JS 层一致）
+   */
+  private fun pollHttpOnce() {
+    val config = activeSourceConfig ?: return
+    Thread {
+      try {
+        val requestBuilder = Request.Builder().url(config.endpoint)
+          .addHeader("Accept", "application/json")
+        if (!config.authToken.isNullOrEmpty()) {
+          requestBuilder.addHeader("Authorization", "Bearer ${config.authToken}")
+        }
+        val response = httpClient?.newCall(requestBuilder.build())?.execute()
+        val body = response?.body?.string()
+        response?.close()
+        if (body != null) {
+          handleSourceData(body)
+        }
+      } catch (e: Exception) {
+        Log.e(TAG, "HTTP 轮询失败: ${e.message}")
+        emitWsStatus("error", "拉取失败: ${e.message}")
+      }
+    }.start()
+  }
+
+  // ======================== 停止连接 ========================
+
+  /**
+   * 停止当前所有连接（WS + HTTP 轮询）
+   *
+   * 用于 [reloadCustomSource] 重连前清理、[onDestroy] 服务销毁时释放资源。
+   */
+  private fun stopConnection() {
+    isManualClose = true
+    // 取消 WS 重连
+    reconnectRunnable?.let { reconnectHandler?.removeCallbacks(it) }
+    reconnectRunnable = null
+    // 关闭 WS
+    try {
+      webSocket?.close(1000, "Service destroyed")
+    } catch (_: Exception) {
+      // 忽略关闭异常
+    }
+    webSocket = null
+
+    // 取消 HTTP 轮询
+    httpPollRunnable?.let { httpPollHandler?.removeCallbacks(it) }
+    httpPollRunnable = null
+
+    activeSourceConfig = null
+  }
+
+  // ======================== 事件处理 ========================
+
+  /**
+   * 处理 WS/HTTP 收到的数据
+   *
+   * 1. 按 fieldMapping 解析为 [ParsedCencEvent]
+   * 2. 去重（同 eventId + reportId 不重复处理）
+   * 3. 转发给 JS 层（通过 DeviceEventEmitter）
+   * 4. 如果 App 不在前台，判断触发条件并启动 LockScreenAlertActivity
+   *
+   * @param text 原始数据文本（JSON）
+   */
+  private fun handleSourceData(text: String) {
+    val config = activeSourceConfig ?: return
+    val event = EewAlertEngine.parseWithMapping(text, config.fieldMapping) ?: return
+    Log.i(TAG, "收到事件 eventId=${event.eventId} mag=${event.magnitude} cancel=${event.isCancel} appInForeground=$appInForeground originTime=${event.originTime}")
+
+    // 转发去重（取消报独立去重）：同一报告不重复转发给 JS 层
+    val dedupKey = if (event.isCancel) "${event.eventId}:cancel" else "${event.eventId}:${event.originTime}"
+    val isNewReport = dedupKey != lastDedupKey
+    Log.i(TAG, "去重检查: dedupKey=$dedupKey isNewReport=$isNewReport lastDedupKey=$lastDedupKey")
+    if (isNewReport) {
+      lastDedupKey = dedupKey
+      // 转发给 JS 层（仅新报告转发）
+      emitEewEvent(event, config)
+    }
+
+    // 取消报：不触发悬浮窗（JS 层处理显示"地震预警取消"）
+    if (event.isCancel) {
+      if (isNewReport) Log.i(TAG, "取消报，不触发悬浮窗")
+      return
+    }
+
+    // 如果 App 在前台，由 JS 层 useFloatingWindow 处理（避免重复触发）
+    if (appInForeground) {
+      if (isNewReport) Log.i(TAG, "App 在前台，由 JS 层处理悬浮窗")
+      return
+    }
+
+    // 触发去重：同一 eventId 只触发一次悬浮窗
+    // （前台收到时不触发也不标记，切到后台后仍可触发一次）
+    if (event.eventId == lastTriggeredEventId) {
+      Log.i(TAG, "事件 ${event.eventId} 已触发过悬浮窗，跳过")
+      return
+    }
+
+    // App 不在前台，检查触发条件并触发悬浮窗
+    Log.i(TAG, "App 在后台，开始检查触发条件: appInForeground=$appInForeground eventId=${event.eventId}")
+    if (tryTriggerFloatingWindow(event)) {
+      lastTriggeredEventId = event.eventId
+    }
+  }
+
+  /**
+   * 检查触发条件并触发悬浮窗（App 不在前台时调用）
+   *
+   * 触发条件：
+   * - alert.lockScreenEnabled == true
+   * - alert.floatingWindowEnabled == true
+   * - 事件震级 >= alert.minMagnitude
+   * - 计算预估烈度 >= alert.lockScreenIntensity
+   */
+  private fun tryTriggerFloatingWindow(event: ParsedCencEvent): Boolean {
+    val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    val lockScreenEnabled = prefs.getBoolean("lockScreenEnabled", true)
+    val floatingWindowEnabled = prefs.getBoolean("floatingWindowEnabled", true)
+    if (!lockScreenEnabled || !floatingWindowEnabled) {
+      Log.i(TAG, "跳过触发: lockScreenEnabled=$lockScreenEnabled floatingWindowEnabled=$floatingWindowEnabled")
+      return false
+    }
+
+    val minMagnitude = prefs.getFloat("minMagnitude", 3.0f).toDouble()
+    if (event.magnitude < minMagnitude) {
+      Log.i(TAG, "跳过触发: 震级 ${event.magnitude} < $minMagnitude")
+      return false
+    }
+
+    val lockScreenIntensity = prefs.getFloat("lockScreenIntensity", 4.0f).toDouble()
+    val userLat = prefs.getFloat("userLat", 39.9f).toDouble()
+    val userLng = prefs.getFloat("userLng", 116.4f).toDouble()
+
+    val distance = EewAlertEngine.haversineDistance(event.lat, event.lng, userLat, userLng)
+    val intensity = EewAlertEngine.calcCsis(event.magnitude, event.depth, distance)
+
+    if (intensity < lockScreenIntensity) {
+      Log.i(TAG, "跳过触发: 烈度 $intensity < $lockScreenIntensity (mag=${event.magnitude} depth=${event.depth} distance=${distance}km userLat=$userLat userLng=$userLng evtLat=${event.lat} evtLng=${event.lng})")
+      return false
+    }
+
+    val alertLevel = EewAlertEngine.computeAlertLevelByIntensity(intensity)
+    if (alertLevel == EewAlertEngine.LEVEL_SILENT) {
+      Log.i(TAG, "跳过触发: 预警级别 silent (intensity=$intensity)")
+      return false
+    }
+
+    // 计算 S 波到达时间（使用真实 arrivalMs，不保底）
+    val arrivalMs = EewAlertEngine.computeSWaveArrivalMs(
+      event.originTime, event.lat, event.lng, userLat, userLng
+    )
+    val remainSec = ((arrivalMs - System.currentTimeMillis()) / 1000.0).toInt()
+
+    Log.i(TAG, "触发预警: mag=${event.magnitude} intensity=$intensity level=$alertLevel remain=${remainSec}s distance=${distance}km")
+
+    // 根据屏幕状态选择 UI：
+    // - 锁屏 → LockScreenAlertActivity（setShowWhenLocked，可点亮屏幕）
+    // - 不锁屏（后台）→ 悬浮窗 FloatingWindowModule（TYPE_APPLICATION_OVERLAY）
+    if (isScreenLocked()) {
+      Log.i(TAG, "屏幕已锁屏，启动 LockScreenAlertActivity")
+      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs)
+    } else {
+      Log.i(TAG, "屏幕未锁屏（后台），显示悬浮窗 FloatingWindowModule")
+      showFloatingWindowFromBackground(event, intensity, distance, alertLevel, arrivalMs)
+    }
+    return true
+  }
+
+  /**
+   * 启动 LockScreenAlertActivity 显示锁屏预警
+   *
+   * 相比 TYPE_APPLICATION_OVERLAY 悬浮窗，Activity 通过 setShowWhenLocked/setTurnScreenOn
+   * 能更可靠地显示在锁屏界面之上（兼容 MIUI/Flye 等定制 ROM）。
+   *
+   * Activity 自带倒计时 tick（每秒更新倒计时显示），无需 EewBackgroundService 维护 tick。
+   * Activity 自带声音/震动/闪光灯联动（通过 ReactContextProvider 获取原生模块）。
+   * Activity 关闭（用户点击✕或系统销毁）后自动结束预警。
+   *
+   * 警报配置（soundEnabled/vibrationEnabled/flashlightEnabled）从 SharedPreferences 读取，
+   * 通过 Intent extras 传入 Activity，避免 Activity 直接依赖 SharedPreferences（解耦）。
+   *
+   * @param event 地震事件
+   * @param intensity 预估烈度
+   * @param distance 震中距 km
+   * @param alertLevel 预警级别（blue/yellow/orange/red）
+   * @param arrivalMs S 波到达时间戳
+   */
+  private fun startLockScreenActivity(
+    event: ParsedCencEvent,
+    intensity: Double,
+    distance: Double,
+    alertLevel: String,
+    arrivalMs: Long,
+  ) {
+    try {
+      // 读取警报配置（声音/震动/闪光灯），通过 Intent extras 传给 Activity
+      val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+      val soundEnabled = prefs.getBoolean("soundEnabled", true)
+      val vibrationEnabled = prefs.getBoolean("vibrationEnabled", true)
+      val flashlightEnabled = prefs.getBoolean("flashlightEnabled", true)
+
+      val intent = Intent(this, LockScreenAlertActivity::class.java).apply {
+        // FLAG_ACTIVITY_NEW_TASK：Service 启动 Activity 必须设置
+        // FLAG_ACTIVITY_CLEAR_TOP：如果 Activity 已存在，清除其上方的 Activity
+        // FLAG_ACTIVITY_SINGLE_TOP：如果 Activity 已存在，不重新创建
+        addFlags(
+          Intent.FLAG_ACTIVITY_NEW_TASK or
+            Intent.FLAG_ACTIVITY_CLEAR_TOP or
+            Intent.FLAG_ACTIVITY_SINGLE_TOP
+        )
+        putExtra(LockScreenAlertActivity.EXTRA_MAGNITUDE, event.magnitude)
+        putExtra(LockScreenAlertActivity.EXTRA_DEPTH, event.depth)
+        putExtra(LockScreenAlertActivity.EXTRA_INTENSITY, intensity)
+        putExtra(LockScreenAlertActivity.EXTRA_DISTANCE, distance)
+        putExtra(LockScreenAlertActivity.EXTRA_LOCATION, event.location)
+        putExtra(LockScreenAlertActivity.EXTRA_ALERT_LEVEL, alertLevel)
+        putExtra(LockScreenAlertActivity.EXTRA_ORIGIN_TIME, event.originTime)
+        putExtra(LockScreenAlertActivity.EXTRA_ARRIVAL_MS, arrivalMs)
+        putExtra(LockScreenAlertActivity.EXTRA_SOUND_ENABLED, soundEnabled)
+        putExtra(LockScreenAlertActivity.EXTRA_VIBRATION_ENABLED, vibrationEnabled)
+        putExtra(LockScreenAlertActivity.EXTRA_FLASHLIGHT_ENABLED, flashlightEnabled)
+      }
+      Log.i(TAG, "启动 LockScreenAlertActivity: sound=$soundEnabled vibrate=$vibrationEnabled flashlight=$flashlightEnabled")
+
+      // === 双管齐下策略（适配 MIUI 等定制 ROM）===
+      // 1. 直接 startActivity：前台服务（ForegroundService）有权启动 Activity，
+      //    配合 setShowWhenLocked/setTurnScreenOn 可在锁屏上显示。
+      //    MIUI 重装后 fullScreenIntent 可能被拦截，直接 startActivity 是更可靠的首选路径。
+      // 2. 同时发送 fullScreenIntent 通知作为后备：若 startActivity 被拦截，
+      //    系统可能仍会通过 fullScreenIntent 启动 Activity。
+      var startActivitySuccess = false
+      try {
+        startActivity(intent)
+        startActivitySuccess = true
+        Log.i(TAG, "直接 startActivity 启动 LockScreenAlertActivity 成功")
+      } catch (e: Exception) {
+        Log.w(TAG, "直接 startActivity 失败（可能被 MIUI 拦截）: ${e.message}，尝试 fullScreenIntent 后备")
+      }
+
+      // Android 10+ 同时发送 fullScreenIntent 通知（作为后备或增强）
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        try {
+          ensureFullScreenIntentChannel()
+          val pendingIntent = PendingIntent.getActivity(
+            this,
+            FULL_SCREEN_INTENT_NOTIF_ID,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+          )
+          val notification = NotificationCompat.Builder(this, FULL_SCREEN_INTENT_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setContentTitle("地震预警")
+            .setContentText("震级 ${event.magnitude} | ${event.location}")
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setFullScreenIntent(pendingIntent, true)
+            .build()
+          val notifManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+          notifManager.notify(FULL_SCREEN_INTENT_NOTIF_ID, notification)
+          Log.i(TAG, "fullScreenIntent 通知已发送${if (startActivitySuccess) "（增强）" else "（后备）"}")
+        } catch (e: Exception) {
+          Log.w(TAG, "fullScreenIntent 通知发送失败: ${e.message}")
+        }
+      }
+    } catch (e: Exception) {
+      Log.e(TAG, "启动 LockScreenAlertActivity 失败: ${e.message}")
+    }
+  }
+
+  /**
+   * 判断屏幕是否处于锁屏状态
+   *
+   * 通过 KeyguardManager.isKeyguardLocked() 判断（API 1+，兼容所有版本）。
+   * 返回 true 表示键盘锁激活（屏幕已锁屏），false 表示未锁屏（可能屏幕点亮或熄灭但未锁屏）。
+   */
+  private fun isScreenLocked(): Boolean {
+    val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+    return keyguardManager?.isKeyguardLocked ?: false
+  }
+
+  /**
+   * 在不锁屏（后台）时显示悬浮窗预警
+   *
+   * 通过 ReactContextProvider 获取 FloatingWindowModule 实例，
+   * 调用 showFromBackground() 显示悬浮窗。
+   *
+   * 悬浮窗使用 TYPE_APPLICATION_OVERLAY，叠加在所有应用之上（但不覆盖锁屏）。
+   * 适用于 App 在后台、屏幕未锁屏的场景（如用户在使用其他 App）。
+   *
+   * 注意：悬浮窗的倒计时更新由 JS 层 useFloatingWindow 的 tick 机制维护，
+   * 但后台时 JS 层可能被挂起，因此原生层需自行维护 tick 更新悬浮窗内容。
+   * 此处启动后台 tick 定时器，每秒更新悬浮窗倒计时，直到倒计时归零。
+   *
+   * @param event 地震事件
+   * @param intensity 预估烈度
+   * @param distance 震中距 km
+   * @param alertLevel 预警级别（blue/yellow/orange/red）
+   * @param arrivalMs S 波到达时间戳
+   */
+  private fun showFloatingWindowFromBackground(
+    event: ParsedCencEvent,
+    intensity: Double,
+    distance: Double,
+    alertLevel: String,
+    arrivalMs: Long,
+  ) {
+    val module = ReactContextProvider.floatingWindowModule
+    if (module == null) {
+      Log.w(TAG, "FloatingWindowModule 未初始化，回退到 LockScreenAlertActivity")
+      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs)
+      return
+    }
+
+    // 检查悬浮窗权限
+    if (!Settings.canDrawOverlays(this)) {
+      Log.w(TAG, "无悬浮窗权限（SYSTEM_ALERT_WINDOW），回退到 LockScreenAlertActivity")
+      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs)
+      return
+    }
+
+    // 构建悬浮窗内容（WritableNativeMap 实现 ReadableMap 接口，可直接传给 showFromBackground）
+    val content = buildFloatingWindowContent(event, intensity, distance, alertLevel, arrivalMs)
+    try {
+      // 设置关闭回调：用户点击✕关闭悬浮窗时，停止警报和 tick
+      module.onClosedCallback = {
+        Log.i(TAG, "用户关闭后台悬浮窗，停止警报和 tick")
+        stopBackgroundFloatingWindowTick()
+        stopAlertsFromBackground()
+      }
+      module.showFromBackground(content)
+      Log.i(TAG, "悬浮窗已显示（后台）: mag=${event.magnitude} intensity=$intensity level=$alertLevel")
+
+      // 启动后台 tick 定时器，每秒更新悬浮窗倒计时
+      startBackgroundFloatingWindowTick(event, intensity, distance, alertLevel, arrivalMs)
+
+      // 触发声音/震动/闪光灯警报（与 LockScreenAlertActivity 行为一致）
+      triggerAlertsFromBackground(intensity)
+    } catch (e: Exception) {
+      Log.e(TAG, "显示悬浮窗失败: ${e.message}，回退到 LockScreenAlertActivity")
+      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs)
+    }
+  }
+
+  /** 后台悬浮窗 tick 定时器 */
+  private var bgFloatingTickHandler: Handler? = null
+  private var bgFloatingTickRunnable: Runnable? = null
+  /** 后台悬浮窗倒计时是否已归零 */
+  private var bgFloatingArrived = false
+  /** 后台悬浮窗警报是否已停止（到达后继续响 -30 秒后停止） */
+  private var bgFloatingAlertsStopped = false
+
+  /**
+   * 启动后台悬浮窗 tick 定时器
+   *
+   * JS 层 useFloatingWindow 的 tick 在后台时可能被挂起，
+   * 因此原生层需自行维护 tick，每秒更新悬浮窗内容。
+   * 倒计时归零后停止 tick，停止警报，但保持悬浮窗显示（等用户手动关闭）。
+   */
+  private fun startBackgroundFloatingWindowTick(
+    event: ParsedCencEvent,
+    intensity: Double,
+    distance: Double,
+    alertLevel: String,
+    arrivalMs: Long,
+  ) {
+    // 停止旧的 tick
+    stopBackgroundFloatingWindowTick()
+
+    bgFloatingArrived = false
+    bgFloatingAlertsStopped = false
+    if (bgFloatingTickHandler == null) {
+      bgFloatingTickHandler = Handler(Looper.getMainLooper())
+    }
+
+    val r = object : Runnable {
+      override fun run() {
+        val module = ReactContextProvider.floatingWindowModule
+        if (module == null) {
+          Log.w(TAG, "后台 tick: FloatingWindowModule 已销毁，停止 tick")
+          return
+        }
+
+        val now = System.currentTimeMillis()
+        val remainSec = ((arrivalMs - now) / 1000.0).toInt()
+
+        // 更新悬浮窗内容
+        val content = buildFloatingWindowContent(event, intensity, distance, alertLevel, arrivalMs)
+        try {
+          module.updateContent(content)
+        } catch (e: Exception) {
+          Log.w(TAG, "后台 tick 更新悬浮窗失败: ${e.message}")
+        }
+
+        // 地震波已到达（remainSec <= 0）：文字已显示"地震波已到达"，警报继续响
+        if (!bgFloatingArrived && remainSec <= 0) {
+          bgFloatingArrived = true
+          Log.i(TAG, "后台悬浮窗：地震波已到达，警报继续响到 -30 秒")
+        }
+
+        // 警报持续到 -30 秒停止（只触发一次）
+        if (!bgFloatingAlertsStopped && remainSec <= -30) {
+          bgFloatingAlertsStopped = true
+          Log.i(TAG, "后台悬浮窗：警报持续 30 秒后停止声音/震动/闪光灯")
+          stopAlertsFromBackground()
+        }
+
+        // 继续下一秒 tick（即使警报停止，tick 继续更新文字"地震波已到达"，等用户手动关闭）
+        bgFloatingTickHandler?.postDelayed(this, 1000L)
+      }
+    }
+    bgFloatingTickRunnable = r
+    bgFloatingTickHandler?.post(r)
+    Log.i(TAG, "后台悬浮窗 tick 已启动")
+  }
+
+  /** 停止后台悬浮窗 tick 定时器 */
+  private fun stopBackgroundFloatingWindowTick() {
+    bgFloatingTickRunnable?.let { bgFloatingTickHandler?.removeCallbacks(it) }
+    bgFloatingTickRunnable = null
+  }
+
+  /**
+   * 构建悬浮窗内容 Map（WritableNativeMap）
+   *
+   * 字段与 useFloatingWindow.buildContent 一致：
+   * - magnitude: 震级
+   * - countdown: 剩余秒数
+   * - location: 震中位置
+   * - level: 预警级别
+   * - intensity: 预估烈度
+   * - epicenterDistance: 震中距 km
+   * - originTime: 发震时刻
+   * - isCancel: 是否取消报
+   */
+  private fun buildFloatingWindowContent(
+    event: ParsedCencEvent,
+    intensity: Double,
+    distance: Double,
+    alertLevel: String,
+    arrivalMs: Long,
+  ): com.facebook.react.bridge.WritableNativeMap {
+    val now = System.currentTimeMillis()
+    val remainSec = maxOf(((arrivalMs - now) / 1000.0).toInt(), 0)
+    val content = com.facebook.react.bridge.WritableNativeMap()
+    content.putDouble("magnitude", event.magnitude)
+    content.putInt("countdown", remainSec)
+    content.putString("location", event.location)
+    content.putString("level", alertLevel)
+    content.putDouble("intensity", intensity)
+    content.putDouble("epicenterDistance", distance)
+    content.putDouble("originTime", event.originTime.toDouble())
+    content.putBoolean("isCancel", event.isCancel)
+    return content
+  }
+
+  /**
+   * 触发声音/震动/闪光灯警报（后台悬浮窗模式）
+   *
+   * 通过 ReactContextProvider 获取原生模块实例，直接调用（不经过 RN 桥）。
+   * 警报配置从 SharedPreferences 读取。
+   *
+   * @param intensity 预估烈度（用于判断闪光灯触发阈值）
+   */
+  private fun triggerAlertsFromBackground(intensity: Double) {
+    val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    val soundEnabled = prefs.getBoolean("soundEnabled", true)
+    val vibrationEnabled = prefs.getBoolean("vibrationEnabled", true)
+    val flashlightEnabled = prefs.getBoolean("flashlightEnabled", true)
+
+    if (soundEnabled) {
+      try {
+        ReactContextProvider.soundModule?.playAlertSound()
+        Log.i(TAG, "后台声音警报已启动")
+      } catch (e: Exception) {
+        Log.w(TAG, "后台声音警报启动失败: ${e.message}")
+      }
+    }
+    if (vibrationEnabled) {
+      try {
+        ReactContextProvider.vibratorModule?.startVibratingCycle(2000, 1000)
+        Log.i(TAG, "后台震动警报已启动")
+      } catch (e: Exception) {
+        Log.w(TAG, "后台震动警报启动失败: ${e.message}")
+      }
+    }
+    // 闪光灯仅在烈度 >= 5 时触发（与 LockScreenAlertActivity 一致）
+    if (flashlightEnabled && intensity >= 5.0) {
+      try {
+        ReactContextProvider.flashlightModule?.startBlinking(1000)
+        Log.i(TAG, "后台闪光灯警报已启动 (intensity=$intensity)")
+      } catch (e: Exception) {
+        Log.w(TAG, "后台闪光灯警报启动失败: ${e.message}")
+      }
+    }
+  }
+
+  /** 停止声音/震动/闪光灯警报（后台悬浮窗模式） */
+  private fun stopAlertsFromBackground() {
+    try {
+      ReactContextProvider.soundModule?.stopAlertSound()
+    } catch (_: Exception) {}
+    try {
+      ReactContextProvider.vibratorModule?.stopVibrating()
+    } catch (_: Exception) {}
+    try {
+      ReactContextProvider.flashlightModule?.stopBlinking()
+    } catch (_: Exception) {}
+  }
+
+  /**
+   * 创建 fullScreenIntent 专用通知渠道（高优先级，绕过勿扰）
+   *
+   * 必须在发送 fullScreenIntent 通知前调用。渠道只需创建一次，重复创建无副作用。
+   */
+  private fun ensureFullScreenIntentChannel() {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+    val notifManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    if (notifManager.getNotificationChannel(FULL_SCREEN_INTENT_CHANNEL_ID) != null) return
+    val channel = NotificationChannel(
+      FULL_SCREEN_INTENT_CHANNEL_ID,
+      "地震预警全屏警报",
+      NotificationManager.IMPORTANCE_HIGH
+    ).apply {
+      description = "锁屏时全屏显示地震预警（绕过后台启动限制）"
+      lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+      setBypassDnd(true)
+      enableVibration(false) // 震动由 LockScreenAlertActivity 自管
+      setSound(null, null)   // 声音由 LockScreenAlertActivity 自管
+    }
+    notifManager.createNotificationChannel(channel)
+    Log.i(TAG, "fullScreenIntent 通知渠道已创建: $FULL_SCREEN_INTENT_CHANNEL_ID")
+  }
+
+  // ======================== ReactContext 获取 ========================
+
+  /**
+   * 获取当前 ReactApplicationContext
+   *
+   * 通过 RN 的 ReactHost 获取（RN 0.74+ API）。
+   * 若获取失败返回 null。
+   */
+  private val currentReactContext: ReactApplicationContext?
+    get() {
+      return try {
+        // 通过反射获取当前 ReactHost 的 reactContext
+        // 由于 RN API 较复杂，此处使用简单的方式：通过 Application 注册的全局引用
+        ReactContextProvider.reactApplicationContext
+      } catch (_: Exception) {
+        null
+      }
+    }
+
+  // ======================== 测试预警（供 RN/ADB 调用） ========================
+
+  /**
+   * 触发测试预警（绕过 WebSocket + 前后台检查，直接走锁屏预警触发路径）
+   *
+   * 供 BackgroundServiceModule.testAlert()（RN 按钮）和 ADB 广播调用。
+   * 测试路径与真实锁屏预警路径完全一致：
+   *   构造事件 → emitEewEvent（转发JS） → 计算烈度/距离/S波 → 启动 LockScreenAlertActivity
+   *
+   * 注意：此方法跳过 lockScreenEnabled、floatingWindowEnabled、appInForeground 检查，
+   * 但仍保留 minMagnitude 和 lockScreenIntensity 检查（避免无意义触发）。
+   * 若希望完全绕过所有检查，可使用 forceTrigger=true。
+   *
+   * @param magnitude 震级
+   * @param depth 震源深度（km）
+   * @param lat 震中纬度
+   * @param lng 震中经度
+   * @param forceTrigger 是否强制触发（绕过所有阈值检查）
+   * @return 是否触发成功
+   */
+  fun triggerTestAlert(
+    magnitude: Double,
+    depth: Double,
+    lat: Double,
+    lng: Double,
+    forceTrigger: Boolean = false,
+  ): Boolean {
+    try {
+      Log.i(TAG, "triggerTestAlert: mag=$magnitude depth=$depth lat=$lat lng=$lng force=$forceTrigger")
+
+      val event = ParsedCencEvent(
+        eventId = "test-${System.currentTimeMillis()}",
+        originTime = System.currentTimeMillis(),
+        magnitude = magnitude,
+        depth = depth,
+        lat = lat,
+        lng = lng,
+        location = "测试预警震中(${String.format("%.2f", lat)}, ${String.format("%.2f", lng)})",
+        maxIntensity = null,
+        isCancel = false,
+        isFinal = false,
+      )
+
+      // 转发给 JS 层（若 JS 仍存活），使用当前活跃源或 test 标识
+      val sourceName = activeSourceConfig?.name ?: "test"
+      emitEewEvent(event, CustomSourceConfig(
+        name = sourceName,
+        endpoint = "",
+        protocol = "test",
+        authToken = null,
+        pollIntervalMs = 0L,
+        fieldMapping = activeSourceConfig?.fieldMapping ?: FieldMapping(
+          eventId = "$.eventId",
+          originTime = "$.originTime",
+          magnitude = "$.magnitude",
+          depth = "$.depth",
+          lat = "$.lat",
+          lng = "$.lng",
+          location = "$.location",
+        ),
+      ))
+
+      val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+      val userLat = prefs.getFloat("userLat", 39.9f).toDouble()
+      val userLng = prefs.getFloat("userLng", 116.4f).toDouble()
+
+      val distance = EewAlertEngine.haversineDistance(lat, lng, userLat, userLng)
+      val intensity = EewAlertEngine.calcCsis(magnitude, depth, distance)
+      val alertLevel = EewAlertEngine.computeAlertLevelByIntensity(intensity)
+
+      Log.i(TAG, "triggerTestAlert 计算: distance=${distance.toInt()}km intensity=$intensity level=$alertLevel")
+
+      if (!forceTrigger) {
+        // 非强制：仍检查阈值（避免无意义触发，但跳过 lockScreenEnabled/floatingWindowEnabled/appInForeground）
+        val minMagnitude = prefs.getFloat("minMagnitude", 3.0f).toDouble()
+        val lockScreenIntensity = prefs.getFloat("lockScreenIntensity", 4.0f).toDouble()
+        if (magnitude < minMagnitude) {
+          Log.w(TAG, "测试预警震级 $magnitude < minMagnitude $minMagnitude，跳过（使用 forceTrigger=true 可绕过）")
+          return false
+        }
+        if (intensity < lockScreenIntensity) {
+          Log.w(TAG, "测试预警烈度 $intensity < lockScreenIntensity $lockScreenIntensity，跳过（使用 forceTrigger=true 可绕过）")
+          return false
+        }
+        if (alertLevel == EewAlertEngine.LEVEL_SILENT) {
+          Log.w(TAG, "测试预警级别 silent，跳过")
+          return false
+        }
+      }
+
+      // 计算 S 波到达时间（使用真实 arrivalMs，不保底）
+      val arrivalMs = EewAlertEngine.computeSWaveArrivalMs(
+        event.originTime, lat, lng, userLat, userLng
+      )
+      val remainSec = ((arrivalMs - System.currentTimeMillis()) / 1000.0).toInt()
+
+      Log.i(TAG, "triggerTestAlert 触发预警: mag=$magnitude intensity=$intensity level=$alertLevel remain=${remainSec}s")
+
+      // 根据屏幕状态选择 UI（与 tryTriggerFloatingWindow 一致）
+      if (isScreenLocked()) {
+        Log.i(TAG, "triggerTestAlert: 屏幕已锁屏，启动 LockScreenAlertActivity")
+        startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs)
+      } else {
+        Log.i(TAG, "triggerTestAlert: 屏幕未锁屏，显示悬浮窗 FloatingWindowModule")
+        showFloatingWindowFromBackground(event, intensity, distance, alertLevel, arrivalMs)
+      }
+      return true
+    } catch (e: Exception) {
+      Log.e(TAG, "triggerTestAlert 失败: ${e.message}")
+      return false
+    }
+  }
+
+  /**
+   * 注册测试预警广播接收器
+   *
+   * 接收 ADB 广播（使用字符串 extras，兼容所有 Android 版本，因为 --ed 在部分设备不支持）：
+   * adb shell am broadcast -a com.mdoeeewapp.android.cn.TEST_ALERT \
+   *   --es magnitude 6.0 --es depth 15 --es lat 40.0 --es lng 116.0 --ez forceTrigger true
+   *
+   * 注意：动态注册的接收器默认为 EXPORTED（Android 14+ 需显式声明 RECEIVER_EXPORTED），
+   * 因为需要接收 ADB shell 广播（系统级外部调用）。
+   */
+  private fun registerTestAlertReceiver() {
+    if (testAlertReceiver != null) return
+    val receiver = object : BroadcastReceiver() {
+      override fun onReceive(context: Context?, intent: Intent?) {
+        if (intent?.action != ACTION_TEST_ALERT) return
+        try {
+          // 使用字符串 extras（--es），兼容所有 Android 版本（--ed 在部分设备不支持）
+          val mag = intent.getStringExtra("magnitude")?.toDoubleOrNull() ?: 5.5
+          val depth = intent.getStringExtra("depth")?.toDoubleOrNull() ?: 15.0
+          val lat = intent.getStringExtra("lat")?.toDoubleOrNull() ?: 40.0
+          val lng = intent.getStringExtra("lng")?.toDoubleOrNull() ?: 116.0
+          val force = intent.getBooleanExtra("forceTrigger", false)
+          Log.i(TAG, "收到测试预警广播: mag=$mag depth=$depth lat=$lat lng=$lng force=$force")
+          triggerTestAlert(mag, depth, lat, lng, force)
+        } catch (e: Exception) {
+          Log.e(TAG, "处理测试预警广播失败: ${e.message}")
+        }
+      }
+    }
+    val filter = IntentFilter(ACTION_TEST_ALERT)
+    // Android 13+ (API 33+) 需显式声明 RECEIVER_EXPORTED 才能接收外部广播
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+    } else {
+      @Suppress("UnspecifiedRegisterReceiverFlag")
+      registerReceiver(receiver, filter)
+    }
+    testAlertReceiver = receiver
+    Log.i(TAG, "测试预警广播接收器已注册（action=$ACTION_TEST_ALERT）")
+  }
+
+  /**
+   * 注销测试预警广播接收器
+   */
+  private fun unregisterTestAlertReceiver() {
+    testAlertReceiver?.let {
+      try {
+        unregisterReceiver(it)
+      } catch (_: Exception) {
+        // 忽略未注册异常
+      }
+      testAlertReceiver = null
+    }
+  }
+
+  // ======================== RN 事件转发 ========================
+
+  /**
+   * 将 EEW 事件转发给 JS 层（通过 DeviceEventEmitter）
+   *
+   * JS 层可通过 `DeviceEventEmitter.addListener('onEewEvent', ...)` 接收。
+   * 事件负载结构（WritableMap）：
+   *   - id: String（"customSource-<host>-<eventId>"，与 JS 层 CustomSourceAdapter 一致）
+   *   - source: String（"customSource"）
+   *   - originTime: Long（Unix 毫秒）
+   *   - magnitude: Double
+   *   - depth: Double
+   *   - lat: Double
+   *   - lng: Double
+   *   - location: String
+   *   - intensity: Double?（可能为 null）
+   *   - isCancel: Boolean
+   *   - isFinal: Boolean
+   *   - receivedAt: Long（Unix 毫秒）
+   *
+   * @param event 解析后的事件
+   * @param config 当前活跃 customSource 配置（用于生成 id 前缀）
+   */
+  private fun emitEewEvent(event: ParsedCencEvent, config: CustomSourceConfig?) {
+    try {
+      val ctx = currentReactContext ?: return
+      val map = WritableNativeMap()
+      val idPrefix = "customSource-${extractHost(config?.endpoint ?: "")}"
+      map.putString("id", "$idPrefix-${event.eventId}")
+      map.putString("source", "customSource")
+      map.putDouble("originTime", event.originTime.toDouble())
+      map.putDouble("magnitude", event.magnitude)
+      map.putDouble("depth", event.depth)
+      map.putDouble("lat", event.lat)
+      map.putDouble("lng", event.lng)
+      map.putString("location", event.location)
+      event.maxIntensity?.let { map.putDouble("intensity", it) }
+      map.putBoolean("isCancel", event.isCancel)
+      map.putBoolean("isFinal", event.isFinal)
+      map.putDouble("receivedAt", System.currentTimeMillis().toDouble())
+
+      ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+        .emit(EVENT_EEW_EVENT, map)
+    } catch (e: Exception) {
+      Log.w(TAG, "emitEewEvent 失败: ${e.message}")
+    }
+  }
+
+  /**
+   * 转发 WebSocket/HTTP 连接状态给 JS 层
+   */
+  private fun emitWsStatus(status: String, message: String) {
+    try {
+      val ctx = currentReactContext ?: return
+      val map = WritableNativeMap()
+      map.putString("status", status)
+      map.putString("message", message)
+      ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+        .emit(EVENT_WS_STATUS, map)
+    } catch (_: Exception) {
+      // 忽略
+    }
+  }
+
+  // ======================== 配置更新（供 BackgroundServiceModule 调用） ========================
+
+  /**
+   * 更新 alert 配置（由 RN 层调用）
+   *
+   * @param alertMap 包含字段：minMagnitude, lockScreenIntensity, lockScreenEnabled,
+   *                 floatingWindowEnabled, soundEnabled, vibrationEnabled, flashlightEnabled,
+   *                 backgroundEnabled, autoStartEnabled
+   */
+  fun updateAlertConfig(alertMap: com.facebook.react.bridge.ReadableMap) {
+    val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+    if (alertMap.hasKey("minMagnitude")) {
+      prefs.putFloat("minMagnitude", alertMap.getDouble("minMagnitude").toFloat())
+    }
+    if (alertMap.hasKey("lockScreenIntensity")) {
+      prefs.putFloat("lockScreenIntensity", alertMap.getDouble("lockScreenIntensity").toFloat())
+    }
+    if (alertMap.hasKey("lockScreenEnabled")) {
+      prefs.putBoolean("lockScreenEnabled", alertMap.getBoolean("lockScreenEnabled"))
+    }
+    if (alertMap.hasKey("floatingWindowEnabled")) {
+      prefs.putBoolean("floatingWindowEnabled", alertMap.getBoolean("floatingWindowEnabled"))
+    }
+    if (alertMap.hasKey("soundEnabled")) {
+      prefs.putBoolean("soundEnabled", alertMap.getBoolean("soundEnabled"))
+    }
+    if (alertMap.hasKey("vibrationEnabled")) {
+      prefs.putBoolean("vibrationEnabled", alertMap.getBoolean("vibrationEnabled"))
+    }
+    if (alertMap.hasKey("flashlightEnabled")) {
+      prefs.putBoolean("flashlightEnabled", alertMap.getBoolean("flashlightEnabled"))
+    }
+    if (alertMap.hasKey("backgroundEnabled")) {
+      prefs.putBoolean("backgroundEnabled", alertMap.getBoolean("backgroundEnabled"))
+    }
+    if (alertMap.hasKey("autoStartEnabled")) {
+      prefs.putBoolean("autoStartEnabled", alertMap.getBoolean("autoStartEnabled"))
+    }
+    prefs.apply()
+    Log.i(TAG, "alert 配置已更新")
+  }
+
+  /**
+   * 更新位置配置（由 RN 层调用）
+   *
+   * @param locationMap 包含字段：userLat, userLng（用户当前位置坐标）
+   */
+  fun updateLocationConfig(locationMap: com.facebook.react.bridge.ReadableMap) {
+    val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+    if (locationMap.hasKey("userLat")) {
+      prefs.putFloat("userLat", locationMap.getDouble("userLat").toFloat())
+    }
+    if (locationMap.hasKey("userLng")) {
+      prefs.putFloat("userLng", locationMap.getDouble("userLng").toFloat())
+    }
+    prefs.apply()
+    Log.i(TAG, "位置配置已更新: lat=${locationMap.getDouble("userLat")}, lng=${locationMap.getDouble("userLng")}")
+  }
+
+  // ======================== 前后台检测 ========================
+
+  /**
+   * 注册锁屏状态广播接收器
+   *
+   * MIUI 等 ROM 上 ComponentCallbacks2.onTrimMemory(TRIM_MEMORY_UI_HIDDEN) 在锁屏时不触发，
+   * 需要监听系统锁屏广播来可靠检测：
+   * - ACTION_SCREEN_OFF：屏幕熄灭（锁屏或超时），标记 App 进入"非前台"
+   * - ACTION_USER_PRESENT：用户解锁并进入桌面，标记 App 回到"前台"
+   *
+   * 注意：SCREEN_OFF 广播只能通过动态注册接收（manifest 注册无效）。
+   */
+  private fun registerScreenStateReceiver() {
+    if (screenStateReceiver != null) return
+    val receiver = object : BroadcastReceiver() {
+      override fun onReceive(context: Context?, intent: Intent?) {
+        when (intent?.action) {
+          Intent.ACTION_SCREEN_OFF -> {
+            appInForeground = false
+            Log.i(TAG, "屏幕熄灭（ACTION_SCREEN_OFF），标记 App 进入后台")
+          }
+          Intent.ACTION_USER_PRESENT -> {
+            appInForeground = true
+            Log.i(TAG, "用户解锁（ACTION_USER_PRESENT），标记 App 回到前台")
+          }
+        }
+      }
+    }
+    val filter = IntentFilter().apply {
+      addAction(Intent.ACTION_SCREEN_OFF)
+      addAction(Intent.ACTION_USER_PRESENT)
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+    } else {
+      @Suppress("UnspecifiedRegisterReceiverFlag")
+      registerReceiver(receiver, filter)
+    }
+    screenStateReceiver = receiver
+    Log.i(TAG, "锁屏状态广播接收器已注册")
+  }
+
+  private fun unregisterScreenStateReceiver() {
+    screenStateReceiver?.let {
+      try {
+        unregisterReceiver(it)
+      } catch (_: Exception) {
+        // 忽略
+      }
+    }
+    screenStateReceiver = null
+  }
+
+  /**
+   * 注册 ComponentCallbacks2 检测 App 前后台切换
+   *
+   * onTrimMemory(TRIM_MEMORY_UI_HIDDEN) 表示 UI 已不可见（App 进入后台）。
+   * 此回调在 Activity onStop 之前触发，是检测 App 进入后台的可靠方式。
+   *
+   * 注意：进入前台无法通过此回调检测，但只要 App 还在前台，appInForeground 就保持 true。
+   * 当 App 从后台回到前台时，由 JS 层（AppState 'active'）触发 updateConfig 来同步状态。
+   * 此处简化处理：假设 AppState active 时 JS 会调用 updateConfig，我们可以
+   * 在 updateAlertConfig 时将 appInForeground 设为 true。
+   */
+  private fun registerComponentCallbacks() {
+    val cb = object : ComponentCallbacks2 {
+      override fun onConfigurationChanged(newConfig: Configuration) {}
+      override fun onLowMemory() {}
+
+      override fun onTrimMemory(level: Int) {
+        if (level == TRIM_MEMORY_UI_HIDDEN) {
+          appInForeground = false
+          Log.i(TAG, "App 进入后台（TRIM_MEMORY_UI_HIDDEN）")
+        }
+      }
+    }
+    componentCallbacks = cb
+    application.registerComponentCallbacks(cb)
+  }
+
+  private fun unregisterComponentCallbacks() {
+    componentCallbacks?.let {
+      try {
+        application.unregisterComponentCallbacks(it)
+      } catch (_: Exception) {
+        // 忽略
+      }
+    }
+    componentCallbacks = null
+  }
+
+  /**
+   * 由 RN 层调用：通知 App 已回到前台
+   *
+   * RN 层在 AppState 'active' 时调用此方法，更新 appInForeground=true。
+   * 这样下次收到事件时不会触发悬浮窗（由 JS 层处理）。
+   */
+  fun notifyAppInForeground() {
+    appInForeground = true
+    Log.i(TAG, "App 回到前台")
+  }
+
+  /**
+   * 由 RN 层调用：通知 App 已进入后台
+   *
+   * RN 层在 AppState 'background'/'inactive' 时调用此方法，更新 appInForeground=false。
+   * 这是按 Home 键切后台时最可靠的检测方式（MIUI 下 onTrimMemory 和 SCREEN_OFF 不可靠）。
+   * 这样后台收到事件时会触发锁屏预警（由原生层处理）。
+   */
+  fun notifyAppInBackground() {
+    appInForeground = false
+    Log.i(TAG, "App 进入后台（RN AppState 通知）")
+  }
+
+  // ======================== 通知 ========================
+
+  /**
+   * 创建低优先级通知渠道
+   * - IMPORTANCE_LOW：不发声、不弹窗，仅在通知栏显示
+   */
+  private fun createNotificationChannel() {
+    val channel = NotificationChannel(
+      CHANNEL_ID,
+      CHANNEL_NAME,
+      NotificationManager.IMPORTANCE_LOW,
+    ).apply {
+      description = "地震预警后台服务常驻通知"
+      setShowBadge(false)
+      enableLights(false)
+      enableVibration(false)
+    }
+    val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+    manager.createNotificationChannel(channel)
+  }
+
+  /**
+   * 构建常驻通知
+   */
+  private fun buildNotification(): Notification {
+    return NotificationCompat.Builder(this, CHANNEL_ID)
+      .setContentTitle(CHANNEL_NAME)
+      .setContentText(NOTIFICATION_CONTENT)
+      .setSmallIcon(com.mdoeeewapp.android.cn.R.mipmap.ic_launcher)
+      .setPriority(NotificationCompat.PRIORITY_LOW)
+      .setOngoing(true)
+      .setSilent(true)
+      .build()
+  }
+}
+
+/**
+ * 当前活跃 customSource 配置（从 SharedPreferences 反序列化）
+ *
+ * 与 JS 层 `SourceConfig` 接口对应，仅保留原生层需要的字段。
+ */
+private data class CustomSourceConfig(
+  /** 数据源名称（用于日志和状态显示） */
+  val name: String,
+  /** 连接端点 URL（WS 或 HTTP） */
+  val endpoint: String,
+  /** 协议：'ws'（WebSocket）或 'http'（HTTP 轮询） */
+  val protocol: String,
+  /** 鉴权 token（可选），WS 追加 ?token= 查询参数，HTTP 添加 Bearer 头 */
+  val authToken: String?,
+  /** HTTP 轮询间隔（毫秒，仅 protocol='http' 使用） */
+  val pollIntervalMs: Long,
+  /** 字段映射配置 */
+  val fieldMapping: FieldMapping,
+)
+
+/**
+ * 从 URL 中提取主机名（用于事件 id 前缀）
+ *
+ * 与 JS 层 `CustomSourceAdapter.extractHost` 行为一致：
+ * wss://api.example.com/path → api.example.com
+ * https://example.com:8080/api → example.com
+ * invalid-url → invalid-url
+ */
+private fun extractHost(url: String): String {
+  return try {
+    val noProto = url.replace(Regex("^[a-z]+://", RegexOption.IGNORE_CASE), "")
+    val host = noProto.split("/")[0].split(":")[0]
+    host.ifEmpty { "unknown" }
+  } catch (_: Exception) {
+    "unknown"
+  }
+}

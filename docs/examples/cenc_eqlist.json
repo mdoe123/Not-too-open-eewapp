@@ -1,0 +1,30 @@
+{
+  "format": "eew-app-source-pack",
+  "version": 1,
+  "exportedAt": 1721300000000,
+  "exportedBy": "示例源 - CENC Eqlist",
+  "sources": [
+    {
+      "type": "customSource",
+      "name": "中国地震台网速报列表",
+      "enabled": false,
+      "priority": 101,
+      "category": "eqlist",
+      "protocol": "http",
+      "endpoint": "https://your-eew-source.example.com/cenc_eqlist.json",
+      "pollIntervalMs": 30000,
+      "note": "示例：地震速报源。HTTP 30s 轮询。返回 No1-No50 平铺结构，用 $.No* 通配符提取为事件数组。请替换 endpoint 为实际数据源地址。",
+      "fieldMapping": {
+        "listPath": "$.No*",
+        "eventId": "$.time",
+        "originTime": "Date.parse($.time)",
+        "magnitude": "$.magnitude",
+        "depth": "$.depth",
+        "lat": "$.latitude",
+        "lng": "$.longitude",
+        "location": "$.location",
+        "intensity": "$.intensity"
+      }
+    }
+  ]
+}
