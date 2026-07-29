@@ -163,9 +163,15 @@ export function useEewStream(): UseEewStreamResult {
         // 检查是否已存在同源同事件（按 id 更新）
         const idxById = prev.findIndex(e => e.id === event.id);
         if (idxById >= 0) {
-          const updated = [...prev];
-          updated[idxById] = event;
-          return updated;
+          // 同 id 报告：保留震级较高的（用户决策：同 id 不直接覆盖）
+          const old = prev[idxById];
+          if (event.magnitude > old.magnitude) {
+            const updated = [...prev];
+            updated[idxById] = event;
+            return updated;
+          }
+          // 新报告震级 ≤ 旧报告，保留旧报告
+          return prev;
         }
 
         // 检查跨源同事件（按 dedupKey 去重，保留先到达的）

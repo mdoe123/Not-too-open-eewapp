@@ -86,6 +86,15 @@ class EewBackgroundService : Service() {
      */
     const val ACTION_TEST_ALERT = "com.mdoeeewapp.android.cn.TEST_ALERT"
 
+    /** 倒计时归零后警报继续的秒数（与 JS 层 ALERT_CONTINUE_AFTER_ARRIVAL_SEC 一致） */
+    private const val ALERT_CONTINUE_AFTER_ARRIVAL_SEC = -30
+
+    /** 并列事件与顶级事件的最大级别差（0 = 同级别才算并列，差 ≥ 1 档算大小关系） */
+    private const val PEER_LEVEL_MAX_DIFF = 0
+
+    /** 最大同时显示的悬浮窗数量 */
+    private const val MAX_DISPLAY_EVENTS = 3
+
     /** 启动幂等标志，防止重复触发 startForeground */
     private val started = AtomicBoolean(false)
 
@@ -187,6 +196,7 @@ class EewBackgroundService : Service() {
     stopConnection()
     stopBackgroundFloatingWindowTick()
     stopAlertsFromBackground()
+    backgroundEvents.clear()
     unregisterComponentCallbacks()
     unregisterScreenStateReceiver()
     unregisterTestAlertReceiver()
@@ -620,15 +630,38 @@ class EewBackgroundService : Service() {
       val vibrationEnabled = prefs.getBoolean("vibrationEnabled", true)
       val flashlightEnabled = prefs.getBoolean("flashlightEnabled", true)
 
+      // 构造事件数据（用于 addEvent 调用）
+      val eventData = LockScreenAlertActivity.LockScreenEvent(
+        eventId = event.eventId,
+        magnitude = event.magnitude,
+        depth = event.depth,
+        intensity = intensity,
+        distance = distance,
+        location = event.location,
+        alertLevel = alertLevel,
+        originTime = event.originTime,
+        arrivalMs = arrivalMs,
+      )
+
+      // === 多事件模式 ===
+      // 若 Activity 已运行，直接调用 addEvent 添加事件，无需 startActivity
+      if (LockScreenAlertActivity.isRunning()) {
+        val added = LockScreenAlertActivity.instance?.addEvent(eventData) ?: false
+        Log.i(TAG, "Activity 已运行，addEvent: eventId=${event.eventId} added=$added")
+        return
+      }
+
+      // Activity 未运行，启动 Activity（首个事件）
       val intent = Intent(this, LockScreenAlertActivity::class.java).apply {
         // FLAG_ACTIVITY_NEW_TASK：Service 启动 Activity 必须设置
         // FLAG_ACTIVITY_CLEAR_TOP：如果 Activity 已存在，清除其上方的 Activity
-        // FLAG_ACTIVITY_SINGLE_TOP：如果 Activity 已存在，不重新创建
+        // FLAG_ACTIVITY_SINGLE_TOP：如果 Activity 已存在，不重新创建，走 onNewIntent
         addFlags(
           Intent.FLAG_ACTIVITY_NEW_TASK or
             Intent.FLAG_ACTIVITY_CLEAR_TOP or
             Intent.FLAG_ACTIVITY_SINGLE_TOP
         )
+        putExtra(LockScreenAlertActivity.EXTRA_EVENT_ID, event.eventId)
         putExtra(LockScreenAlertActivity.EXTRA_MAGNITUDE, event.magnitude)
         putExtra(LockScreenAlertActivity.EXTRA_DEPTH, event.depth)
         putExtra(LockScreenAlertActivity.EXTRA_INTENSITY, intensity)
@@ -641,7 +674,7 @@ class EewBackgroundService : Service() {
         putExtra(LockScreenAlertActivity.EXTRA_VIBRATION_ENABLED, vibrationEnabled)
         putExtra(LockScreenAlertActivity.EXTRA_FLASHLIGHT_ENABLED, flashlightEnabled)
       }
-      Log.i(TAG, "启动 LockScreenAlertActivity: sound=$soundEnabled vibrate=$vibrationEnabled flashlight=$flashlightEnabled")
+      Log.i(TAG, "启动 LockScreenAlertActivity: eventId=${event.eventId} sound=$soundEnabled vibrate=$vibrationEnabled flashlight=$flashlightEnabled")
 
       // === 双管齐下策略（适配 MIUI 等定制 ROM）===
       // 1. 直接 startActivity：前台服务（ForegroundService）有权启动 Activity，
@@ -739,26 +772,109 @@ class EewBackgroundService : Service() {
       return
     }
 
-    // 构建悬浮窗内容（WritableNativeMap 实现 ReadableMap 接口，可直接传给 showFromBackground）
-    val content = buildFloatingWindowContent(event, intensity, distance, alertLevel, arrivalMs)
+    // 加入后台事件队列
+    val bgEvent = BackgroundEvent(event, intensity, distance, alertLevel, arrivalMs)
+    backgroundEvents[event.eventId] = bgEvent
+
     try {
-      // 设置关闭回调：用户点击✕关闭悬浮窗时，停止警报和 tick
-      module.onClosedCallback = {
-        Log.i(TAG, "用户关闭后台悬浮窗，停止警报和 tick")
-        stopBackgroundFloatingWindowTick()
-        stopAlertsFromBackground()
+      // 设置关闭回调：用户点击✕关闭某事件悬浮窗时，从队列移除并刷新显示
+      module.onClosedCallback = { eventId ->
+        Log.i(TAG, "用户关闭后台悬浮窗 eventId=$eventId，从队列移除")
+        backgroundEvents.remove(eventId)
+        // 如果队列空，停止 tick 和警报
+        if (backgroundEvents.isEmpty()) {
+          stopBackgroundFloatingWindowTick()
+          stopAlertsFromBackground()
+        } else {
+          // 队列非空，刷新显示（重新 setEvents）
+          refreshBackgroundFloatingWindows()
+        }
       }
-      module.showFromBackground(content)
-      Log.i(TAG, "悬浮窗已显示（后台）: mag=${event.magnitude} intensity=$intensity level=$alertLevel")
 
-      // 启动后台 tick 定时器，每秒更新悬浮窗倒计时
-      startBackgroundFloatingWindowTick(event, intensity, distance, alertLevel, arrivalMs)
+      // 刷新所有显示中的悬浮窗（按优先级排序、分组）
+      refreshBackgroundFloatingWindows()
 
-      // 触发声音/震动/闪光灯警报（与 LockScreenAlertActivity 行为一致）
-      triggerAlertsFromBackground(intensity)
+      Log.i(TAG, "悬浮窗已显示（后台多事件）: eventId=${event.eventId} mag=${event.magnitude} intensity=$intensity level=$alertLevel 队列大小=${backgroundEvents.size}")
+
+      // 启动后台 tick 定时器（如尚未启动）
+      if (bgFloatingTickRunnable == null) {
+        startBackgroundFloatingWindowTick()
+      }
+
+      // 触发声音/震动/闪光灯警报（合并一个，仅最高优先级事件决定闪光灯）
+      val topEvent = selectBackgroundDisplayEvents().firstOrNull()
+      if (topEvent != null && !bgFloatingAlertsStopped) {
+        triggerAlertsFromBackground(topEvent.intensity)
+      }
     } catch (e: Exception) {
       Log.e(TAG, "显示悬浮窗失败: ${e.message}，回退到 LockScreenAlertActivity")
       startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs)
+    }
+  }
+
+  /**
+   * 从后台事件队列中选出要显示的事件（按预警级别降序，同级别的并列，最多 3 个）
+   *
+   * 规则（与 JS 层 selectDisplayEvents 一致，用户决策）：
+   * 1. 候选过滤：用户已关闭的不显示；非取消报需 remainSec > -30（倒计时归零后 30 秒内仍算活跃，让大震独占显示）
+   * 2. 排序：预警级别降序，同级别按烈度降序
+   * 3. 分组：顶级 1 个 + 并列（与顶级同级别）最多 2 个
+   * 4. 差 ≥ 1 档的事件被顶级"压制"，等顶级 remainSec <= -30 后才会成为新顶级显示
+   * 5. 用户手动关闭顶级 → 顶级被过滤，下一级立即显示
+   */
+  private fun selectBackgroundDisplayEvents(): List<BackgroundEvent> {
+    val candidates = backgroundEvents.values.filter { bgEvent ->
+      val remainSec = ((bgEvent.arrivalMs - System.currentTimeMillis()) / 1000.0).toInt()
+      // remainSec > -30：倒计时归零后 30 秒内仍算活跃，让大震独占显示
+      // 这样小震在此时不会成为候选，直到大震 remainSec <= -30 被过滤掉
+      remainSec > ALERT_CONTINUE_AFTER_ARRIVAL_SEC || bgEvent.event.isCancel
+    }.toMutableList()
+
+    if (candidates.isEmpty()) return emptyList()
+
+    // 排序：预警级别降序，同级别按烈度降序
+    candidates.sortWith(compareByDescending<BackgroundEvent> {
+      levelOrder(it.alertLevel)
+    }.thenByDescending { it.intensity })
+
+    val top = candidates.first()
+    val topOrder = levelOrder(top.alertLevel)
+    val peers = candidates.drop(1).filter {
+      topOrder - levelOrder(it.alertLevel) <= PEER_LEVEL_MAX_DIFF
+    }
+    return listOf(top) + peers.take(MAX_DISPLAY_EVENTS - 1)
+  }
+
+  /** 预警级别转数字（用于排序） */
+  private fun levelOrder(level: String): Int = when (level) {
+    "red" -> 4
+    "orange" -> 3
+    "yellow" -> 2
+    "blue" -> 1
+    else -> 0
+  }
+
+  /**
+   * 刷新后台悬浮窗显示（调用 setEvents 批量更新）
+   */
+  private fun refreshBackgroundFloatingWindows() {
+    val module = ReactContextProvider.floatingWindowModule ?: return
+    val displayList = selectBackgroundDisplayEvents()
+    if (displayList.isEmpty()) {
+      module.hide()
+      return
+    }
+    // 构建 WritableNativeArray
+    val arr = com.facebook.react.bridge.WritableNativeArray()
+    for (bgEvent in displayList) {
+      arr.pushMap(buildFloatingWindowContent(
+        bgEvent.event, bgEvent.intensity, bgEvent.distance, bgEvent.alertLevel, bgEvent.arrivalMs
+      ))
+    }
+    try {
+      module.setEventsFromBackground(arr)
+    } catch (e: Exception) {
+      Log.w(TAG, "refreshBackgroundFloatingWindows setEventsFromBackground 失败: ${e.message}")
     }
   }
 
@@ -771,23 +887,36 @@ class EewBackgroundService : Service() {
   private var bgFloatingAlertsStopped = false
 
   /**
-   * 启动后台悬浮窗 tick 定时器
+   * 后台事件队列（多事件并发）
    *
-   * JS 层 useFloatingWindow 的 tick 在后台时可能被挂起，
-   * 因此原生层需自行维护 tick，每秒更新悬浮窗内容。
-   * 倒计时归零后停止 tick，停止警报，但保持悬浮窗显示（等用户手动关闭）。
+   * Key: eventId，Value: 该事件的计算结果（烈度/距离/级别/到达时间）
+   * 收到新事件时加入队列，用户关闭或事件过期时移除。
+   * 每次 tick 重新排序、调用 setEvents 更新所有显示中的悬浮窗。
    */
-  private fun startBackgroundFloatingWindowTick(
-    event: ParsedCencEvent,
-    intensity: Double,
-    distance: Double,
-    alertLevel: String,
-    arrivalMs: Long,
-  ) {
+  private data class BackgroundEvent(
+    val event: ParsedCencEvent,
+    val intensity: Double,
+    val distance: Double,
+    val alertLevel: String,
+    val arrivalMs: Long,
+    var arrived: Boolean = false,
+    var alertsStopped: Boolean = false,
+  )
+  private val backgroundEvents: MutableMap<String, BackgroundEvent> = LinkedHashMap()
+
+  /**
+   * 启动后台悬浮窗 tick 定时器（多事件版）
+   *
+   * 每秒遍历 backgroundEvents 队列：
+   * - 更新每个事件的 arrived/alertsStopped 状态
+   * - 调用 refreshBackgroundFloatingWindows 批量更新所有悬浮窗内容
+   * - 所有事件警报都应停止时停止警报
+   * - 队列空时停止 tick
+   */
+  private fun startBackgroundFloatingWindowTick() {
     // 停止旧的 tick
     stopBackgroundFloatingWindowTick()
 
-    bgFloatingArrived = false
     bgFloatingAlertsStopped = false
     if (bgFloatingTickHandler == null) {
       bgFloatingTickHandler = Handler(Looper.getMainLooper())
@@ -801,37 +930,53 @@ class EewBackgroundService : Service() {
           return
         }
 
+        // 队列空，停止 tick
+        if (backgroundEvents.isEmpty()) {
+          Log.i(TAG, "后台 tick: 事件队列空，停止 tick")
+          stopBackgroundFloatingWindowTick()
+          stopAlertsFromBackground()
+          return
+        }
+
         val now = System.currentTimeMillis()
-        val remainSec = ((arrivalMs - now) / 1000.0).toInt()
 
-        // 更新悬浮窗内容
-        val content = buildFloatingWindowContent(event, intensity, distance, alertLevel, arrivalMs)
-        try {
-          module.updateContent(content)
-        } catch (e: Exception) {
-          Log.w(TAG, "后台 tick 更新悬浮窗失败: ${e.message}")
+        // 遍历所有事件，更新状态
+        var allAlertsShouldStop = true
+        for (bgEvent in backgroundEvents.values) {
+          val remainSec = ((bgEvent.arrivalMs - now) / 1000.0).toInt()
+
+          // 标记归零
+          if (!bgEvent.arrived && remainSec <= 0) {
+            bgEvent.arrived = true
+            Log.i(TAG, "后台事件 ${bgEvent.event.eventId} 地震波已到达")
+          }
+
+          // 检查警报是否应停止
+          if (!bgEvent.alertsStopped && remainSec <= ALERT_CONTINUE_AFTER_ARRIVAL_SEC) {
+            bgEvent.alertsStopped = true
+            Log.i(TAG, "后台事件 ${bgEvent.event.eventId} 警报停止")
+          }
+          if (!bgEvent.alertsStopped) {
+            allAlertsShouldStop = false
+          }
         }
 
-        // 地震波已到达（remainSec <= 0）：文字已显示"地震波已到达"，警报继续响
-        if (!bgFloatingArrived && remainSec <= 0) {
-          bgFloatingArrived = true
-          Log.i(TAG, "后台悬浮窗：地震波已到达，警报继续响到 -30 秒")
-        }
-
-        // 警报持续到 -30 秒停止（只触发一次）
-        if (!bgFloatingAlertsStopped && remainSec <= -30) {
+        // 所有事件警报都应停止
+        if (allAlertsShouldStop && !bgFloatingAlertsStopped) {
           bgFloatingAlertsStopped = true
-          Log.i(TAG, "后台悬浮窗：警报持续 30 秒后停止声音/震动/闪光灯")
           stopAlertsFromBackground()
         }
 
-        // 继续下一秒 tick（即使警报停止，tick 继续更新文字"地震波已到达"，等用户手动关闭）
+        // 刷新所有悬浮窗内容
+        refreshBackgroundFloatingWindows()
+
+        // 继续下一秒 tick
         bgFloatingTickHandler?.postDelayed(this, 1000L)
       }
     }
     bgFloatingTickRunnable = r
     bgFloatingTickHandler?.post(r)
-    Log.i(TAG, "后台悬浮窗 tick 已启动")
+    Log.i(TAG, "后台悬浮窗 tick 已启动（多事件）")
   }
 
   /** 停止后台悬浮窗 tick 定时器 */
@@ -863,6 +1008,7 @@ class EewBackgroundService : Service() {
     val now = System.currentTimeMillis()
     val remainSec = maxOf(((arrivalMs - now) / 1000.0).toInt(), 0)
     val content = com.facebook.react.bridge.WritableNativeMap()
+    content.putString("eventId", event.eventId)
     content.putDouble("magnitude", event.magnitude)
     content.putInt("countdown", remainSec)
     content.putString("location", event.location)

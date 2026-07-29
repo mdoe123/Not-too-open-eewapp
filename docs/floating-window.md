@@ -4,6 +4,8 @@
 
 悬浮窗在 EEW（地震预警）事件达到 `blue` 及以上级别（预估烈度 ≥ 1）时自动显示，实时展示倒计时、震级、震中位置、震中距、发震时刻、级别提示。悬浮窗通过 Android `WindowManager + TYPE_APPLICATION_OVERLAY` 实现，填满屏幕宽度，带关闭按钮。
 
+支持**多事件并发显示**（最多 3 个事件上下垂直排列）：大震独占显示直到倒计时归零 30 秒后，同级别地震垂直并列。前台悬浮窗、后台悬浮窗、锁屏预警 Activity 三条路径全部支持多事件并发显示。详见 [多事件并发显示规则](#多事件并发显示规则)。
+
 预警级别按 DB/T 113.1-2026 标准按预估地震烈度分档：`silent / blue / yellow / orange / red`。
 
 悬浮窗支持三种触发路径：
@@ -70,22 +72,31 @@ EewBackgroundService（原生 ForegroundService）
   ├─ ComponentCallbacks2.onTrimMemory
   │    └─ TRIM_MEMORY_UI_HIDDEN 检测 App 进入后台
   └─ startLockScreenActivity()（启动 LockScreenAlertActivity，传入 sound/vibration/flashlight 配置）
-       │  双管齐下启动策略（适配 MIUI 等定制 ROM）：
+       │  多事件模式：
+       │  - 首个事件：startActivity 启动 Activity（双管齐下策略适配 MIUI）
+       │  - 后续事件：若 Activity 已运行（LockScreenAlertActivity.isRunning()），
+       │              直接调用 instance.addEvent(eventData) 添加事件，无需重启 Activity
+       │  双管齐下启动策略（适配 MIUI 等定制 ROM，仅首个事件）：
        │  1. startActivity(intent) — ForegroundService 有权启动 Activity，配合 setShowWhenLocked/setTurnScreenOn 可在锁屏显示
        │  2. Notification.fullScreenIntent — Android 10+ 同时发送高优先级通知，作为 startActivity 的增强/后备
        │     （MIUI 重装 APK 后可能拦截 fullScreenIntent，此时 startActivity 是更可靠的路径）
-       └─ LockScreenAlertActivity（独立 Activity，显示在锁屏界面之上）
+       └─ LockScreenAlertActivity（独立 Activity，显示在锁屏界面之上，支持多事件垂直排列）
             ├─ setShowWhenLocked(true)   API 27+ 锁屏之上显示
             ├─ setTurnScreenOn(true)     API 27+ 点亮屏幕
             ├─ requestDismissKeyguard()  请求解除键盘锁（仅无密码设备自动解除）
             ├─ WakeLock（SCREEN_BRIGHT_WAKE_LOCK + ACQUIRE_CAUSES_WAKEUP）
-            ├─ Handler 每秒 tick 更新倒计时
-            ├─ startAlerts()             启动声音/震动/闪光灯警报（通过 ReactContextProvider）
+            ├─ events: MutableMap<eventId, LockScreenEvent>  事件列表（按级别排序，最多 3 个）
+            ├─ onNewIntent(intent)        singleInstance 模式下接收新事件（备用路径，addEvent 是主路径）
+            ├─ addEvent(event)            添加事件并 refreshDisplay（供 EewBackgroundService 直接调用）
+            ├─ selectDisplayEvents()      选择显示事件（顶级 + 并列同级别，与悬浮窗规则一致）
+            ├─ refreshDisplay()           重建事件卡片 UI（垂直排列）
+            ├─ Handler 每秒 tick 更新所有事件倒计时（updateAllCountdowns）
+            ├─ startAlerts()             启动声音/震动/闪光灯警报（合并一个，通过 ReactContextProvider）
             │    ├─ SoundModule.playAlertSound()        循环播放警报主音
             │    ├─ VibratorModule.startVibratingCycle(2000, 1000)  循环震动（振2s+默1s）
-            │    └─ FlashlightModule.startBlinking(1000) 循环闪烁（仅烈度 ≥ 5）
-            ├─ stopAlerts()              停止声音/震动/闪光灯（倒计时归零或 onDestroy 时）
-            └─ ✕ 按钮 → finish()
+            │    └─ FlashlightModule.startBlinking(1000) 循环闪烁（仅最高级别事件烈度 ≥ 5）
+            ├─ stopAlerts()              停止声音/震动/闪光灯（所有事件到达后 -30 秒或 onDestroy 时）
+            └─ ✕ 按钮 → 移除该事件卡片（其他事件继续显示，所有事件关闭后 finish()）
 ```
 
 **fullScreenIntent 通知渠道**（独立于保活通知）：
@@ -396,6 +407,74 @@ if (remain <= 0) {
     FlashlightManager.stopBlinking();
   }
   return;  // 不自动隐藏
+}
+```
+
+## 多事件并发显示规则
+
+当同时收到多个不同地震的预警时，悬浮窗按以下规则显示（用户决策）。
+
+### 核心规则
+
+1. **候选过滤**：未被用户手动关闭 + `remain > -30`（倒计时归零后 30 秒内仍算活跃）；取消报（`isCancel=true`）不受此限制
+2. **排序**：按预警级别降序（red > orange > yellow > blue），同级别按预估烈度降序
+3. **顶级事件**：候选中级别最高的那一个，显示在最上方
+4. **并列事件**：与顶级**同级别**（差 0 档）的其他事件，最多 2 个，显示在下方
+5. **大小压制**：差 ≥ 1 档的事件被顶级"压制"不显示，等顶级 `remain <= -30` 后才让下一级显示
+6. **手动关闭**：用户点✕关闭顶级事件后，顶级被过滤，下一级事件**立即**显示
+
+### 场景示例
+
+**场景 1：大震 + 小震（级别差 ≥ 1 档）**
+
+| 时刻 | 大震 remain | 小震 remain | 显示 |
+|------|------------|------------|------|
+| 倒计时中 | 30s | 20s | 仅大震 |
+| 大震归零 | -5s | 15s | 仅大震（显示"地震波已到达"） |
+| 大震归零后 29s | -29s | 1s | 仅大震（仍独占显示） |
+| 大震归零后 30s | -30s | 0s | 大震被过滤，显示小震（如果还有倒计时） |
+| 大震归零后 31s | -31s | -1s | 小震也被过滤，无显示 |
+
+**场景 2：差不多大的地震（同级别）**
+
+两个 red 级别地震同时预警 → 上下垂直排列两个悬浮窗（顶级在上，并列在下）。
+
+**场景 3：用户手动关闭顶级**
+
+大震(red) + 小震(blue) 同时预警，用户点✕关闭大震 → 大震标记 `userDismissed`，小震**立即**显示。
+
+### 关键参数
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `PEER_LEVEL_MAX_DIFF` | 0 | 并列事件与顶级最大级别差（0 = 同级别才算并列） |
+| `MAX_DISPLAY_EVENTS` | 3 | 最大同时显示悬浮窗数（1 顶级 + 2 并列） |
+| `ALERT_CONTINUE_AFTER_ARRIVAL_SEC` | -30 | 倒计时归零后继续显示/警报的秒数阈值 |
+
+### 实现位置
+
+| 层 | 文件 | 函数 |
+|----|------|------|
+| 前台（JS） | `src/hooks/useFloatingWindow.ts` | `selectDisplayEvents()` |
+| 后台（原生） | `EewBackgroundService.kt` | `selectBackgroundDisplayEvents()` |
+| 锁屏（原生） | `LockScreenAlertActivity.kt` | `selectDisplayEvents()` |
+
+三层逻辑完全一致，确保前台/后台/锁屏切换时显示行为统一。
+
+### 同 ID 预警报告处理
+
+同一事件 ID 的多次报告（震级可能随测算更新）**不直接覆盖**，保留震级较高的那个（在 `useEewStream.mergeEvent` 中实现）：
+
+```typescript
+const idxById = prev.findIndex(e => e.id === event.id);
+if (idxById >= 0) {
+  const old = prev[idxById];
+  if (event.magnitude > old.magnitude) {
+    const updated = [...prev];
+    updated[idxById] = event;
+    return updated;
+  }
+  return prev;  // 新报告震级 ≤ 旧报告，保留旧报告
 }
 ```
 

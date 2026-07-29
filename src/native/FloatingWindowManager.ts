@@ -8,6 +8,8 @@ const {FloatingWindowModule} = NativeModules;
 
 /** 悬浮窗内容字段 */
 export interface FloatingWindowContent {
+  /** 事件 ID（多事件并发时用于区分不同事件，必填） */
+  eventId: string;
   /** 震级 */
   magnitude: number;
   /** S 波到达剩余秒数 */
@@ -27,25 +29,56 @@ export interface FloatingWindowContent {
 }
 
 /**
- * 悬浮窗管理器
+ * 悬浮窗管理器（多事件并发版）
+ *
+ * 支持最多 3 个悬浮窗上下垂直排列。
+ * 推荐使用 setEvents 批量设置显示中的事件列表，自动处理新增/更新/移除。
  *
  * 所有方法在非 Android 平台返回安全默认值，调用方无需关心平台差异。
  */
 export const FloatingWindowManager = {
-  /** 显示悬浮窗 */
+  /**
+   * 显示或更新单个事件的悬浮窗
+   * @param content 包含 eventId 字段，若该事件已存在则更新，否则新建
+   */
   show(content: FloatingWindowContent): Promise<void> {
     if (Platform.OS !== 'android') return Promise.resolve();
     return FloatingWindowModule?.show(content) ?? Promise.resolve();
   },
-  /** 隐藏悬浮窗 */
+  /** 隐藏所有悬浮窗 */
   hide(): Promise<void> {
     if (Platform.OS !== 'android') return Promise.resolve();
     return FloatingWindowModule?.hide() ?? Promise.resolve();
   },
-  /** 更新悬浮窗内容（不重建窗口） */
+  /**
+   * 隐藏指定事件的悬浮窗（不影响其他事件）
+   * @param eventId 要隐藏的事件 ID
+   */
+  hideOne(eventId: string): Promise<void> {
+    if (Platform.OS !== 'android') return Promise.resolve();
+    return FloatingWindowModule?.hideOne(eventId) ?? Promise.resolve();
+  },
+  /**
+   * 更新指定事件的内容（不重建窗口）
+   * @param content 包含 eventId 字段
+   */
   updateContent(content: FloatingWindowContent): Promise<void> {
     if (Platform.OS !== 'android') return Promise.resolve();
     return FloatingWindowModule?.updateContent(content) ?? Promise.resolve();
+  },
+  /**
+   * 批量设置显示中的事件列表（替代多次 show/hideOne 调用）
+   * @param contents 由上层排序后的内容数组（最多 3 个）
+   *
+   * 行为：
+   * - 新增 eventId → 创建 View
+   * - 已存在 eventId → 更新内容
+   * - 不在列表中的已显示 eventId → 移除
+   * - 重新排列所有 View 的 y 偏移
+   */
+  setEvents(contents: FloatingWindowContent[]): Promise<void> {
+    if (Platform.OS !== 'android') return Promise.resolve();
+    return FloatingWindowModule?.setEvents(contents) ?? Promise.resolve();
   },
   /** 检查是否有悬浮窗权限 */
   hasPermission(): Promise<boolean> {

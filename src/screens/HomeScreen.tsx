@@ -71,21 +71,27 @@ export default function HomeScreen({navigation}: HomeScreenProps) {
     manualLng: locationConfig.manualLng,
   });
 
-  // 预警级别按预估地震烈度分档（DB/T 113.1-2026 标准）
-  // 需先计算震中距与烈度，再映射为 silent/blue/yellow/orange/red
-  const alertLevel: AlertLevel = useMemo(() => {
-    if (!latestEvent || !userLocation) {
-      return 'silent';
+  // 多事件并发支持：活跃事件列表 + 每个事件对应的预警级别
+  // - activeEvents：当前所有 eew 事件（按 originTime 降序），传给 useFloatingWindow 用于排序分组显示
+  // - alertLevels：每个事件 id 对应的预警级别，由震中距→烈度→级别映射得到
+  //   （DB/T 113.1-2026 标准：silent/blue/yellow/orange/red）
+  const activeEvents = eewStream.events;
+  const alertLevels = useMemo(() => {
+    const map: Record<string, AlertLevel> = {};
+    if (!userLocation) return map;
+    for (const evt of activeEvents) {
+      const dist = haversineDistance(evt.lat, evt.lng, userLocation.lat, userLocation.lng);
+      const intensity = calcCsis(evt.magnitude, evt.depth || 0, dist);
+      map[evt.id] = computeAlertLevelByIntensity(intensity);
     }
-    const dist = haversineDistance(
-      latestEvent.lat,
-      latestEvent.lng,
-      userLocation.lat,
-      userLocation.lng,
-    );
-    const intensity = calcCsis(latestEvent.magnitude, latestEvent.depth || 0, dist);
-    return computeAlertLevelByIntensity(intensity);
-  }, [latestEvent, userLocation]);
+    return map;
+  }, [activeEvents, userLocation]);
+
+  // 兼容字段：最新事件的单事件预警级别（仅用于日志/调试，悬浮窗已改用 alertLevels 多事件逻辑）
+  const alertLevel: AlertLevel = useMemo(() => {
+    if (!latestEvent || !userLocation) return 'silent';
+    return alertLevels[latestEvent.id] ?? 'silent';
+  }, [latestEvent, userLocation, alertLevels]);
 
   // 标题栏位置小字：GPS 定位中 / 坐标 / 手动坐标
   const locationLabel = useMemo(() => {
@@ -100,8 +106,8 @@ export default function HomeScreen({navigation}: HomeScreenProps) {
   }, [isMock, userLocation, locationConfig.mode]);
 
   useFloatingWindow({
-    event: latestEvent,
-    alertLevel,
+    events: activeEvents,
+    alertLevels,
     userLocation,
     soundEnabled: alertConfig.soundEnabled,
     vibrationEnabled: alertConfig.vibrationEnabled,
