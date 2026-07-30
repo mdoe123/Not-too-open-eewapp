@@ -105,7 +105,7 @@ export const AGREEMENT_SUMMARY = `本应用（NTOEEW）是一款地震预警辅�
  */
 export const AGREEMENT_FULL = `# 用户协议（User Agreement）
 
-最后更新日期：2026-07-28
+最后更新日期：2026-07-30
 
 欢迎使用 NTOEEW（Not Too Open EEW App，以下简称"本应用"）。请在使用本应用前仔细阅读本用户协议（以下简称"本协议"）。安装、复制或以其他方式使用本应用，即表示您已阅读并同意接受本协议的全部条款。如您不同意本协议的任何条款，请立即停止使用本应用并删除。
 
