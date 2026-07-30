@@ -1,6 +1,6 @@
 # NTOEEW (Not Too Open EEW App)
 
-> 本项目由 **GLM-5.2** 制作
+> 本项目由 **GLM-5.2** 制作 在探究目前ai能把app制作到什么程度
 
 [![License: LGPL v3](https://img.shields.io/badge/License-LGPL_v3-blue.svg)](https://www.gnu.org/licenses/lgpl-3.0)
 [![React Native](https://img.shields.io/badge/React%20Native-0.86.0-61DAFB.svg)](https://reactnative.dev/)
