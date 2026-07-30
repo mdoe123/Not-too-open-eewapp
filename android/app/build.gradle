@@ -90,9 +90,8 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
-        // 显式禁止明文 HTTP 流量，防止中间人篡改预警数据
-        // 仅 debug 构建按需放开（如本地调试用 HTTP）
-        manifestPlaceholders = [usesCleartextTraffic: false]
+        // 明文 HTTP 流量策略由 res/xml/network_security_config.xml 统一管理
+        // 不在 manifestPlaceholders 中设置 usesCleartextTraffic
     }
     signingConfigs {
         debug {
@@ -105,8 +104,6 @@ android {
     buildTypes {
         debug {
             signingConfig signingConfigs.debug
-            // debug 构建允许明文流量，便于本地调试（如本地 HTTP 数据源）
-            manifestPlaceholders = [usesCleartextTraffic: true]
         }
         release {
             // Caution! In production, you need to generate your own keystore file.
