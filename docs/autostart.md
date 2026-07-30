@@ -60,31 +60,31 @@ src/
 - **通知渠道**：`eew_service`，名称"地震预警服务"，重要性 `IMPORTANCE_LOW`（不发声、不弹窗）。
 - **通知内容**：`"持续接收预警数据"`，常驻 `setOngoing(true)`，`setSilent(true)`。
 - **onCreate**：创建渠道、注册 ComponentCallbacks2、设置 instance 引用。
-- **onStartCommand**：`startForeground` + 调用 `reloadCustomSource()` 按 customSource 配置启动 WS/HTTP 连接，返回 `START_STICKY`（被杀后系统自动重启）。
+- **onStartCommand**：`startForeground` + 调用 `reloadCustomSources()` 按 customSources 多源配置启动所有 WS/HTTP 连接，返回 `START_STICKY`（被杀后系统自动重启）。
 - **onBind**：返回 `null`（不允许绑定）。
 - **启动方式**：
   - App 启动时由 RN 侧 `BackgroundServiceModule.start()` 主动启动（当 `backgroundEnabled=true`）
   - 开机时由 `BootReceiver` 启动
 
-**锁屏预警能力**（v13+ 合规改造）：
-- **OkHttp WebSocket / HTTP 客户端**：按 `customSource.protocol` 选择连接方式，从 SharedPreferences 读取 `activeCustomSource` 配置，独立于 RN JS 层（锁屏时不被系统暂停）
-- **指数退避重连**（WS）：初始 1s，倍数 2，上限 30s
+**锁屏预警能力**（v13+ 合规改造，多源并行模式）：
+- **OkHttp WebSocket / HTTP 客户端**：按 `customSource.protocol` 选择连接方式，从 SharedPreferences 读取 `customSources` JSON 数组配置，为每个源创建独立的 `SourceConnection` 实例，独立于 RN JS 层（锁屏时不被系统暂停）
+- **指数退避重连**（WS）：初始 1s，倍数 2，上限 30s（每个源独立维护重连状态）
 - **心跳超时**（HTTP）：`max(pollIntervalMs * 3, 10000ms)`
-- **配置热更新**：`reloadCustomSource()` 停止旧连接 → 读新配置 → 启动新连接
-- **事件处理**：`handleSourceData()` 调用 `EewAlertEngine.parseWithMapping(raw, fieldMapping)` 解析 → 转发 JS → 启动 LockScreenAlertActivity（App 不在前台时）
+- **配置热更新**：`reloadCustomSources()` 停止所有旧连接 → 读新配置数组 → 为每个源启动新连接
+- **事件处理**：`handleSourceData(text, config)` 调用 `EewAlertEngine.parseWithMapping(raw, fieldMapping)` 解析 → 转发 JS → 启动 LockScreenAlertActivity（App 不在前台时）
 - **前后台检测**：`ComponentCallbacks2.onTrimMemory(TRIM_MEMORY_UI_HIDDEN)` 检测 App 进入后台
 - **事件转发**：通过 `DeviceEventEmitter` 发送 `onEewEvent` 和 `onWsStatus` 事件给 JS 层
-- **配置存储**：从 `SharedPreferences`（`eew_alert_config` 文件）读取 alert 配置、用户位置和 activeCustomSource
-- **触发条件检查**：`tryTriggerFloatingWindow()` 检查 lockScreenEnabled、floatingWindowEnabled、minMagnitude、lockScreenIntensity、预警级别、S 波到达、App 前后台状态
+- **配置存储**：从 `SharedPreferences`（`eew_alert_config` 文件）读取 alert 配置、用户位置和 customSources（多源 JSON 数组）
+- **触发条件检查**：`tryTriggerFloatingWindow(event, sourceName)` 检查 lockScreenEnabled、floatingWindowEnabled、minMagnitude、lockScreenIntensity、预警级别、S 波到达、App 前后台状态
 - **锁屏显示**：启动 `LockScreenAlertActivity`（配置 `setShowWhenLocked(true)`），显示在锁屏界面之上，自带倒计时 tick
 
 **配置同步方法**（供 BackgroundServiceModule 调用）：
 - `updateAlertConfig(ReadableMap)`：更新 alert 配置到 SharedPreferences
 - `updateLocationConfig(ReadableMap)`：更新用户位置到 SharedPreferences
-- `updateCustomSourceJson(String?)`：写入/删除 `activeCustomSource` 配置，并触发 `reloadCustomSource()` 热更新连接
+- `updateCustomSourcesJson(String?)`：写入/删除 `customSources` 多源配置（JSON 数组），并触发 `reloadCustomSources()` 热更新所有连接
 - `notifyAppInForeground()`：设置 `appInForeground=true`，避免后台重复触发悬浮窗
 
-> 注：实际配置写入由 `BackgroundServiceModule` 直接操作 SharedPreferences，不依赖 Service 实例是否存活。Service 仅在触发悬浮窗时读取 SharedPreferences。customSource 配置变更会立即触发 `reloadCustomSource()` 热更新连接（若 Service 已启动）。
+> 注：实际配置写入由 `BackgroundServiceModule` 直接操作 SharedPreferences，不依赖 Service 实例是否存活。Service 仅在触发悬浮窗时读取 SharedPreferences。customSource 配置变更会立即触发 `reloadCustomSources()` 热更新所有连接（若 Service 已启动）。
 
 > 原 `BootStarterService.kt` 占位实现已保留但不再使用，BootReceiver 改为启动 `EewBackgroundService`。
 
@@ -237,6 +237,6 @@ override val reactHost: ReactHost by lazy {
 - **Task 10（权限引导页）**：在引导页中调用 `useAutoStart`，引导用户检查厂商 ROM 自启动开关。
 - **锁屏预警能力**：`EewBackgroundService` 已升级为完整锁屏预警服务（OkHttp WS/HTTP + 事件触发 + 配置同步），详见 [floating-window.md](./floating-window.md#锁屏预警实现eewbackgroundservice)。
   - 原生层按 `customSource.protocol` 启动 WebSocket 或 HTTP 连接，独立于 RN JS 层
-  - `BackgroundServiceModule` 提供 `updateConfig` / `updateLocation` / `updateCustomSourceJson` / `notifyAppInForeground` 方法供 RN 层同步配置
-  - `HomeScreen.tsx` 在配置变化和 AppState 'active' 时自动同步 alert 配置、用户位置和活跃 customSource 到原生层
+  - `BackgroundServiceModule` 提供 `updateConfig` / `updateLocation` / `updateCustomSourcesJson` / `notifyAppInForeground` 方法供 RN 层同步配置
+  - `HomeScreen.tsx` 在配置变化和 AppState 'active' 时自动同步 alert 配置、用户位置和所有活跃 customSource（多源数组）到原生层
   - `FloatingWindowModule` 添加 `showFromBackground()` 方法和锁屏显示 flag（`FLAG_SHOW_WHEN_LOCKED` 等）+ WakeLock

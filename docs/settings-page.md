@@ -148,6 +148,7 @@ src/
 | 悬浮窗 | `floatingWindowEnabled` | 地震时显示悬浮预警窗口 | 悬浮窗权限状态（SYSTEM_ALERT_WINDOW） |
 | 锁屏报警 | `lockScreenEnabled` | 锁屏状态高震级地震触发报警 | 无需额外权限（WAKE_LOCK 自动授予） |
 | 开机自启动 | `autoStartEnabled` | 开机后自动启动预警服务 | 请到系统设置确认（厂商 ROM 不可自动检测） |
+| 允许 HTTP 连接 | `allowHttp` | 开启后允许连接 HTTP 明文数据源（如局域网自建服务器），关闭时仅允许 HTTPS + localhost | 无（应用层控制，详见 data-source-guide.md 11.3 节） |
 
 - 每个开关的 description 动态拼接对应系统权限的实际状态（通过 `useSystemPermissionStatus` hook 检测）
 - 悬浮窗权限：调 `FloatingWindowManager.hasPermission()`（`Settings.canDrawOverlays`）
@@ -157,7 +158,7 @@ src/
 
 ## 7. SVG 图标（SettingsIcons.tsx）
 
-`src/components/icons/SettingsIcons.tsx` 导出 13 个线条图标，统一规格 24×24、`stroke=currentColor`、`fill=none`、`strokeWidth=1.5`、圆角线帽：
+`src/components/icons/SettingsIcons.tsx` 导出 14 个线条图标，统一规格 24×24、`stroke=currentColor`、`fill=none`、`strokeWidth=1.5`、圆角线帽：
 
 | 图标 | 用途 |
 |------|------|
@@ -173,11 +174,16 @@ src/
 | `WindowIcon` | 悬浮窗 |
 | `LockIcon` | 锁屏 |
 | `PowerIcon` | 自启动 |
+| `HttpIcon` | 允许 HTTP 连接 |
 | `ResetIcon` | 重置 |
 
 依赖 `react-native-svg`。图标通过外层 `color` 属性控制颜色，自动适配亮/暗模式。
 
 ## 8. 设置页面组装（SettingsScreen）
+
+**实际效果**：
+
+![设置页面](./image/设置页面.jpg)
 
 - **顶部标题栏**：「设置」标题 + 重置按钮（`ResetIcon`），点击弹出 `Alert` 二次确认后调用 `resetConfig()`
 - **加载态**：`ready=false` 时显示 `ActivityIndicator`

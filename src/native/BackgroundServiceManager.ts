@@ -1,7 +1,7 @@
 // 后台保活服务 RN 层接口
 // 封装 BackgroundServiceModule 原生模块，提供 start/stop + 配置同步方法。
 // App 启动时调用 start() 启动常驻通知，防止锁屏后 RN JS 线程被系统挂起。
-// 配置变化时调用 updateConfig/updateLocation/updateCustomSource 同步到原生层，
+// 配置变化时调用 updateConfig/updateLocation/updateCustomSources 同步到原生层，
 // 供后台服务锁屏预警使用。
 // AppState 'active' 时调用 notifyAppInForeground 通知后台服务 App 已回到前台。
 import {NativeModules, Platform} from 'react-native';
@@ -30,12 +30,19 @@ interface BackgroundServiceModuleType {
    */
   markEventTriggered(eventId: string): void;
   /**
-   * 更新当前活跃 customSource 配置（JSON 字符串或 null）
+   * 更新所有活跃 customSource 配置（JSON 数组字符串或 null）
    *
-   * 传 null 清空配置（后台服务不建立连接）。
-   * 传入 SourceConfig 的 JSON 字符串后，后台服务会按 protocol 启动 WS/HTTP 连接。
+   * 传 null 或空字符串清空配置（后台服务不建立连接）。
+   * 传入 SourceConfig 数组的 JSON 字符串后，后台服务会为每个源按 protocol 启动 WS/HTTP 连接。
    */
-  updateCustomSourceJson(sourceJson: string | null): void;
+  updateCustomSourcesJson(sourcesJson: string | null): void;
+  /**
+   * 更新 allowHttp 开关到原生层（SharedPreferences）
+   *
+   * 控制后台服务是否允许 HTTP 明文连接。
+   * 开关变化后会触发后台服务重连所有数据源。
+   */
+  updateAllowHttp(allowHttp: boolean): void;
   /**
    * 触发测试预警（绕过 WebSocket + 前后台检查，直接走悬浮窗触发路径）
    * @param magnitude 震级
@@ -180,27 +187,44 @@ export const BackgroundServiceManager = {
   },
 
   /**
-   * 同步当前活跃 customSource 配置到原生层
+   * 同步所有活跃 customSource 配置到原生层（多源并行模式）
    *
-   * 当 config.sources 变化时调用，将活跃 customSource 序列化为 JSON 写入
-   * SharedPreferences，供后台服务锁屏时按用户配置接收预警数据。
+   * 当 config.sources 变化时调用，将所有活跃 eew customSource 序列化为 JSON 数组
+   * 写入 SharedPreferences，供后台服务锁屏时按用户配置并行接收多源预警数据。
    *
    * 数据源选择策略：
    * - 调用方从 config.sources 中筛选 enabled && type==='customSource' && category==='eew'
-   *   的源，按 priority 升序取第一个作为活跃源传入
-   * - 若无符合条件的源，传 null 清空原生层配置（后台服务不建立连接）
+   *   的所有源，按 priority 升序传入
+   * - 若无符合条件的源，传空数组清空原生层配置（后台服务不建立连接）
    *
-   * 调用后原生层会自动重连：停止旧 WS/HTTP → 读取新配置 → 按 protocol 启动连接
+   * 调用后原生层会自动重连：停止所有旧 WS/HTTP → 读取新配置数组 → 为每个源按 protocol 启动连接
    *
-   * @param source 活跃 customSource 配置（null 表示无活跃源）
+   * @param sources 活跃 customSource 配置数组（空数组表示无活跃源）
    */
-  updateCustomSource(source: SourceConfig | null): void {
+  updateCustomSources(sources: SourceConfig[]): void {
     if (Platform.OS !== 'android') return;
     try {
-      // 使用 JSON.stringify 传输完整 SourceConfig，避免在原生层逐字段读取 ReadableMap
-      // 原生层 BackgroundServiceModule.updateCustomSourceJson 接收字符串并写入 SharedPreferences
-      const json = source ? JSON.stringify(source) : null;
-      BackgroundServiceModule?.updateCustomSourceJson(json);
+      // 使用 JSON.stringify 传输 SourceConfig 数组，避免在原生层逐字段读取 ReadableMap
+      // 原生层 BackgroundServiceModule.updateCustomSourcesJson 接收字符串并写入 SharedPreferences
+      const json = sources.length > 0 ? JSON.stringify(sources) : null;
+      BackgroundServiceModule?.updateCustomSourcesJson(json);
+    } catch {
+      // 忽略同步异常
+    }
+  },
+
+  /**
+   * 同步 allowHttp 开关到原生层
+   *
+   * 当 config.allowHttp 变化时调用，控制后台服务是否允许 HTTP 明文连接。
+   * 开关变化后原生层会自动重连所有数据源（重新检查每个源的 endpoint 协议）。
+   *
+   * @param allowHttp 是否允许 HTTP 明文连接
+   */
+  updateAllowHttp(allowHttp: boolean): void {
+    if (Platform.OS !== 'android') return;
+    try {
+      BackgroundServiceModule?.updateAllowHttp(allowHttp);
     } catch {
       // 忽略同步异常
     }

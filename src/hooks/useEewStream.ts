@@ -242,6 +242,15 @@ export function useEewStream(): UseEewStreamResult {
           log('STREAM', `跳过不支持的源类型: ${src.type}`);
           continue;
         }
+
+        // HTTP 明文连接检查：allowHttp=false 时拒绝非 localhost 的 HTTP endpoint
+        const endpoint = src.endpoint ?? '';
+        const isHttp = endpoint.startsWith('http://');
+        const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1|10\.0\.2\.2)([:/]|$)/.test(endpoint);
+        if (isHttp && !isLocalhost && !appConfig.allowHttp) {
+          log('STREAM', `跳过 HTTP 源（allowHttp=false）: ${src.name} endpoint=${endpoint}`);
+          continue;
+        }
         const adapter = createCustomSourceAdapter(src);
         if (!adapter) {
           log('STREAM', `adapter 创建失败: ${src.type}`);
@@ -331,7 +340,7 @@ export function useEewStream(): UseEewStreamResult {
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, config?.sources, config?.heartbeatFailureThreshold]);
+  }, [ready, config?.sources, config?.heartbeatFailureThreshold, config?.allowHttp]);
 
   // 事件超时清理：定期移除超过 5 分钟无更新的事件（eew + eqlist）
   useEffect(() => {

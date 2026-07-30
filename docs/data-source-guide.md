@@ -599,20 +599,61 @@ npx tsc --noEmit
 
 锁屏预警由原生层 `EewBackgroundService` 实现，独立于 JS 层 `CustomSourceAdapter`，确保锁屏时 RN JS 被系统暂停后仍能接收预警数据。
 
-### 11.1 数据源同步机制
+### 11.1 数据源同步机制（多源并行模式）
 
-- **JS 层 → 原生层**：`HomeScreen` 通过 `BackgroundServiceManager.updateCustomSource(activeSource)` 将活跃 customSource 配置同步到原生层 `SharedPreferences`
-- **同步时机**：`config.sources` 变化时自动同步（取 `enabled && type === 'customSource' && category === 'eew'` 中 priority 最小的源）
-- **同步内容**：源配置的 JSON 字符串（含 endpoint/protocol/authToken/pollIntervalMs/fieldMapping）
+- **JS 层 → 原生层**：`HomeScreen` 通过 `BackgroundServiceManager.updateCustomSources(sources)` 将所有活跃 customSource 配置同步到原生层 `SharedPreferences`
+- **同步时机**：`config.sources` 变化时自动同步（取所有 `enabled && type === 'customSource' && category === 'eew'` 的源，按 priority 升序）
+- **同步内容**：多源配置的 JSON 数组字符串（含每个源的 endpoint/protocol/authToken/pollIntervalMs/fieldMapping/priority）
 
-### 11.2 原生层连接逻辑
+### 11.2 原生层连接逻辑（多源并行）
 
-`EewBackgroundService` 从 SharedPreferences 读取 `activeCustomSource` 配置后：
-- `protocol='ws'`：使用 OkHttp WebSocket 客户端连接 endpoint（Bearer token 鉴权）
+`EewBackgroundService` 从 SharedPreferences 读取 `customSources` JSON 数组后：
+- 为每个源创建独立的 `SourceConnection` 实例（封装 WS/HTTP 连接、重连、数据处理）
+- `protocol='ws'`：使用 OkHttp WebSocket 客户端连接 endpoint（URL 查询参数 ?token= 鉴权）
 - `protocol='http'`：使用 OkHttp HTTP GET 按配置间隔轮询（Authorization Bearer token 鉴权）
-- 收到数据后调用 `EewAlertEngine.parseWithMapping(raw, fieldMapping)` 解析
+- 每个源独立维护重连状态（指数退避：1s→2s→4s→...→30s 上限）
+- 收到数据后调用 `handleSourceData(text, config)` → `EewAlertEngine.parseWithMapping(raw, fieldMapping)` 解析
+- **HTTP 明文连接检查**：`SourceConnection.start()` 连接前检查 `allowHttp` 开关（详见 11.4 节）
 
-### 11.3 原生层 FieldMapping 解析器
+### 11.3 HTTP 明文连接控制（allowHttp）
+
+#### 背景
+
+Android `network_security_config.xml` 不支持 CIDR 通配符（无法配置 `192.168.*.*`），因此系统层全局允许 cleartext traffic，由应用层通过 `allowHttp` 开关控制是否放行 HTTP endpoint。
+
+#### 配置项
+
+| 配置 | 位置 | 默认值 | 说明 |
+|------|------|--------|------|
+| `AppConfig.allowHttp` | `src/types/config.ts` | `false` | 全局 HTTP 明文连接开关 |
+
+#### 行为
+
+| allowHttp | HTTP endpoint (localhost) | HTTP endpoint (局域网/公网) | HTTPS endpoint |
+|-----------|--------------------------|----------------------------|----------------|
+| `false`（默认） | ✅ 允许 | ❌ 拒绝 | ✅ 允许 |
+| `true` | ✅ 允许 | ✅ 允许 | ✅ 允许 |
+
+#### 检查点（双层检查）
+
+1. **JS 层**（前台）：`useEewStream.startSources()` 创建 adapter 前检查 endpoint 协议
+   - `allowHttp=false` 时跳过非 localhost 的 HTTP 源（日志：`跳过 HTTP 源（allowHttp=false）`）
+   - `allowHttp` 变化时自动重连所有源（useEffect 依赖 `config?.allowHttp`）
+
+2. **原生层**（后台/锁屏）：`EewBackgroundService.SourceConnection.start()` 连接前检查 endpoint 协议
+   - `allowHttp=false` 时拒绝非 localhost 的 HTTP 源（日志：`源 xxx 跳过 HTTP 连接（allowHttp=false）`）
+   - `allowHttp` 变化时通过 `BackgroundServiceModule.updateAllowHttp()` 触发 `reloadCustomSources()` 重连
+
+#### 配置同步
+
+- JS 层 `HomeScreen.tsx` 通过 `BackgroundServiceManager.updateAllowHttp(allowHttp)` 同步到原生层
+- 原生层 `BackgroundServiceModule.updateAllowHttp(allowHttp)` 写入 SharedPreferences 并触发重连
+
+#### 系统层配置
+
+`res/xml/network_security_config.xml` 全局 `cleartextTrafficPermitted="true"`，系统不阻止任何 HTTP 连接，完全由应用层 `allowHttp` 开关控制。
+
+### 11.4 原生层 FieldMapping 解析器
 
 `FieldMappingParser.kt`（位于 `android/app/src/main/java/com/mdoeeewapp/android/cn/background/`）是 JS 层 `jsonPathExtract.ts` 的 Kotlin 移植版，提供以下 API：
 

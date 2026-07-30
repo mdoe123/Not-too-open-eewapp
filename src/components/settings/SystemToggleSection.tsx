@@ -1,5 +1,5 @@
 // 系统能力开关分组
-// 后台运行 / 悬浮窗 / 锁屏报警 / 开机自启动
+// 后台运行 / 悬浮窗 / 锁屏报警 / 开机自启动 / 允许 HTTP
 // 开关旁显示对应系统权限的实际开启状态（通过 useSystemPermissionStatus 检测）
 import React from 'react';
 import {StyleSheet, Text, View} from 'react-native';
@@ -12,6 +12,7 @@ import {
   WindowIcon,
   LockIcon,
   PowerIcon,
+  HttpIcon,
 } from '../icons/SettingsIcons';
 
 export interface SystemToggleSectionProps {
@@ -19,6 +20,10 @@ export interface SystemToggleSectionProps {
   alert: AlertConfig;
   /** 局部更新回调 */
   updateAlert: (partial: Partial<AlertConfig>) => void;
+  /** 是否允许 HTTP 明文连接 */
+  allowHttp: boolean;
+  /** allowHttp 变更回调 */
+  updateAllowHttp: (allowHttp: boolean) => void;
   /** 配色 */
   colors: AppColors;
 }
@@ -30,6 +35,8 @@ export interface SystemToggleSectionProps {
 export function SystemToggleSection({
   alert,
   updateAlert,
+  allowHttp,
+  updateAllowHttp,
   colors,
 }: SystemToggleSectionProps) {
   const {overlay, notification, battery} = useSystemPermissionStatus();
@@ -86,6 +93,14 @@ export function SystemToggleSection({
         icon={<PowerIcon size={20} color={colors.text} />}
         value={alert.autoStartEnabled}
         onValueChange={v => updateAlert({autoStartEnabled: v})}
+        colors={colors}
+      />
+      <ToggleRow
+        label="允许 HTTP 连接"
+        description="开启后允许连接 HTTP 明文数据源（如局域网自建服务器），关闭时仅允许 HTTPS"
+        icon={<HttpIcon size={20} color={colors.text} />}
+        value={allowHttp}
+        onValueChange={v => updateAllowHttp(v)}
         colors={colors}
         hideDivider
       />

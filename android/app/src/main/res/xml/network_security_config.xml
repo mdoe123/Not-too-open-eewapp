@@ -2,21 +2,19 @@
 <!--
   网络安全配置
 
-  策略：公网仅 HTTPS，本地/局域网允许明文 HTTP
-  - 默认：禁止明文流量，仅信任系统 CA（保证公网安全）
-  - 例外：localhost / 127.0.0.1 / 10.0.2.2（模拟器）允许 HTTP
+  策略：系统层全局允许 cleartext，应用层通过 allowHttp 开关控制
+  - 系统层：cleartextTrafficPermitted="true"（Android 不阻止 HTTP）
+  - 应用层：AppConfig.allowHttp 开关
+    - false（默认）：JS 层 useEewStream 和原生层 EewBackgroundService 拒绝非 localhost 的 HTTP endpoint
+    - true：允许所有 HTTP 连接（含公网和局域网），用于连接自建 HTTP 服务器
 
-  如需连接局域网 webui（如 192.168.x.x），在此文件的 domain-config 中添加对应 IP。
+  设计原因：Android network_security_config 不支持 CIDR 通配符（无法配置 192.168.*.*），
+  只能在系统层全局放开 cleartext，由应用层做精细控制。
 -->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="false">
+    <base-config cleartextTrafficPermitted="true">
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>
     </base-config>
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">localhost</domain>
-        <domain includeSubdomains="false">127.0.0.1</domain>
-        <domain includeSubdomains="false">10.0.2.2</domain>
-    </domain-config>
 </network-security-config>

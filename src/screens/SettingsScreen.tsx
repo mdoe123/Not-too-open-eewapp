@@ -33,7 +33,7 @@ import type {SettingsScreenProps} from '../navigation/types';
 export default function SettingsScreen({navigation}: SettingsScreenProps) {
   const isDark = useColorScheme() === 'dark';
   const colors = getColors(isDark);
-  const {config, updateAlert, updateSources, updateLocation, updateDebug, resetConfig} = useConfig();
+  const {config, updateAlert, updateSources, updateLocation, updateDebug, updateNetwork, resetConfig} = useConfig();
 
   /** 重置配置（Alert 二次确认，避免误触） */
   const handleReset = useCallback(() => {
@@ -68,6 +68,10 @@ export default function SettingsScreen({navigation}: SettingsScreenProps) {
   const handleUpdateDebug = useCallback(
     (partial: Parameters<typeof updateDebug>[0]) => updateDebug(partial),
     [updateDebug],
+  );
+  const handleUpdateAllowHttp = useCallback(
+    (allowHttp: boolean) => updateNetwork({allowHttp}),
+    [updateNetwork],
   );
 
   return (
@@ -136,6 +140,8 @@ export default function SettingsScreen({navigation}: SettingsScreenProps) {
           <SystemToggleSection
             alert={config.alert}
             updateAlert={handleUpdateAlert}
+            allowHttp={config.allowHttp}
+            updateAllowHttp={handleUpdateAllowHttp}
             colors={colors}
           />
         </CollapsibleSection>

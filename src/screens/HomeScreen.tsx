@@ -136,9 +136,9 @@ export default function HomeScreen({navigation}: HomeScreenProps) {
     );
   }, [userLocation, locationConfig, isMock]);
 
-  // 同步当前活跃 customSource 到原生层（供 EewBackgroundService 锁屏预警接收数据）
-  // 策略：从 config.sources 中筛选 enabled && customSource && category=eew 的源，
-  //       按 priority 升序取第一个作为活跃源；若无则传 null（原生层不建立连接）
+  // 同步所有活跃 customSource 到原生层（供 EewBackgroundService 锁屏预警接收数据）
+  // 多源并行模式：从 config.sources 中筛选所有 enabled && customSource && category=eew 的源，
+  // 按 priority 升序传入；原生层为每个源建立独立的 WS/HTTP 连接
   useEffect(() => {
     if (!config) return;
     const eewCustomSources = config.sources
@@ -149,9 +149,14 @@ export default function HomeScreen({navigation}: HomeScreenProps) {
           (s.category ?? 'eew') === 'eew',
       )
       .sort((a, b) => a.priority - b.priority);
-    const activeSource = eewCustomSources[0] ?? null;
-    BackgroundServiceManager.updateCustomSource(activeSource);
+    BackgroundServiceManager.updateCustomSources(eewCustomSources);
   }, [config?.sources]);
+
+  // 同步 allowHttp 开关到原生层（供 EewBackgroundService.SourceConnection 连接前检查）
+  // 开关变化时原生层会自动重连所有数据源
+  useEffect(() => {
+    BackgroundServiceManager.updateAllowHttp(config?.allowHttp ?? false);
+  }, [config?.allowHttp]);
 
   // AppState 监听：前后台切换时通知后台服务
   // - 'active'：App 回到前台，后台服务跳过悬浮窗触发（由 JS 层 useFloatingWindow 处理）

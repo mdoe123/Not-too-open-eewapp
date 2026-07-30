@@ -487,3 +487,25 @@ export function QrScanIcon({size = 24, color = '#000'}: IconProps) {
     </Svg>
   );
 }
+
+/** HTTP 明文连接（地球+连线造型） */
+export function HttpIcon({size = 24, color = '#000'}: IconProps) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <Circle cx="12" cy="12" r="8.5" stroke={color} strokeWidth={STROKE_W} />
+      <Line x1="3.5" y1="12" x2="20.5" y2="12" stroke={color} strokeWidth={STROKE_W} strokeLinecap={STROKE_CAP} />
+      <Path
+        d="M12 3.5C15 6.5 15 17.5 12 20.5"
+        stroke={color}
+        strokeWidth={STROKE_W}
+        strokeLinecap={STROKE_CAP}
+      />
+      <Path
+        d="M12 3.5C9 6.5 9 17.5 12 20.5"
+        stroke={color}
+        strokeWidth={STROKE_W}
+        strokeLinecap={STROKE_CAP}
+      />
+    </Svg>
+  );
+}

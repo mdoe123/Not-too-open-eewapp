@@ -118,6 +118,29 @@ class BackgroundServiceModule(
   }
 
   /**
+   * 更新 allowHttp 配置到原生层（由 RN 层调用）
+   *
+   * 将 allowHttp 开关写入 SharedPreferences，供 EewBackgroundService.SourceConnection
+   * 在建立连接前检查是否允许 HTTP 明文连接。
+   *
+   * @param allowHttp 是否允许 HTTP 明文连接
+   */
+  @ReactMethod
+  fun updateAllowHttp(allowHttp: Boolean) {
+    try {
+      val prefs = reactContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+      prefs.putBoolean("allowHttp", allowHttp)
+      prefs.apply()
+      Log.i(TAG, "allowHttp=$allowHttp 已写入 SharedPreferences")
+      // 触发后台服务重连（开关变化后需要重新建立/断开连接）
+      EewBackgroundService.instance?.reloadCustomSources()
+        ?: Log.d(TAG, "EewBackgroundService 未启动，配置已持久化，下次启动时生效")
+    } catch (e: Exception) {
+      Log.e(TAG, "updateAllowHttp 失败: ${e.message}")
+    }
+  }
+
+  /**
    * 更新位置配置（由 RN 层调用）
    *
    * 直接写入 SharedPreferences，不依赖 Service 实例是否存活。
@@ -184,40 +207,42 @@ class BackgroundServiceModule(
   }
 
   /**
-   * 更新当前活跃 customSource 配置（由 RN 层调用）
+   * 更新所有活跃 customSource 配置（由 RN 层调用，多源并行模式）
    *
-   * 将整个 SourceConfig 序列化为 JSON 字符串写入 SharedPreferences，
-   * 供后台服务在锁屏时按用户配置的 endpoint/protocol/fieldMapping 接收预警数据。
+   * 将 SourceConfig 数组序列化为 JSON 字符串写入 SharedPreferences（KEY_CUSTOM_SOURCES），
+   * 供后台服务在锁屏时按用户配置的 endpoint/protocol/fieldMapping 接收多源预警数据。
    *
-   * 调用此方法后会触发 [EewBackgroundService.reloadCustomSource]：
-   * 1. 停止现有 WS/HTTP 连接
-   * 2. 解析新的配置
-   * 3. 按 protocol（'ws' 或 'http'）启动相应连接
+   * 调用此方法后会触发 [EewBackgroundService.reloadCustomSources]：
+   * 1. 停止所有现有 WS/HTTP 连接
+   * 2. 解析新的多源配置数组
+   * 3. 为每个源按 protocol（'ws' 或 'http'）启动相应连接
    *
-   * 数据源选择策略（由 JS 层负责）：
+   * 多源选择策略（由 JS 层负责）：
    * - JS 层从 config.sources 中筛选 enabled && type==='customSource' && category==='eew'
-   *   的源，按 priority 升序取第一个作为活跃源传入
-   * - 若无符合条件的源，传 null 清空原生层配置（后台服务不建立连接）
+   *   的所有源，序列化为 JSON 数组传入
+   * - 若无符合条件的源，传 null 或空数组清空原生层配置（后台服务不建立连接）
    *
-   * @param sourceJson 完整 SourceConfig 的 JSON 字符串，传 null 清空配置
+   * @param sourcesJson 多源配置 JSON 数组字符串，传 null 或空字符串清空配置
    */
   @ReactMethod
-  fun updateCustomSourceJson(sourceJson: String?) {
+  fun updateCustomSourcesJson(sourcesJson: String?) {
     try {
-      val prefs = reactContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
-      if (sourceJson == null) {
-        prefs.remove("activeCustomSource")
-        Log.i(TAG, "已清空 activeCustomSource 配置")
-      } else {
-        prefs.putString("activeCustomSource", sourceJson)
-        Log.i(TAG, "activeCustomSource 配置已写入 SharedPreferences（长度=${sourceJson.length}）")
-      }
-      prefs.apply()
-      // 触发后台服务重新加载配置并重连
-      EewBackgroundService.instance?.reloadCustomSource()
-        ?: Log.d(TAG, "EewBackgroundService 未启动，配置已持久化，下次启动时生效")
+      EewBackgroundService.instance?.updateCustomSourcesJson(sourcesJson)
+        ?: run {
+          // Service 未启动，直接写入 SharedPreferences，下次启动时生效
+          val prefs = reactContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+          if (sourcesJson.isNullOrEmpty()) {
+            prefs.remove("customSources")
+            Log.i(TAG, "已清空 customSources 配置")
+          } else {
+            prefs.putString("customSources", sourcesJson)
+            Log.i(TAG, "customSources 配置已写入 SharedPreferences（长度=${sourcesJson.length}）")
+          }
+          prefs.apply()
+          Log.d(TAG, "EewBackgroundService 未启动，配置已持久化，下次启动时生效")
+        }
     } catch (e: Exception) {
-      Log.e(TAG, "updateCustomSourceJson 失败: ${e.message}")
+      Log.e(TAG, "updateCustomSourcesJson 失败: ${e.message}")
     }
   }
 

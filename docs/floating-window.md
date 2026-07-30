@@ -59,7 +59,7 @@ HomeScreen
 ```
 EewBackgroundService（原生 ForegroundService）
   ├─ OkHttp WebSocket / HTTP 客户端（根据 customSource.protocol 选择）
-  │    └─ 连接用户配置的 endpoint（独立于 RN JS 层，从 SharedPreferences 读取 activeCustomSource）
+  │    └─ 连接用户配置的 endpoint（独立于 RN JS 层，从 SharedPreferences 读取 customSources 多源配置数组）
   ├─ EewAlertEngine（原生层预警计算引擎）
   │    ├─ parseWithMapping(raw, mapping)  按 FieldMapping 解析消息（替代原 parseCencEvent）
   │    ├─ FieldMappingParser.kt           Kotlin 路径表达式解析器（与 JS 层 jsonPathExtract 一致）
@@ -152,11 +152,14 @@ adb shell am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d package:c
 HomeScreen (useEffect)
   ├─ BackgroundServiceManager.updateConfig(alertConfig)     → BackgroundServiceModule.updateConfig() → SharedPreferences
   ├─ BackgroundServiceManager.updateLocation(location)      → BackgroundServiceModule.updateLocation() → SharedPreferences
-  ├─ BackgroundServiceManager.updateCustomSource(source)    → BackgroundServiceModule.updateCustomSourceJson() → SharedPreferences → reloadCustomSource()
+  ├─ BackgroundServiceManager.updateCustomSources(sources)  → BackgroundServiceModule.updateCustomSourcesJson() → SharedPreferences → reloadCustomSources()
+  ├─ BackgroundServiceManager.updateAllowHttp(allowHttp)     → BackgroundServiceModule.updateAllowHttp() → SharedPreferences → reloadCustomSources()
   └─ AppState 'active' → BackgroundServiceManager.notifyAppInForeground() → EewBackgroundService.appInForeground = true
 ```
 
-> customSource 同步：从 `config.sources` 中筛选 `enabled && type === 'customSource' && category === 'eew'` 中 priority 最小的源，JSON 字符串写入 SharedPreferences 的 `activeCustomSource` key；原生层 `reloadCustomSource()` 停止旧连接后按新配置的 `protocol` 启动 WS 或 HTTP 连接。
+> customSource 同步（多源并行）：从 `config.sources` 中筛选所有 `enabled && type === 'customSource' && category === 'eew'` 的源（按 priority 升序），JSON 数组字符串写入 SharedPreferences 的 `customSources` key；原生层 `reloadCustomSources()` 停止所有旧连接后为每个源按 `protocol` 启动独立的 WS 或 HTTP 连接。
+
+> allowHttp 同步：`config.allowHttp` 变化时通过 `BackgroundServiceManager.updateAllowHttp()` 同步到原生层 SharedPreferences，并触发 `reloadCustomSources()` 重连所有源（开关关闭时非 localhost 的 HTTP 源会被拒绝连接）。
 
 **触发条件**（必须全部满足，在 `EewBackgroundService.tryTriggerFloatingWindow()` 中检查）：
 1. `alert.lockScreenEnabled == true`
@@ -646,6 +649,16 @@ if (event.isCancel === true) {
 └──────────────────────────────────────────────────────┘
 ```
 
+**非锁屏悬浮窗实际效果**：
+
+**单事件**：
+
+![非锁屏单震样例](./image/非锁屏单震样例.jpg)
+
+**多事件并发**：
+
+![非锁屏多震样例](./image/非锁屏多震样例.jpg)
+
 - **顶行**：左侧 "S 波到达" 标签（11sp），右侧 ✕ 关闭按钮（18sp）
 - **倒计时**：居中大字 48sp BOLD
   - 正常倒计时：格式为 "N 秒"（如 "30 秒"）
@@ -809,11 +822,11 @@ LockScreenAlertActivity: onCreate: mag=7.5 intensity=9.22 level=red ...
 
 #### EewBackgroundService（原生 ForegroundService）
 
-- **数据源连接**：从 SharedPreferences 读取 `activeCustomSource` 配置，按 `protocol` 启动 WebSocket 或 HTTP GET 轮询
-- **WS 指数退避重连**：初始 1s，倍数 2，上限 30s
+- **数据源连接（多源并行）**：从 SharedPreferences 读取 `customSources` JSON 数组，为每个源创建独立的 `SourceConnection` 实例，按 `protocol` 启动 WebSocket 或 HTTP GET 轮询
+- **WS 指数退避重连**：初始 1s，倍数 2，上限 30s（每个源独立维护重连状态）
 - **HTTP 心跳超时**：`max(pollIntervalMs * 3, 10000ms)`
-- **配置热更新**：`reloadCustomSource()` 停止旧连接 → 读新配置 → 启动新连接
-- **事件处理**：`handleSourceData()` 按 FieldMapping 解析 → 转发 JS → 启动 LockScreenAlertActivity
+- **配置热更新**：`reloadCustomSources()` 停止所有旧连接 → 读新配置数组 → 为每个源启动新连接
+- **事件处理**：`handleSourceData(text, config)` 按 FieldMapping 解析 → 转发 JS → 启动 LockScreenAlertActivity
 - **双层去重**（修复前后台切换不触发问题）：
   - **转发去重**（`lastDedupKey` = `eventId:originTime`）：同一报告不重复转发给 JS 层
   - **触发去重**（`lastTriggeredEventId` = `eventId`）：同一事件只触发一次悬浮窗
@@ -866,13 +879,15 @@ Activity 使用 `Theme.Translucent.NoTitleBar` 透明主题（保持灵活的系
 
 #### BackgroundServiceModule（RN 桥接模块）
 
-新增 customSource 配置同步方法：
+新增 customSource 多源配置同步方法：
 
 | ReactMethod | 作用 |
 |-------------|------|
-| `updateCustomSourceJson(sourceJson: String?)` | 写入/删除 SharedPreferences 的 `activeCustomSource` key，并触发 `EewBackgroundService.reloadCustomSource()` 热更新连接 |
+| `updateCustomSourcesJson(sourcesJson: String?)` | 写入/删除 SharedPreferences 的 `customSources` key（JSON 数组），并触发 `EewBackgroundService.reloadCustomSources()` 热更新所有连接 |
+| `updateAllowHttp(allowHttp: Boolean)` | 写入 SharedPreferences 的 `allowHttp` key，并触发 `EewBackgroundService.reloadCustomSources()` 热更新所有连接（开关变化后重新检查每个源的 HTTP 协议） |
 
-JS 层通过 `BackgroundServiceManager.updateCustomSource(source)` 调用，`source` 为 `SourceConfig | null`，序列化为 JSON 字符串后传入。
+JS 层通过 `BackgroundServiceManager.updateCustomSources(sources)` 调用，`sources` 为 `SourceConfig[]`（多源数组），序列化为 JSON 数组字符串后传入。
+JS 层通过 `BackgroundServiceManager.updateAllowHttp(allowHttp)` 调用，`allowHttp` 为 `boolean`。
 
 #### ReactContextProvider（全局 ReactContext 与 NativeModule 提供者）
 
@@ -899,7 +914,8 @@ RN 层通过 `BackgroundServiceManager` 将配置同步到原生层：
 |---------|---------|------|
 | `updateConfig(alertConfig)` | `BackgroundServiceModule.updateConfig()` | 写入 SharedPreferences（minMagnitude, lockScreenIntensity, lockScreenEnabled, floatingWindowEnabled 等） |
 | `updateLocation(location)` | `BackgroundServiceModule.updateLocation()` | 写入 SharedPreferences（userLat, userLng） |
-| `updateCustomSource(source)` | `BackgroundServiceModule.updateCustomSourceJson()` | 写入/删除 SharedPreferences `activeCustomSource`，触发 `reloadCustomSource()` 热更新连接 |
+| `updateCustomSources(sources)` | `BackgroundServiceModule.updateCustomSourcesJson()` | 写入/删除 SharedPreferences `customSources`（JSON 数组），触发 `reloadCustomSources()` 热更新所有连接 |
+| `updateAllowHttp(allowHttp)` | `BackgroundServiceModule.updateAllowHttp()` | 写入 SharedPreferences `allowHttp`，触发 `reloadCustomSources()` 热更新所有连接（重新检查 HTTP 协议） |
 | `notifyAppInForeground()` | `BackgroundServiceModule.notifyAppInForeground()` | 设置 `appInForeground=true`，避免后台重复触发 |
 
 **设计要点**：配置直接写入 SharedPreferences，不依赖 Service 实例是否存活。即使 Service 未启动，配置也已持久化，下次 Service 启动时自动读取。
@@ -928,6 +944,16 @@ RN 层通过 `BackgroundServiceManager` 将配置同步到原生层：
   - **UI 透明度修复**：根布局 `outer` 不透明烈度色背景填满屏幕，内层 `container` 透明背景
   - ✕ 按钮 → `finish()`（同时触发 stopAlerts）
   - 返回键禁用（防误触）
+
+**锁屏预警实际效果**：
+
+**单事件**：
+
+![锁屏单震样例](./image/锁屏单震样例.jpg)
+
+**多事件并发（双震垂直排列）**：
+
+![锁屏双震样例](./image/锁屏双震样例.jpg)
 
 - **FloatingWindowModule（保留前台悬浮窗能力）**：
   - 仍用于前台触发路径（App 在前台时由 JS 层 `useFloatingWindow` 调用）

@@ -192,6 +192,16 @@ export interface AppConfig {
   pollIntervalMs: number;
   /** 心跳失败切换阈值（默认 3 次） */
   heartbeatFailureThreshold: number;
+  /**
+   * 是否允许 HTTP 明文连接（默认 false）
+   *
+   * - false：仅允许 HTTPS（localhost/127.0.0.1/10.0.2.2 除外）
+   * - true：允许所有 HTTP 连接（含公网和局域网），用于连接自建 HTTP 服务器
+   *
+   * 系统层 network_security_config 全局允许 cleartext，
+   * 应用层通过此开关控制是否放行 HTTP endpoint。
+   */
+  allowHttp: boolean;
 }
 
 /** 当前配置版本号（结构变更时递增）
@@ -227,8 +237,12 @@ export interface AppConfig {
  * - v14: AlertConfig 新增 autoVolumeEnabled（自动调节媒体音量，默认 false）和
  *        alertVolume（预警媒体音量百分比 0-100，默认 80）。
  *        迁移策略：新字段可选，旧配置通过 DEFAULT_CONFIG 合并自动补齐默认值。
+ * - v15: AppConfig 新增 allowHttp（允许 HTTP 明文连接，默认 false）。
+ *        系统层 network_security_config 全局允许 cleartext，
+ *        应用层通过此开关控制是否放行 HTTP endpoint（false 时仅允许 HTTPS + localhost）。
+ *        迁移策略：新字段可选，旧配置通过 DEFAULT_CONFIG 合并自动补齐默认值。
  */
-export const CURRENT_CONFIG_VERSION = 14;
+export const CURRENT_CONFIG_VERSION = 15;
 
 /**
  * AsyncStorage 中存储免责声明确认标记的 key
@@ -286,4 +300,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   },
   pollIntervalMs: 30000,
   heartbeatFailureThreshold: 3,
+  // 默认禁止 HTTP 明文连接（仅允许 HTTPS + localhost）
+  // 用户需在设置中手动开启以连接自建 HTTP 服务器
+  allowHttp: false,
 };

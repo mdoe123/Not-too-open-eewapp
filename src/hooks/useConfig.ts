@@ -179,6 +179,8 @@ export interface UseConfigResult {
   updateLocation: (partial: Partial<LocationConfig>) => void;
   /** 局部更新 debug 字段（远程日志等） */
   updateDebug: (partial: Partial<DebugConfig>) => void;
+  /** 局部更新顶层网络配置字段（allowHttp 等） */
+  updateNetwork: (partial: Partial<Pick<AppConfig, 'allowHttp'>>) => void;
   /** 重置为默认配置 */
   resetConfig: () => void;
 }
@@ -275,9 +277,16 @@ export function useConfig(): UseConfigResult {
     }));
   }, []);
 
+  const updateNetwork = useCallback((partial: Partial<Pick<AppConfig, 'allowHttp'>>) => {
+    setConfig(prev => ({
+      ...prev,
+      ...partial,
+    }));
+  }, []);
+
   const resetConfig = useCallback(() => {
     setConfig({...DEFAULT_CONFIG});
   }, []);
 
-  return {config, ready, updateAlert, updateSources, updateLocation, updateDebug, resetConfig};
+  return {config, ready, updateAlert, updateSources, updateLocation, updateDebug, updateNetwork, resetConfig};
 }

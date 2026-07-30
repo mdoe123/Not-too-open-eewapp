@@ -70,8 +70,8 @@ class EewBackgroundService : Service() {
     /** SharedPreferences 文件名 */
     private const val PREFS_NAME = "eew_alert_config"
 
-    /** SharedPreferences 键：当前活跃 customSource 配置（JSON 字符串） */
-    private const val KEY_ACTIVE_CUSTOM_SOURCE = "activeCustomSource"
+    /** SharedPreferences 键：所有活跃 customSource 配置列表（JSON 数组字符串） */
+    private const val KEY_CUSTOM_SOURCES = "customSources"
 
     /** RN 事件名：转发 EEW 事件给 JS 层 */
     private const val EVENT_EEW_EVENT = "onEewEvent"
@@ -120,28 +120,22 @@ class EewBackgroundService : Service() {
   /** 主线程 Handler */
   private val mainHandler = Handler(Looper.getMainLooper())
 
-  /** OkHttpClient（懒加载，第一次连接时初始化） */
+  /** OkHttpClient（懒加载，第一次连接时初始化，所有源共享） */
   private var httpClient: OkHttpClient? = null
 
-  /** 当前活跃 customSource 配置（从 SharedPreferences 读取） */
-  private var activeSourceConfig: CustomSourceConfig? = null
+  /**
+   * 所有活跃 customSource 配置列表（从 SharedPreferences 读取）
+   *
+   * 多源并行模式：与 JS 层 useEewStream 对齐，支持同时连接多个 eew 数据源。
+   */
+  private var sourceConfigs: List<CustomSourceConfig> = emptyList()
 
-  /** WebSocket 实例（protocol='ws' 时使用） */
-  private var webSocket: WebSocket? = null
-
-  /** WebSocket 是否为主动关闭（避免 onClosed 触发重连） */
-  private var isManualClose = false
-
-  /** 重连定时器（WS 指数退避） */
-  private var reconnectHandler: Handler? = null
-  private var reconnectRunnable: Runnable? = null
-
-  /** 当前重连延迟（指数退避） */
-  private var reconnectDelayMs = 1000L
-
-  /** HTTP 轮询定时器（protocol='http' 时使用） */
-  private var httpPollHandler: Handler? = null
-  private var httpPollRunnable: Runnable? = null
+  /**
+   * 所有源连接实例（按 endpoint 索引，与 JS 层 getSourceKey 对齐）
+   *
+   * key = endpoint（小写），value = SourceConnection（封装 WS/HTTP 连接和重连）
+   */
+  private val sourceConnections: MutableMap<String, SourceConnection> = mutableMapOf()
 
   /** 上次去重的 eventId:reportId（避免重复触发同一报告） */
   private var lastDedupKey: String? = null
@@ -196,8 +190,8 @@ class EewBackgroundService : Service() {
         // 忽略重复 startForeground 异常
       }
     }
-    // 读取 customSource 配置并启动连接
-    reloadCustomSource()
+    // 读取 customSource 配置列表并启动所有连接
+    reloadCustomSources()
     return START_STICKY
   }
 
@@ -222,277 +216,159 @@ class EewBackgroundService : Service() {
   // ======================== customSource 配置加载 ========================
 
   /**
-   * 重新加载 customSource 配置并重连
+   * 重新加载 customSource 配置列表并重连所有源
    *
    * 由以下场景调用：
    * - onStartCommand：服务启动时
-   * - BackgroundServiceModule.updateCustomSourceJson：JS 层配置变化时
+   * - BackgroundServiceModule.updateCustomSourcesJson：JS 层配置变化时
    *
    * 行为：
-   * 1. 停止现有 WS/HTTP 连接
-   * 2. 从 SharedPreferences 读取 activeCustomSource JSON
-   * 3. 解析为 [CustomSourceConfig]
-   * 4. 根据 protocol 启动 WS 或 HTTP 轮询
+   * 1. 停止所有现有连接（WS/HTTP）
+   * 2. 从 SharedPreferences 读取 customSources JSON 数组
+   * 3. 解析为 [List<CustomSourceConfig>]
+   * 4. 为每个源创建 [SourceConnection] 并启动 WS 或 HTTP 轮询
    */
-  fun reloadCustomSource() {
+  fun reloadCustomSources() {
     stopConnection()
-    val config = readCustomSourceConfig()
-    activeSourceConfig = config
-    if (config == null) {
-      Log.i(TAG, "无 activeCustomSource 配置，不建立连接")
+    val configs = readCustomSourceConfigs()
+    sourceConfigs = configs
+    if (configs.isEmpty()) {
+      Log.i(TAG, "无 customSources 配置，不建立连接")
       emitWsStatus("disconnected", "未配置数据源")
       return
     }
-    Log.i(TAG, "活跃 customSource: name=${config.name} protocol=${config.protocol} endpoint=${config.endpoint}")
-    when (config.protocol) {
-      "ws" -> startWebSocket()
-      "http" -> startHttpPolling()
-      else -> {
-        Log.w(TAG, "未知协议: ${config.protocol}，不建立连接")
-        emitWsStatus("error", "未知协议: ${config.protocol}")
-      }
+    Log.i(TAG, "活跃 customSources 数量: ${configs.size}")
+    for (config in configs) {
+      Log.i(TAG, "启动源: name=${config.name} protocol=${config.protocol} endpoint=${config.endpoint} priority=${config.priority}")
+      val conn = SourceConnection(config)
+      val key = getSourceKey(config)
+      sourceConnections[key] = conn
+      conn.start()
     }
   }
 
   /**
-   * 从 SharedPreferences 读取 activeCustomSource 并解析为 [CustomSourceConfig]
+   * 更新 customSources 配置并重连（由 RN 层调用）
    *
-   * @returns 配置对象，无配置或解析失败返回 null
+   * 由 [BackgroundServiceModule.updateCustomSourcesJson] 调用：
+   * 1. 将 JSON 数组字符串写入 SharedPreferences（KEY_CUSTOM_SOURCES）
+   * 2. 调用 [reloadCustomSources] 停止旧连接并按新配置重连
+   *
+   * @param sourcesJson 多源配置 JSON 数组字符串，传 null 或空字符串清空所有连接
    */
-  private fun readCustomSourceConfig(): CustomSourceConfig? {
+  fun updateCustomSourcesJson(sourcesJson: String?) {
+    val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+    if (sourcesJson.isNullOrEmpty()) {
+      prefs.remove(KEY_CUSTOM_SOURCES)
+    } else {
+      prefs.putString(KEY_CUSTOM_SOURCES, sourcesJson)
+    }
+    prefs.apply()
+    Log.i(TAG, "customSources 配置已更新，开始重连")
+    reloadCustomSources()
+  }
+
+  /**
+   * 生成数据源在 sourceConnections 中的唯一 key
+   *
+   * 与 JS 层 getSourceKey 对齐：endpoint 小写（endpoint 大小写不敏感）
+   */
+  private fun getSourceKey(config: CustomSourceConfig): String {
+    return config.endpoint.lowercase()
+  }
+
+  /**
+   * 从 SharedPreferences 读取 customSources 并解析为 [List<CustomSourceConfig>]
+   *
+   * 兼容旧版单源配置（activeCustomSource 键）：若新键不存在但旧键存在，按单源解析。
+   *
+   * @returns 配置列表，无配置或解析失败返回空列表
+   */
+  private fun readCustomSourceConfigs(): List<CustomSourceConfig> {
     val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-    val json = prefs.getString(KEY_ACTIVE_CUSTOM_SOURCE, null) ?: return null
+    val json = prefs.getString(KEY_CUSTOM_SOURCES, null)
+    if (json.isNullOrEmpty()) {
+      // 兼容旧版单源键 activeCustomSource（已弃用，仅用于平滑升级）
+      val legacyJson = prefs.getString("activeCustomSource", null) ?: return emptyList()
+      val single = parseSingleSourceConfig(legacyJson) ?: return emptyList()
+      return listOf(single)
+    }
+    return try {
+      val arr = org.json.JSONArray(json)
+      val result = mutableListOf<CustomSourceConfig>()
+      for (i in 0 until arr.length()) {
+        val obj = arr.optJSONObject(i) ?: continue
+        val config = parseSourceConfigFromJson(obj) ?: continue
+        result.add(config)
+      }
+      result
+    } catch (e: Exception) {
+      Log.e(TAG, "解析 customSources 失败: ${e.message}")
+      emptyList()
+    }
+  }
+
+  /** 从 JSON 对象解析单个 [CustomSourceConfig] */
+  private fun parseSingleSourceConfig(json: String): CustomSourceConfig? {
     return try {
       val obj = JSONObject(json)
-      val fmObj = obj.optJSONObject("fieldMapping") ?: return null
-      val mapping = FieldMapping(
-        listPath = fmObj.optString("listPath", "").ifEmpty { null },
-        eventId = fmObj.optString("eventId", ""),
-        originTime = fmObj.optString("originTime", ""),
-        magnitude = fmObj.optString("magnitude", ""),
-        depth = fmObj.optString("depth", ""),
-        lat = fmObj.optString("lat", ""),
-        lng = fmObj.optString("lng", ""),
-        location = fmObj.optString("location", ""),
-        intensity = fmObj.optString("intensity", "").ifEmpty { null },
-        isFinal = fmObj.optString("isFinal", "").ifEmpty { null },
-        isCancel = fmObj.optString("isCancel", "").ifEmpty { null },
-        reportNum = fmObj.optString("reportNum", "").ifEmpty { null },
-      )
-      // 必填字段校验
-      if (mapping.eventId.isEmpty() || mapping.originTime.isEmpty() ||
-          mapping.magnitude.isEmpty() || mapping.depth.isEmpty() ||
-          mapping.lat.isEmpty() || mapping.lng.isEmpty() ||
-          mapping.location.isEmpty()) {
-        Log.e(TAG, "fieldMapping 必填字段缺失")
-        return null
-      }
-      CustomSourceConfig(
-        name = obj.optString("name", "customSource"),
-        endpoint = obj.optString("endpoint", ""),
-        protocol = obj.optString("protocol", "ws"),
-        authToken = obj.optString("authToken", "").ifEmpty { null },
-        pollIntervalMs = obj.optLong("pollIntervalMs", 30_000L),
-        fieldMapping = mapping,
-      )
+      parseSourceConfigFromJson(obj)
     } catch (e: Exception) {
-      Log.e(TAG, "解析 activeCustomSource 失败: ${e.message}")
+      Log.e(TAG, "解析单源配置失败: ${e.message}")
       null
     }
   }
 
-  // ======================== WebSocket 连接（protocol='ws'） ========================
-
-  /**
-   * 启动 WebSocket 连接
-   *
-   * URL 来自 [CustomSourceConfig.endpoint]，鉴权通过 URL 查询参数 ?token=<authToken>。
-   * 若已连接则不重复连接。
-   */
-  private fun startWebSocket() {
-    if (webSocket != null) {
-      Log.i(TAG, "WebSocket 已存在，跳过 startWebSocket")
-      return
+  /** 从 JSONObject 解析 [CustomSourceConfig]（共用逻辑） */
+  private fun parseSourceConfigFromJson(obj: JSONObject): CustomSourceConfig? {
+    val fmObj = obj.optJSONObject("fieldMapping") ?: return null
+    val mapping = FieldMapping(
+      listPath = fmObj.optString("listPath", "").ifEmpty { null },
+      eventId = fmObj.optString("eventId", ""),
+      originTime = fmObj.optString("originTime", ""),
+      magnitude = fmObj.optString("magnitude", ""),
+      depth = fmObj.optString("depth", ""),
+      lat = fmObj.optString("lat", ""),
+      lng = fmObj.optString("lng", ""),
+      location = fmObj.optString("location", ""),
+      intensity = fmObj.optString("intensity", "").ifEmpty { null },
+      isFinal = fmObj.optString("isFinal", "").ifEmpty { null },
+      isCancel = fmObj.optString("isCancel", "").ifEmpty { null },
+      reportNum = fmObj.optString("reportNum", "").ifEmpty { null },
+    )
+    // 必填字段校验
+    if (mapping.eventId.isEmpty() || mapping.originTime.isEmpty() ||
+        mapping.magnitude.isEmpty() || mapping.depth.isEmpty() ||
+        mapping.lat.isEmpty() || mapping.lng.isEmpty() ||
+        mapping.location.isEmpty()) {
+      Log.e(TAG, "fieldMapping 必填字段缺失")
+      return null
     }
-    val config = activeSourceConfig ?: return
-    if (config.endpoint.isEmpty()) {
-      Log.w(TAG, "endpoint 为空，跳过 WebSocket 连接")
-      emitWsStatus("error", "endpoint 为空")
-      return
-    }
-
-    isManualClose = false
-    reconnectDelayMs = 1000L
-
-    if (httpClient == null) {
-      httpClient = OkHttpClient.Builder()
-        .pingInterval(30, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS) // WebSocket 不超时
-        .build()
-    }
-
-    val url = buildWsUrl(config.endpoint, config.authToken)
-    Log.i(TAG, "WebSocket 连接 $url")
-    emitWsStatus("connecting", "连接中: ${config.name}")
-
-    val request = Request.Builder().url(url).build()
-    webSocket = httpClient?.newWebSocket(request, object : WebSocketListener() {
-      override fun onOpen(webSocket: WebSocket, response: Response) {
-        Log.i(TAG, "WebSocket 已连接: ${config.name}")
-        reconnectDelayMs = 1000L
-        emitWsStatus("connected", "${config.name} 已连接")
-      }
-
-      override fun onMessage(webSocket: WebSocket, text: String) {
-        handleSourceData(text)
-      }
-
-      override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-        Log.e(TAG, "WebSocket 错误: ${t.message}")
-        this@EewBackgroundService.webSocket = null
-        if (!isManualClose) {
-          emitWsStatus("error", "WebSocket 错误: ${t.message}")
-          scheduleReconnect()
-        }
-      }
-
-      override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-        Log.i(TAG, "WebSocket 已关闭: $code $reason")
-        this@EewBackgroundService.webSocket = null
-        if (!isManualClose) {
-          emitWsStatus("disconnected", "WebSocket 意外断开，准备重连")
-          scheduleReconnect()
-        }
-      }
-    })
-  }
-
-  /**
-   * 构建 WS URL（追加 token 查询参数，与 JS 层 CustomSourceAdapter.buildWsUrl 行为一致）
-   */
-  private fun buildWsUrl(endpoint: String, authToken: String?): String {
-    if (authToken.isNullOrEmpty()) return endpoint
-    val sep = if (endpoint.contains("?")) "&" else "?"
-    return "${endpoint}${sep}token=${java.net.URLEncoder.encode(authToken, "UTF-8")}"
-  }
-
-  /**
-   * 指数退避重连
-   * 初始 1s，倍数 2，上限 30s
-   */
-  private fun scheduleReconnect() {
-    if (isManualClose) return
-    if (reconnectHandler == null) {
-      reconnectHandler = Handler(Looper.getMainLooper())
-    }
-    reconnectRunnable?.let { reconnectHandler?.removeCallbacks(it) }
-    val delay = reconnectDelayMs
-    Log.i(TAG, "WebSocket ${delay}ms 后重连")
-    emitWsStatus("connecting", "${delay}ms 后重连")
-    val r = Runnable {
-      if (!isManualClose) {
-        reconnectDelayMs = minOf(reconnectDelayMs * 2, 30_000L)
-        startWebSocket()
-      }
-    }
-    reconnectRunnable = r
-    reconnectHandler?.postDelayed(r, delay)
-  }
-
-  // ======================== HTTP 轮询（protocol='http'） ========================
-
-  /**
-   * 启动 HTTP 轮询
-   *
-   * - 立即拉取一次，随后按 [CustomSourceConfig.pollIntervalMs] 定时轮询
-   * - 首次拉取成功后上报 connected
-   */
-  private fun startHttpPolling() {
-    val config = activeSourceConfig ?: return
-    if (config.endpoint.isEmpty()) {
-      Log.w(TAG, "endpoint 为空，跳过 HTTP 轮询")
-      emitWsStatus("error", "endpoint 为空")
-      return
-    }
-
-    if (httpClient == null) {
-      httpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .build()
-    }
-
-    if (httpPollHandler == null) {
-      httpPollHandler = Handler(Looper.getMainLooper())
-    }
-
-    val intervalMs = config.pollIntervalMs.coerceAtLeast(1000L)
-    Log.i(TAG, "HTTP 轮询启动: ${config.name} interval=${intervalMs}ms")
-    emitWsStatus("connecting", "连接中: ${config.name}")
-
-    val r = object : Runnable {
-      override fun run() {
-        pollHttpOnce()
-        // 调度下次轮询
-        httpPollHandler?.postDelayed(this, intervalMs)
-      }
-    }
-    httpPollRunnable = r
-    httpPollHandler?.post(r) // 立即执行第一次
-  }
-
-  /**
-   * 执行一次 HTTP 拉取（在后台线程）
-   *
-   * 鉴权：添加 Authorization: Bearer <authToken> 请求头（与 JS 层一致）
-   */
-  private fun pollHttpOnce() {
-    val config = activeSourceConfig ?: return
-    Thread {
-      try {
-        val requestBuilder = Request.Builder().url(config.endpoint)
-          .addHeader("Accept", "application/json")
-        if (!config.authToken.isNullOrEmpty()) {
-          requestBuilder.addHeader("Authorization", "Bearer ${config.authToken}")
-        }
-        val response = httpClient?.newCall(requestBuilder.build())?.execute()
-        val body = response?.body?.string()
-        response?.close()
-        if (body != null) {
-          handleSourceData(body)
-        }
-      } catch (e: Exception) {
-        Log.e(TAG, "HTTP 轮询失败: ${e.message}")
-        emitWsStatus("error", "拉取失败: ${e.message}")
-      }
-    }.start()
+    return CustomSourceConfig(
+      name = obj.optString("name", "customSource"),
+      endpoint = obj.optString("endpoint", ""),
+      protocol = obj.optString("protocol", "ws"),
+      authToken = obj.optString("authToken", "").ifEmpty { null },
+      pollIntervalMs = obj.optLong("pollIntervalMs", 30_000L),
+      fieldMapping = mapping,
+      priority = obj.optInt("priority", 0),
+    )
   }
 
   // ======================== 停止连接 ========================
 
   /**
-   * 停止当前所有连接（WS + HTTP 轮询）
+   * 停止所有源连接（WS + HTTP 轮询）
    *
-   * 用于 [reloadCustomSource] 重连前清理、[onDestroy] 服务销毁时释放资源。
+   * 用于 [reloadCustomSources] 重连前清理、[onDestroy] 服务销毁时释放资源。
+   * 遍历 [sourceConnections] 调用每个 [SourceConnection.stop]，然后清空 Map。
    */
   private fun stopConnection() {
-    isManualClose = true
-    // 取消 WS 重连
-    reconnectRunnable?.let { reconnectHandler?.removeCallbacks(it) }
-    reconnectRunnable = null
-    // 关闭 WS
-    try {
-      webSocket?.close(1000, "Service destroyed")
-    } catch (_: Exception) {
-      // 忽略关闭异常
+    for ((key, conn) in sourceConnections) {
+      Log.i(TAG, "停止源连接: $key")
+      conn.stop()
     }
-    webSocket = null
-
-    // 取消 HTTP 轮询
-    httpPollRunnable?.let { httpPollHandler?.removeCallbacks(it) }
-    httpPollRunnable = null
-
-    activeSourceConfig = null
+    sourceConnections.clear()
   }
 
   // ======================== 事件处理 ========================
@@ -506,11 +382,11 @@ class EewBackgroundService : Service() {
    * 4. 如果 App 不在前台，判断触发条件并启动 LockScreenAlertActivity
    *
    * @param text 原始数据文本（JSON）
+   * @param config 数据源配置（由 [SourceConnection] 传入，用于字段映射和事件 id 前缀）
    */
-  private fun handleSourceData(text: String) {
-    val config = activeSourceConfig ?: return
+  private fun handleSourceData(text: String, config: CustomSourceConfig) {
     val event = EewAlertEngine.parseWithMapping(text, config.fieldMapping) ?: return
-    Log.i(TAG, "收到事件 eventId=${event.eventId} mag=${event.magnitude} cancel=${event.isCancel} appInForeground=$appInForeground originTime=${event.originTime}")
+    Log.i(TAG, "收到事件 eventId=${event.eventId} mag=${event.magnitude} cancel=${event.isCancel} appInForeground=$appInForeground originTime=${event.originTime} source=${config.name}")
 
     // 转发去重（取消报独立去重）：同一报告不重复转发给 JS 层
     val dedupKey = if (event.isCancel) "${event.eventId}:cancel" else "${event.eventId}:${event.originTime}"
@@ -560,13 +436,13 @@ class EewBackgroundService : Service() {
     // 但仍需更新数据到已显示的悬浮窗/锁屏（同 ID 报告升级场景）
     if (triggeredEventIds.contains(event.eventId)) {
       Log.i(TAG, "事件 ${event.eventId} 已触发过警报，尝试更新已显示的 UI")
-      updateDisplayedEvent(event)
+      updateDisplayedEvent(event, config.name)
       return
     }
 
     // App 不在前台，检查触发条件并触发悬浮窗
     Log.i(TAG, "App 在后台，开始检查触发条件: appInForeground=$appInForeground eventId=${event.eventId}")
-    if (tryTriggerFloatingWindow(event)) {
+    if (tryTriggerFloatingWindow(event, config.name)) {
       triggeredEventIds.add(event.eventId)
     }
   }
@@ -580,8 +456,11 @@ class EewBackgroundService : Service() {
    * - 锁屏 Activity 在运行 → 调用 addEvent 更新（addEvent 已支持同 ID 更新）
    * - 后台悬浮窗在显示 → 更新 backgroundEvents 并刷新显示
    * - 两者都未显示 → 忽略（不应发生，但防御性处理）
+   *
+   * @param event 解析后的事件
+   * @param sourceName 数据源名称（用于锁屏/悬浮窗显示）
    */
-  private fun updateDisplayedEvent(event: ParsedCencEvent) {
+  private fun updateDisplayedEvent(event: ParsedCencEvent, sourceName: String?) {
     // 用户已手动关闭此事件的后台悬浮窗 → 不再重新弹出
     if (userDismissedEventIds.contains(event.eventId)) {
       Log.i(TAG, "事件 ${event.eventId} 已被用户关闭，跳过更新")
@@ -611,7 +490,7 @@ class EewBackgroundService : Service() {
         originTime = event.originTime,
         arrivalMs = arrivalMs,
         reportNum = event.reportNum,
-        sourceName = activeSourceConfig?.name,
+        sourceName = sourceName,
       )
       LockScreenAlertActivity.instance?.addEvent(eventData)
       Log.i(TAG, "更新锁屏事件: eventId=${event.eventId} mag=${event.magnitude} intensity=$intensity level=$alertLevel")
@@ -622,13 +501,13 @@ class EewBackgroundService : Service() {
     // 场景：之前在后台显示悬浮窗，屏幕随后锁屏，同 ID 新报告到来时应切换到锁屏 Activity
     if (isScreenLocked()) {
       Log.i(TAG, "屏幕已锁屏但 Activity 未运行，启动锁屏 Activity: eventId=${event.eventId}")
-      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs)
+      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs, sourceName)
       return
     }
 
     // 后台悬浮窗在显示 → 更新 backgroundEvents 并刷新
     if (backgroundEvents.containsKey(event.eventId)) {
-      val bgEvent = BackgroundEvent(event, intensity, distance, alertLevel, arrivalMs)
+      val bgEvent = BackgroundEvent(event, intensity, distance, alertLevel, arrivalMs, sourceName)
       // 保留旧的 arrived/alertsStopped 状态
       val old = backgroundEvents[event.eventId]
       if (old != null) {
@@ -644,7 +523,7 @@ class EewBackgroundService : Service() {
     // 既不在锁屏也不在后台悬浮窗（如 App 从前台切到后台后首次收到同 ID 新报告）
     // → 添加到后台悬浮窗队列并显示
     Log.i(TAG, "事件 ${event.eventId} 未在任何显示中，添加到后台悬浮窗: intensity=$intensity level=$alertLevel")
-    showFloatingWindowFromBackground(event, intensity, distance, alertLevel, arrivalMs)
+    showFloatingWindowFromBackground(event, intensity, distance, alertLevel, arrivalMs, sourceName)
   }
 
   /**
@@ -667,8 +546,11 @@ class EewBackgroundService : Service() {
    * - alert.floatingWindowEnabled == true
    * - 事件震级 >= alert.minMagnitude
    * - 计算预估烈度 >= alert.lockScreenIntensity
+   *
+   * @param event 解析后的事件
+   * @param sourceName 数据源名称（用于锁屏/悬浮窗显示）
    */
-  private fun tryTriggerFloatingWindow(event: ParsedCencEvent): Boolean {
+  private fun tryTriggerFloatingWindow(event: ParsedCencEvent, sourceName: String?): Boolean {
     val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     val lockScreenEnabled = prefs.getBoolean("lockScreenEnabled", true)
@@ -715,10 +597,10 @@ class EewBackgroundService : Service() {
     // - 不锁屏（后台）→ 悬浮窗 FloatingWindowModule（TYPE_APPLICATION_OVERLAY）
     if (isScreenLocked()) {
       Log.i(TAG, "屏幕已锁屏，启动 LockScreenAlertActivity")
-      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs)
+      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs, sourceName)
     } else {
       Log.i(TAG, "屏幕未锁屏（后台），显示悬浮窗 FloatingWindowModule")
-      showFloatingWindowFromBackground(event, intensity, distance, alertLevel, arrivalMs)
+      showFloatingWindowFromBackground(event, intensity, distance, alertLevel, arrivalMs, sourceName)
     }
     return true
   }
@@ -741,6 +623,7 @@ class EewBackgroundService : Service() {
    * @param distance 震中距 km
    * @param alertLevel 预警级别（blue/yellow/orange/red）
    * @param arrivalMs S 波到达时间戳
+   * @param sourceName 数据源名称（用于锁屏界面显示）
    */
   private fun startLockScreenActivity(
     event: ParsedCencEvent,
@@ -748,6 +631,7 @@ class EewBackgroundService : Service() {
     distance: Double,
     alertLevel: String,
     arrivalMs: Long,
+    sourceName: String?,
   ) {
     try {
       // 读取警报配置（声音/震动/闪光灯/自动音量），通过 Intent extras 传给 Activity
@@ -759,7 +643,6 @@ class EewBackgroundService : Service() {
       val alertVolume = prefs.getInt("alertVolume", 80)
 
       // 构造事件数据（用于 addEvent 调用）
-      val sourceName = activeSourceConfig?.name
       val eventData = LockScreenAlertActivity.LockScreenEvent(
         eventId = event.eventId,
         magnitude = event.magnitude,
@@ -898,6 +781,7 @@ class EewBackgroundService : Service() {
    * @param distance 震中距 km
    * @param alertLevel 预警级别（blue/yellow/orange/red）
    * @param arrivalMs S 波到达时间戳
+   * @param sourceName 数据源名称（用于悬浮窗显示）
    */
   private fun showFloatingWindowFromBackground(
     event: ParsedCencEvent,
@@ -905,23 +789,24 @@ class EewBackgroundService : Service() {
     distance: Double,
     alertLevel: String,
     arrivalMs: Long,
+    sourceName: String?,
   ) {
     val module = ReactContextProvider.floatingWindowModule
     if (module == null) {
       Log.w(TAG, "FloatingWindowModule 未初始化，回退到 LockScreenAlertActivity")
-      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs)
+      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs, sourceName)
       return
     }
 
     // 检查悬浮窗权限
     if (!Settings.canDrawOverlays(this)) {
       Log.w(TAG, "无悬浮窗权限（SYSTEM_ALERT_WINDOW），回退到 LockScreenAlertActivity")
-      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs)
+      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs, sourceName)
       return
     }
 
     // 加入后台事件队列
-    val bgEvent = BackgroundEvent(event, intensity, distance, alertLevel, arrivalMs)
+    val bgEvent = BackgroundEvent(event, intensity, distance, alertLevel, arrivalMs, sourceName)
     backgroundEvents[event.eventId] = bgEvent
 
     try {
@@ -958,7 +843,7 @@ class EewBackgroundService : Service() {
       }
     } catch (e: Exception) {
       Log.e(TAG, "显示悬浮窗失败: ${e.message}，回退到 LockScreenAlertActivity")
-      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs)
+      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs, sourceName)
     }
   }
 
@@ -1018,7 +903,7 @@ class EewBackgroundService : Service() {
     val arr = com.facebook.react.bridge.WritableNativeArray()
     for (bgEvent in displayList) {
       arr.pushMap(buildFloatingWindowContent(
-        bgEvent.event, bgEvent.intensity, bgEvent.distance, bgEvent.alertLevel, bgEvent.arrivalMs
+        bgEvent.event, bgEvent.intensity, bgEvent.distance, bgEvent.alertLevel, bgEvent.arrivalMs, bgEvent.sourceName
       ))
     }
     try {
@@ -1049,6 +934,7 @@ class EewBackgroundService : Service() {
     val distance: Double,
     val alertLevel: String,
     val arrivalMs: Long,
+    val sourceName: String? = null,
     var arrived: Boolean = false,
     var alertsStopped: Boolean = false,
   )
@@ -1154,6 +1040,7 @@ class EewBackgroundService : Service() {
     distance: Double,
     alertLevel: String,
     arrivalMs: Long,
+    sourceName: String?,
   ): com.facebook.react.bridge.WritableNativeMap {
     val now = System.currentTimeMillis()
     val remainSec = maxOf(((arrivalMs - now) / 1000.0).toInt(), 0)
@@ -1170,9 +1057,8 @@ class EewBackgroundService : Service() {
     if (event.reportNum != null && event.reportNum > 0) {
       content.putInt("reportNum", event.reportNum)
     }
-    val sName = activeSourceConfig?.name
-    if (!sName.isNullOrEmpty()) {
-      content.putString("sourceName", sName)
+    if (!sourceName.isNullOrEmpty()) {
+      content.putString("sourceName", sourceName)
     }
     return content
   }
@@ -1328,15 +1214,16 @@ class EewBackgroundService : Service() {
         reportNum = 1,
       )
 
-      // 转发给 JS 层（若 JS 仍存活），使用当前活跃源或 test 标识
-      val sourceName = activeSourceConfig?.name ?: "test"
+      // 转发给 JS 层（若 JS 仍存活），使用 test 标识
+      // 多源模式下测试预警不依赖任何具体源，使用默认 test 配置
+      val testSourceName = "test"
       emitEewEvent(event, CustomSourceConfig(
-        name = sourceName,
+        name = testSourceName,
         endpoint = "",
         protocol = "test",
         authToken = null,
         pollIntervalMs = 0L,
-        fieldMapping = activeSourceConfig?.fieldMapping ?: FieldMapping(
+        fieldMapping = FieldMapping(
           eventId = "$.eventId",
           originTime = "$.originTime",
           magnitude = "$.magnitude",
@@ -1386,10 +1273,10 @@ class EewBackgroundService : Service() {
       // 根据屏幕状态选择 UI（与 tryTriggerFloatingWindow 一致）
       if (isScreenLocked()) {
         Log.i(TAG, "triggerTestAlert: 屏幕已锁屏，启动 LockScreenAlertActivity")
-        startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs)
+        startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs, testSourceName)
       } else {
         Log.i(TAG, "triggerTestAlert: 屏幕未锁屏，显示悬浮窗 FloatingWindowModule")
-        showFloatingWindowFromBackground(event, intensity, distance, alertLevel, arrivalMs)
+        showFloatingWindowFromBackground(event, intensity, distance, alertLevel, arrivalMs, testSourceName)
       }
       return true
     } catch (e: Exception) {
@@ -1758,6 +1645,267 @@ class EewBackgroundService : Service() {
       .setSilent(true)
       .build()
   }
+
+  // ======================== 单源连接封装 ========================
+
+  /**
+   * 单源连接封装类（内部使用）
+   *
+   * 管理单个 customSource 的 WS/HTTP 连接、重连和数据处理，
+   * 与 JS 层 CustomSourceAdapter 行为对齐。
+   *
+   * 每个实例独立维护：
+   * - WebSocket 连接和重连状态
+   * - HTTP 轮询定时器
+   * - 手动关闭标志（避免 stop 后仍触发重连）
+   *
+   * 收到数据时回调外层 [handleSourceData] 处理事件。
+   */
+  private inner class SourceConnection(private val config: CustomSourceConfig) {
+
+    /** WebSocket 实例（protocol='ws' 时使用） */
+    private var webSocket: WebSocket? = null
+
+    /** 是否为手动关闭（避免 stop 后仍触发重连） */
+    private var isManualClose = false
+
+    /** WS 重连 Handler */
+    private val reconnectHandler: Handler = Handler(Looper.getMainLooper())
+
+    /** WS 重连 Runnable */
+    private var reconnectRunnable: Runnable? = null
+
+    /** WS 重连延迟（指数退避，初始 1s，上限 30s） */
+    private var reconnectDelayMs = 1000L
+
+    /** HTTP 轮询 Handler（protocol='http' 时使用） */
+    private val httpPollHandler: Handler = Handler(Looper.getMainLooper())
+
+    /** HTTP 轮询 Runnable */
+    private var httpPollRunnable: Runnable? = null
+
+    /**
+     * 启动连接
+     *
+     * 根据 [CustomSourceConfig.protocol] 选择 WS 或 HTTP 轮询。
+     * 连接前检查 allowHttp 开关：false 时拒绝非 localhost 的 HTTP endpoint。
+     */
+    fun start() {
+      // HTTP 明文连接检查：allowHttp=false 时拒绝非 localhost 的 HTTP/WS endpoint
+      val endpoint = config.endpoint
+      val isHttp = endpoint.startsWith("http://") || endpoint.startsWith("ws://")
+      val isLocalhost = isLocalhostEndpoint(endpoint)
+      val allowHttp = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        .getBoolean("allowHttp", false)
+      if (isHttp && !isLocalhost && !allowHttp) {
+        Log.w(TAG, "源 ${config.name} 跳过 HTTP 连接（allowHttp=false）: $endpoint")
+        emitWsStatus("error", "${config.name}: HTTP 被禁用（设置中开启允许 HTTP）")
+        return
+      }
+
+      when (config.protocol) {
+        "ws" -> startWebSocket()
+        "http" -> startHttpPolling()
+        else -> Log.w(TAG, "源 ${config.name} 未知协议: ${config.protocol}")
+      }
+    }
+
+    /**
+     * 判断 endpoint 是否为 localhost（允许 HTTP 明文）
+     * 匹配：localhost / 127.0.0.1 / 10.0.2.2（模拟器）
+     */
+    private fun isLocalhostEndpoint(endpoint: String): Boolean {
+      val host = try {
+        java.net.URI(endpoint).host ?: return false
+      } catch (_: Exception) {
+        return false
+      }
+      return host == "localhost" || host == "127.0.0.1" || host == "10.0.2.2"
+    }
+
+    /**
+     * 停止连接（WS + HTTP 轮询）
+     *
+     * 标记手动关闭，取消重连，关闭 WS，取消 HTTP 轮询。
+     */
+    fun stop() {
+      isManualClose = true
+      // 取消 WS 重连
+      reconnectRunnable?.let { reconnectHandler.removeCallbacks(it) }
+      reconnectRunnable = null
+      // 关闭 WS
+      try {
+        webSocket?.close(1000, "Source stopped")
+      } catch (_: Exception) {
+        // 忽略关闭异常
+      }
+      webSocket = null
+      // 取消 HTTP 轮询
+      httpPollRunnable?.let { httpPollHandler.removeCallbacks(it) }
+      httpPollRunnable = null
+      Log.i(TAG, "源 ${config.name} 已停止")
+    }
+
+    // ======================== WebSocket 连接 ========================
+
+    /**
+     * 启动 WebSocket 连接
+     *
+     * URL 来自 [CustomSourceConfig.endpoint]，鉴权通过 URL 查询参数 ?token=<authToken>。
+     * 若已连接则不重复连接。
+     */
+    private fun startWebSocket() {
+      if (webSocket != null) {
+        Log.i(TAG, "源 ${config.name} WebSocket 已存在，跳过")
+        return
+      }
+      if (config.endpoint.isEmpty()) {
+        Log.w(TAG, "源 ${config.name} endpoint 为空，跳过 WebSocket 连接")
+        emitWsStatus("error", "${config.name}: endpoint 为空")
+        return
+      }
+
+      isManualClose = false
+      reconnectDelayMs = 1000L
+
+      // 初始化共享 OkHttpClient（所有源共享一个实例）
+      if (httpClient == null) {
+        httpClient = OkHttpClient.Builder()
+          .pingInterval(30, TimeUnit.SECONDS)
+          .readTimeout(0, TimeUnit.MILLISECONDS) // WebSocket 不超时
+          .build()
+      }
+
+      val url = buildWsUrl(config.endpoint, config.authToken)
+      Log.i(TAG, "源 ${config.name} WebSocket 连接 $url")
+      emitWsStatus("connecting", "连接中: ${config.name}")
+
+      val request = Request.Builder().url(url).build()
+      webSocket = httpClient?.newWebSocket(request, object : WebSocketListener() {
+        override fun onOpen(webSocket: WebSocket, response: Response) {
+          Log.i(TAG, "源 ${config.name} WebSocket 已连接")
+          reconnectDelayMs = 1000L
+          emitWsStatus("connected", "${config.name} 已连接")
+        }
+
+        override fun onMessage(webSocket: WebSocket, text: String) {
+          handleSourceData(text, config)
+        }
+
+        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+          Log.e(TAG, "源 ${config.name} WebSocket 错误: ${t.message}")
+          this@SourceConnection.webSocket = null
+          if (!isManualClose) {
+            emitWsStatus("error", "${config.name} WebSocket 错误: ${t.message}")
+            scheduleReconnect()
+          }
+        }
+
+        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+          Log.i(TAG, "源 ${config.name} WebSocket 已关闭: $code $reason")
+          this@SourceConnection.webSocket = null
+          if (!isManualClose) {
+            emitWsStatus("disconnected", "${config.name} WebSocket 意外断开，准备重连")
+            scheduleReconnect()
+          }
+        }
+      })
+    }
+
+    /**
+     * 指数退避重连
+     * 初始 1s，倍数 2，上限 30s
+     */
+    private fun scheduleReconnect() {
+      if (isManualClose) return
+      reconnectRunnable?.let { reconnectHandler.removeCallbacks(it) }
+      val delay = reconnectDelayMs
+      Log.i(TAG, "源 ${config.name} WebSocket ${delay}ms 后重连")
+      emitWsStatus("connecting", "${config.name} ${delay}ms 后重连")
+      val r = Runnable {
+        if (!isManualClose) {
+          reconnectDelayMs = minOf(reconnectDelayMs * 2, 30_000L)
+          startWebSocket()
+        }
+      }
+      reconnectRunnable = r
+      reconnectHandler.postDelayed(r, delay)
+    }
+
+    /**
+     * 构建 WS URL（追加 token 查询参数，与 JS 层 CustomSourceAdapter.buildWsUrl 行为一致）
+     */
+    private fun buildWsUrl(endpoint: String, authToken: String?): String {
+      if (authToken.isNullOrEmpty()) return endpoint
+      val sep = if (endpoint.contains("?")) "&" else "?"
+      return "${endpoint}${sep}token=${java.net.URLEncoder.encode(authToken, "UTF-8")}"
+    }
+
+    // ======================== HTTP 轮询 ========================
+
+    /**
+     * 启动 HTTP 轮询
+     *
+     * - 立即拉取一次，随后按 [CustomSourceConfig.pollIntervalMs] 定时轮询
+     * - 首次拉取成功后上报 connected
+     */
+    private fun startHttpPolling() {
+      if (config.endpoint.isEmpty()) {
+        Log.w(TAG, "源 ${config.name} endpoint 为空，跳过 HTTP 轮询")
+        emitWsStatus("error", "${config.name}: endpoint 为空")
+        return
+      }
+
+      // 初始化共享 OkHttpClient（WS 和 HTTP 共用）
+      if (httpClient == null) {
+        httpClient = OkHttpClient.Builder()
+          .connectTimeout(15, TimeUnit.SECONDS)
+          .readTimeout(15, TimeUnit.SECONDS)
+          .pingInterval(30, TimeUnit.SECONDS)
+          .build()
+      }
+
+      val intervalMs = config.pollIntervalMs.coerceAtLeast(1000L)
+      Log.i(TAG, "源 ${config.name} HTTP 轮询启动: interval=${intervalMs}ms")
+      emitWsStatus("connecting", "连接中: ${config.name}")
+
+      val r = object : Runnable {
+        override fun run() {
+          pollHttpOnce()
+          // 调度下次轮询
+          httpPollHandler.postDelayed(this, intervalMs)
+        }
+      }
+      httpPollRunnable = r
+      httpPollHandler.post(r) // 立即执行第一次
+    }
+
+    /**
+     * 执行一次 HTTP 拉取（在后台线程）
+     *
+     * 鉴权：添加 Authorization: Bearer <authToken> 请求头（与 JS 层一致）
+     */
+    private fun pollHttpOnce() {
+      Thread {
+        try {
+          val requestBuilder = Request.Builder().url(config.endpoint)
+            .addHeader("Accept", "application/json")
+          if (!config.authToken.isNullOrEmpty()) {
+            requestBuilder.addHeader("Authorization", "Bearer ${config.authToken}")
+          }
+          val response = httpClient?.newCall(requestBuilder.build())?.execute()
+          val body = response?.body?.string()
+          response?.close()
+          if (body != null) {
+            handleSourceData(body, config)
+          }
+        } catch (e: Exception) {
+          Log.e(TAG, "源 ${config.name} HTTP 轮询失败: ${e.message}")
+          emitWsStatus("error", "${config.name} 拉取失败: ${e.message}")
+        }
+      }.start()
+    }
+  }
 }
 
 /**
@@ -1778,6 +1926,8 @@ private data class CustomSourceConfig(
   val pollIntervalMs: Long,
   /** 字段映射配置 */
   val fieldMapping: FieldMapping,
+  /** 源优先级（用于事件 id 前缀，与 JS 层 customSource-${host}-${priority} 对齐） */
+  val priority: Int = 0,
 )
 
 /**
