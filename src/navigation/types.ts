@@ -16,6 +16,8 @@ export type RootStackParamList = {
   EventDetail: {event: EewEvent};
   /** 模拟预警页面（从设置页进入） */
   SimulateAlert: undefined;
+  /** 关于页面（含用户协议、应用信息） */
+  About: undefined;
 };
 
 /** Onboarding 页面的 navigation/props 类型 */
@@ -43,4 +45,10 @@ export type EventDetailScreenProps = NativeStackScreenProps<
 export type SimulateAlertScreenProps = NativeStackScreenProps<
   RootStackParamList,
   'SimulateAlert'
+>;
+
+/** About 页面的 navigation/props 类型 */
+export type AboutScreenProps = NativeStackScreenProps<
+  RootStackParamList,
+  'About'
 >;

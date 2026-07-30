@@ -5,7 +5,11 @@
 // - 序列化/反序列化（serializePack + parsePack）：往返一致性
 // - 解析（parsePack）：非 JSON、缺字段、version 不匹配
 // - 校验（validatePack）：合法包、缺 format、缺 sources、source 缺必填字段、endpoint 非 URL
-// - 合并（mergeImported）：新增、覆盖（同 priority）、混合
+// - 合并（mergeImported）：
+//   * 新增（不同 endpoint）
+//   * 更新（同 endpoint，priority 保留旧值）
+//   * priority 冲突重新分配（不同 endpoint 但 priority 相同）
+//   * 混合场景
 // - 一键导入（importFromJson）：成功路径 + 错误路径
 //
 // 这些测试同时作为分享包 schema 的可执行文档
@@ -521,67 +525,157 @@ describe('sourceShare', () => {
       expect(result.merged).toHaveLength(0);
       expect(result.added).toBe(0);
       expect(result.updated).toBe(0);
+      expect(result.reassigned).toBe(0);
     });
 
-    test('空 existing + 非空 imported 全部为新增', () => {
+    test('空 existing + 非空 imported（不同 endpoint）全部为新增', () => {
       const src1 = makeValidSource({priority: 10});
-      const src2 = makeValidSource({priority: 20, name: 'EMSC'});
+      const src2 = makeValidSource({
+        priority: 20,
+        name: 'EMSC',
+        endpoint: 'https://www.seismicportal.eu/fdsnws/event/1/query?format=json',
+      });
       const result = mergeImported([], [src1, src2]);
       expect(result.merged).toHaveLength(2);
       expect(result.added).toBe(2);
       expect(result.updated).toBe(0);
+      expect(result.reassigned).toBe(0);
       // 安全设计：导入的源强制 enabled=false
       expect(result.merged.every(s => s.enabled === false)).toBe(true);
     });
 
-    test('同 priority 覆盖', () => {
+    test('同 endpoint 更新（即使 priority 不同，保留旧 priority）', () => {
+      // 场景：用户已有 USGS 源（priority=10），导入同 endpoint 的新配置（priority=999）
+      // 期望：更新为导入的配置，但 priority 保留为 10（避免破坏用户排序）
       const existing = [makeValidSource({priority: 10, name: '原 USGS'})];
-      const imported = [makeValidSource({priority: 10, name: '新 USGS'})];
+      const imported = [makeValidSource({priority: 999, name: '新 USGS'})];
       const result = mergeImported(existing, imported);
       expect(result.merged).toHaveLength(1);
       expect(result.merged[0].name).toBe('新 USGS');
+      expect(result.merged[0].priority).toBe(10); // 保留旧 priority
       expect(result.added).toBe(0);
       expect(result.updated).toBe(1);
-      // 安全设计：覆盖后 enabled=false
+      expect(result.reassigned).toBe(0);
+      // 安全设计：更新后 enabled=false
       expect(result.merged[0].enabled).toBe(false);
     });
 
-    test('混合场景：部分新增部分覆盖', () => {
+    test('不同 endpoint 同 priority：重新分配 priority（不覆盖现有源）', () => {
+      // 场景：用户已有真实源（priority=100），导入测试源（priority=100，但 endpoint 不同）
+      // 这是用户反馈的核心问题：之前按 priority 去重会覆盖真实源
+      // 期望：测试源作为新源追加，priority 重新分配为 100→101（100 已被占用）
+      const existing = [makeValidSource({
+        priority: 100,
+        name: '真实源',
+        endpoint: 'https://real.example.com/api',
+      })];
+      const imported = [makeValidSource({
+        priority: 100,
+        name: '测试源',
+        endpoint: 'https://test.example.com/api',
+      })];
+      const result = mergeImported(existing, imported);
+      expect(result.merged).toHaveLength(2); // 两个源都保留
+      expect(result.added).toBe(1);
+      expect(result.updated).toBe(0);
+      expect(result.reassigned).toBe(1);
+      // 测试源的 priority 被重新分配（100 → 101）
+      const testSrc = result.merged.find(s => s.name === '测试源');
+      const realSrc = result.merged.find(s => s.name === '真实源');
+      expect(testSrc?.priority).toBe(101);
+      expect(realSrc?.priority).toBe(100); // 现有源 priority 不变
+      // 安全设计：导入的源强制 false，现有源保持原样
+      expect(testSrc?.enabled).toBe(false);
+      expect(realSrc?.enabled).toBe(true);
+    });
+
+    test('endpoint 大小写不敏感：同地址不同大小写视为同一源', () => {
+      const existing = [makeValidSource({
+        priority: 10,
+        endpoint: 'https://Example.COM/API',
+      })];
+      const imported = [makeValidSource({
+        priority: 20,
+        name: '新配置',
+        endpoint: 'https://example.com/api',
+      })];
+      const result = mergeImported(existing, imported);
+      expect(result.merged).toHaveLength(1);
+      expect(result.updated).toBe(1);
+      expect(result.added).toBe(0);
+      expect(result.merged[0].name).toBe('新配置');
+    });
+
+    test('混合场景：部分新增部分更新部分重排', () => {
       const existing = [
         makeValidSource({priority: 10, name: 'USGS 旧'}),
-        makeValidSource({priority: 20, name: 'EMSC'}),
+        makeValidSource({
+          priority: 20,
+          name: 'EMSC',
+          endpoint: 'https://www.seismicportal.eu/fdsnws/event/1/query?format=json',
+        }),
       ];
       const imported = [
-        makeValidSource({priority: 10, name: 'USGS 新'}),
-        makeValidSource({priority: 30, name: 'JMA'}),
+        // USGS 新：同 endpoint（默认）→ 更新
+        makeValidSource({priority: 999, name: 'USGS 新'}),
+        // JMA：不同 endpoint + priority 冲突（20）→ 重新分配
+        makeValidSource({
+          priority: 20,
+          name: 'JMA',
+          endpoint: 'https://www.jma.go.jp/bosai/quake/data/list.json',
+        }),
+        // IRIS：不同 endpoint + priority 不冲突（30）→ 直接追加
+        makeValidSource({
+          priority: 30,
+          name: 'IRIS',
+          endpoint: 'https://service.iris.edu/fdsnws/event/1/query?format=json',
+        }),
       ];
       const result = mergeImported(existing, imported);
-      expect(result.merged).toHaveLength(3);
-      expect(result.added).toBe(1);
-      expect(result.updated).toBe(1);
-      expect(result.merged.map(s => s.name).sort()).toEqual(['EMSC', 'JMA', 'USGS 新']);
-      // 安全设计：导入的源（USGS 新、JMA）enabled=false，原有源（EMSC）保持原样
+      expect(result.merged).toHaveLength(4);
+      expect(result.added).toBe(2);  // JMA + IRIS
+      expect(result.updated).toBe(1); // USGS 新
+      expect(result.reassigned).toBe(1); // JMA（priority 20 冲突）
+
+      // USGS 新：更新，priority 保留旧值 10
       const usgsNew = result.merged.find(s => s.name === 'USGS 新');
-      const jma = result.merged.find(s => s.name === 'JMA');
-      const emsc = result.merged.find(s => s.name === 'EMSC');
+      expect(usgsNew?.priority).toBe(10);
       expect(usgsNew?.enabled).toBe(false);
+
+      // JMA：新源，priority 从 20 重新分配为 100（因为 20 被 EMSC 占用）
+      const jma = result.merged.find(s => s.name === 'JMA');
+      expect(jma?.priority).toBe(100);
       expect(jma?.enabled).toBe(false);
+
+      // IRIS：新源，priority 保持 30
+      const iris = result.merged.find(s => s.name === 'IRIS');
+      expect(iris?.priority).toBe(30);
+      expect(iris?.enabled).toBe(false);
+
+      // EMSC：现有源，保持原样
+      const emsc = result.merged.find(s => s.name === 'EMSC');
+      expect(emsc?.priority).toBe(20);
       expect(emsc?.enabled).toBe(true);
     });
 
     test('合并后按 priority 升序', () => {
-      const existing = [makeValidSource({priority: 30, name: 'C'})];
+      const existing = [makeValidSource({
+        priority: 30,
+        name: 'C',
+        endpoint: 'https://c.example.com/api',
+      })];
       const imported = [
-        makeValidSource({priority: 10, name: 'A'}),
-        makeValidSource({priority: 20, name: 'B'}),
+        makeValidSource({priority: 10, name: 'A', endpoint: 'https://a.example.com/api'}),
+        makeValidSource({priority: 20, name: 'B', endpoint: 'https://b.example.com/api'}),
       ];
       const result = mergeImported(existing, imported);
       expect(result.merged.map(s => s.priority)).toEqual([10, 20, 30]);
+      expect(result.merged.map(s => s.name)).toEqual(['A', 'B', 'C']);
     });
 
     test('不修改原始数组', () => {
-      const existing = [makeValidSource({priority: 10})];
-      const imported = [makeValidSource({priority: 20})];
+      const existing = [makeValidSource({priority: 10, endpoint: 'https://a.example.com/api'})];
+      const imported = [makeValidSource({priority: 20, endpoint: 'https://b.example.com/api'})];
       const existingBefore = JSON.parse(JSON.stringify(existing));
       const importedBefore = JSON.parse(JSON.stringify(imported));
       mergeImported(existing, imported);
@@ -593,7 +687,12 @@ describe('sourceShare', () => {
       // makeValidSource 默认 enabled=true，模拟分享包中 enabled=true 的情况
       const imported = [
         makeValidSource({priority: 10, enabled: true}),
-        makeValidSource({priority: 20, enabled: true, name: 'EMSC'}),
+        makeValidSource({
+          priority: 20,
+          enabled: true,
+          name: 'EMSC',
+          endpoint: 'https://www.seismicportal.eu/fdsnws/event/1/query?format=json',
+        }),
       ];
       const result = mergeImported([], imported);
       expect(result.merged).toHaveLength(2);
@@ -603,9 +702,18 @@ describe('sourceShare', () => {
     test('现有源的 enabled 状态不被修改', () => {
       const existing = [
         makeValidSource({priority: 10, enabled: true}),
-        makeValidSource({priority: 20, enabled: false, name: 'EMSC'}),
+        makeValidSource({
+          priority: 20,
+          enabled: false,
+          name: 'EMSC',
+          endpoint: 'https://www.seismicportal.eu/fdsnws/event/1/query?format=json',
+        }),
       ];
-      const imported = [makeValidSource({priority: 30, name: 'JMA'})];
+      const imported = [makeValidSource({
+        priority: 30,
+        name: 'JMA',
+        endpoint: 'https://www.jma.go.jp/bosai/quake/data/list.json',
+      })];
       const result = mergeImported(existing, imported);
       const usgs = result.merged.find(s => s.priority === 10);
       const emsc = result.merged.find(s => s.priority === 20);
@@ -613,6 +721,27 @@ describe('sourceShare', () => {
       expect(usgs?.enabled).toBe(true);   // 现有源保持原样
       expect(emsc?.enabled).toBe(false);  // 现有源保持原样
       expect(jma?.enabled).toBe(false);   // 导入的源强制 false
+    });
+
+    test('多个新源 priority 连续冲突时递增分配', () => {
+      // 场景：existing 占用 priority 100、101，导入两个新源都用 priority 100
+      // 期望：第一个新源分配 102，第二个新源分配 103
+      const existing = [
+        makeValidSource({priority: 100, name: '源A', endpoint: 'https://a.example.com/api'}),
+        makeValidSource({priority: 101, name: '源B', endpoint: 'https://b.example.com/api'}),
+      ];
+      const imported = [
+        makeValidSource({priority: 100, name: '新源C', endpoint: 'https://c.example.com/api'}),
+        makeValidSource({priority: 100, name: '新源D', endpoint: 'https://d.example.com/api'}),
+      ];
+      const result = mergeImported(existing, imported);
+      expect(result.merged).toHaveLength(4);
+      expect(result.added).toBe(2);
+      expect(result.reassigned).toBe(2);
+      const newC = result.merged.find(s => s.name === '新源C');
+      const newD = result.merged.find(s => s.name === '新源D');
+      expect(newC?.priority).toBe(102);
+      expect(newD?.priority).toBe(103);
     });
   });
 
@@ -629,6 +758,7 @@ describe('sourceShare', () => {
         expect(result.merged).toHaveLength(1);
         expect(result.added).toBe(1);
         expect(result.updated).toBe(0);
+        expect(result.reassigned).toBe(0);
       }
     });
 
@@ -651,7 +781,7 @@ describe('sourceShare', () => {
       }
     });
 
-    test('导入到非空 existing 正确合并', () => {
+    test('导入到非空 existing 正确合并（同 endpoint 更新）', () => {
       const existing = [makeValidSource({priority: 10, name: '已有 USGS'})];
       const imported = [makeValidSource({priority: 10, name: '新 USGS'})];
       const pack = exportSources(imported);
@@ -662,6 +792,21 @@ describe('sourceShare', () => {
         expect(result.merged).toHaveLength(1);
         expect(result.merged[0].name).toBe('新 USGS');
         expect(result.updated).toBe(1);
+        expect(result.reassigned).toBe(0);
+      }
+    });
+
+    test('导入到非空 existing（不同 endpoint 重新分配 priority）', () => {
+      const existing = [makeValidSource({priority: 100, name: '真实源', endpoint: 'https://real.example.com/api'})];
+      const imported = [makeValidSource({priority: 100, name: '测试源', endpoint: 'https://test.example.com/api'})];
+      const pack = exportSources(imported);
+      const json = serializePack(pack);
+      const result = importFromJson(json, existing);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.merged).toHaveLength(2);
+        expect(result.added).toBe(1);
+        expect(result.reassigned).toBe(1);
       }
     });
   });

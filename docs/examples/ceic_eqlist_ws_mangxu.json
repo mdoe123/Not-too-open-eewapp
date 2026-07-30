@@ -1,0 +1,28 @@
+{
+  "format": "eew-app-source-pack",
+  "version": 1,
+  "exportedAt": 1785300000000,
+  "exportedBy": "mangxuCEIC(WS)",
+  "sources": [
+    {
+      "type": "customSource",
+      "name": "mangxuCEIC(WS)",
+      "enabled": false,
+      "priority": 104,
+      "category": "eqlist",
+      "protocol": "ws",
+      "endpoint": "wss://ws.mangxufurry.cc.cd/ws/agency/ceic",
+      "note": "mangxu的CEIC（中国地震台网）地震速报 - WebSocket 实时推流 源",
+      "fieldMapping": {
+        "listPath": "$.earthquakes",
+        "eventId": "$.id",
+        "originTime": "$.ceic_raw.time",
+        "magnitude": "$.magnitude",
+        "depth": "$.depth_km",
+        "lat": "$.latitude",
+        "lng": "$.longitude",
+        "location": "$.location"
+      }
+    }
+  ]
+}

@@ -68,7 +68,16 @@ export class CustomSourceAdapter implements SourceAdapter {
   private readonly pollIntervalMs: number;
   /** HTTP 心跳超时阈值（毫秒） */
   private readonly heartbeatTimeoutMs: number;
-  /** 事件 id 前缀（用 endpoint 主机名区分多个自定义源） */
+  /**
+   * 事件 id 前缀（用于区分多个自定义源，避免同 host 不同源的事件 ID 冲突）
+   *
+   * 组成：customSource-{host}-{priority}
+   * - host：endpoint 主机名
+   * - priority：源优先级（用户配置中每个源应唯一）
+   *
+   * 仅用 host 会导致同 host 不同源（如同一服务器不同路径的测试源与真实源）
+   * 事件 ID 前缀相同，触发 mergeEvent 的"同 ID 保留震级高的"逻辑，互相覆盖。
+   */
   private readonly idPrefix: string;
 
   constructor(config: SourceConfig) {
@@ -78,7 +87,7 @@ export class CustomSourceAdapter implements SourceAdapter {
       this.pollIntervalMs * HEARTBEAT_TIMEOUT_MULTIPLIER,
       HEARTBEAT_TIMEOUT_MIN_MS,
     );
-    this.idPrefix = `customSource-${extractHost(config.endpoint ?? '')}`;
+    this.idPrefix = `customSource-${extractHost(config.endpoint ?? '')}-${config.priority}`;
   }
 
   /**
@@ -400,6 +409,7 @@ export class CustomSourceAdapter implements SourceAdapter {
       : null;
     const isFinal = mapping.isFinal ? extractBoolean(raw, mapping.isFinal) : false;
     const isCancel = mapping.isCancel ? extractBoolean(raw, mapping.isCancel) : false;
+    const reportNum = mapping.reportNum ? extractNumber(raw, mapping.reportNum) : null;
 
     return {
       id: `${this.idPrefix}-${id}`,
@@ -414,6 +424,8 @@ export class CustomSourceAdapter implements SourceAdapter {
       isFinal: isFinal || isCancel,
       isCancel,
       receivedAt: Date.now(),
+      reportNum: reportNum ?? undefined,
+      sourceName: this.config.name,
     };
   }
 

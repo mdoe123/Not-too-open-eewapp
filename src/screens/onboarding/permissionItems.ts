@@ -8,7 +8,7 @@
 // - 后台运行检测通知权限（前台服务依赖通知），作为后台能力的代理检测
 
 import {Platform, Linking} from 'react-native';
-import {check, request, RESULTS, PERMISSIONS, checkNotifications, requestNotifications} from 'react-native-permissions';
+import {check, request, checkMultiple, requestMultiple, RESULTS, PERMISSIONS, checkNotifications, requestNotifications} from 'react-native-permissions';
 import {FloatingWindowManager} from '../../native/FloatingWindowManager';
 import {AutoStartManager} from '../../native/AutoStartManager';
 import {PermissionManager} from '../../native/PermissionManager';
@@ -60,27 +60,49 @@ function isGranted(status: string): boolean {
 /**
  * 位置权限检查
  * 非 Android 平台直接返回 true（iOS 暂未适配，本应用仅面向 Android）
+ *
+ * Android 12+ 用户可能只授予"大致位置"（ACCESS_COARSE_LOCATION），
+ * 此时 FINE 为 DENIED 但 COARSE 为 GRANTED，仍可降级到网络定位。
+ * 任一位置权限授予即视为已授权。
  */
 async function checkLocation(): Promise<boolean> {
   if (Platform.OS !== 'android') {
     return true;
   }
   try {
-    const status = await check(PERMISSIONS.ANDROID.ACCESS_FINE_LOCATION);
-    return isGranted(status);
+    const statuses = await checkMultiple([
+      PERMISSIONS.ANDROID.ACCESS_FINE_LOCATION,
+      PERMISSIONS.ANDROID.ACCESS_COARSE_LOCATION,
+    ]);
+    return (
+      isGranted(statuses[PERMISSIONS.ANDROID.ACCESS_FINE_LOCATION]) ||
+      isGranted(statuses[PERMISSIONS.ANDROID.ACCESS_COARSE_LOCATION])
+    );
   } catch {
     return false;
   }
 }
 
-/** 位置权限请求 */
+/**
+ * 位置权限请求
+ *
+ * 同时请求 ACCESS_FINE_LOCATION 和 ACCESS_COARSE_LOCATION，
+ * 系统会弹出"精确位置/大致位置"选择对话框。
+ * 用户授予任一即视为成功（COARSE 时降级到网络定位）。
+ */
 async function requestLocation(): Promise<boolean> {
   if (Platform.OS !== 'android') {
     return true;
   }
   try {
-    const status = await request(PERMISSIONS.ANDROID.ACCESS_FINE_LOCATION);
-    return isGranted(status);
+    const statuses = await requestMultiple([
+      PERMISSIONS.ANDROID.ACCESS_FINE_LOCATION,
+      PERMISSIONS.ANDROID.ACCESS_COARSE_LOCATION,
+    ]);
+    return (
+      isGranted(statuses[PERMISSIONS.ANDROID.ACCESS_FINE_LOCATION]) ||
+      isGranted(statuses[PERMISSIONS.ANDROID.ACCESS_COARSE_LOCATION])
+    );
   } catch {
     return false;
   }

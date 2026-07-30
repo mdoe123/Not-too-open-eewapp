@@ -26,6 +26,10 @@ export interface FloatingWindowContent {
   originTime: number;
   /** 是否为取消报（true 时悬浮窗显示"地震预警取消"） */
   isCancel?: boolean;
+  /** 报数（第几报，若数据源提供） */
+  reportNum?: number;
+  /** 数据源显示名称 */
+  sourceName?: string;
 }
 
 /**

@@ -31,4 +31,26 @@ export const SoundManager = {
     if (Platform.OS !== 'android') return Promise.resolve();
     return SoundModule?.stopAlertSound() ?? Promise.resolve();
   },
+
+  /**
+   * 保存当前媒体音量并设置为指定百分比
+   * @param volumePercent 目标音量百分比（0-100）
+   *
+   * 在预警开始前调用（仅当 autoVolumeEnabled=true）。
+   * 重复调用不会覆盖已保存的值。
+   */
+  saveAndSetMediaVolume(volumePercent: number): Promise<void> {
+    if (Platform.OS !== 'android') return Promise.resolve();
+    return SoundModule?.saveAndSetMediaVolume(volumePercent) ?? Promise.resolve();
+  },
+
+  /**
+   * 恢复之前保存的媒体音量
+   *
+   * 在预警结束后调用。若未保存过则无操作。
+   */
+  restoreMediaVolume(): Promise<void> {
+    if (Platform.OS !== 'android') return Promise.resolve();
+    return SoundModule?.restoreMediaVolume() ?? Promise.resolve();
+  },
 };

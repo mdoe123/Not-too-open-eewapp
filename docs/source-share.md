@@ -110,11 +110,28 @@ interface SourceShareChunk {
 
 ### 4.2 导入方安全
 
-- **强制禁用**：导入的源在 `mergeImported` 中被强制设置 `enabled = false`，即使分享包中 `enabled = true` 也会被覆盖
+- **强制禁用**：导入的源在 `mergeImported` 中被强制设置 `enabled = false`，即使分享包中 `enabled = true` 也会被覆盖（含同 endpoint 更新场景）
 - **手动启用**：用户需在数据源管理列表中手动开启源开关
 - **防自动连接**：避免分享包中恶意 `enabled = true` 导致导入后立即连接未经验证的源
 
-### 4.3 鉴权信息处理
+### 4.3 合并去重策略
+
+`mergeImported` 按 `endpoint`（大小写不敏感）判断源冲突，而非 `priority`：
+
+| 场景 | 行为 | 统计字段 |
+|------|------|---------|
+| 同 endpoint（同 API 地址） | 更新现有源配置，保留旧 `priority`（避免破坏用户排序） | `updated++` |
+| 不同 endpoint + `priority` 不冲突 | 直接追加为新源 | `added++` |
+| 不同 endpoint + `priority` 冲突 | 追加为新源，`priority` 重新分配（从 100 递增） | `added++`、`reassigned++` |
+
+> **设计理由**：早期版本按 `priority` 去重会导致"导入测试源覆盖真实源"——只要 priority 相同就覆盖，不管 endpoint 是否不同。改为 endpoint 去重后，只有同一 API 地址才视为同一源，不同 API 地址的源即使 priority 相同也会作为新源追加（priority 自动重排），从根本上避免误覆盖。
+
+合并结果 `MergeResult` 包含三个统计字段：
+- `added`：新增源数量（不同 endpoint）
+- `updated`：更新源数量（同 endpoint）
+- `reassigned`：重新分配 priority 的源数量
+
+### 4.4 鉴权信息处理
 
 - 导入后若源需要鉴权（`authToken` 必填），用户需自行填写
 - App 不提供任何默认 authToken，不存储任何官方鉴权凭据
@@ -187,7 +204,18 @@ interface SourceShareChunk {
 
 `src/sources/custom/__tests__/sourceShare.test.ts` 覆盖：
 
-- `mergeImported` 强制 `enabled = false`（5 处断言）
+- `mergeImported` 合并去重（11 个用例）：
+  - 空 existing + 空 imported
+  - 不同 endpoint 全部新增
+  - 同 endpoint 更新（保留旧 priority）
+  - 不同 endpoint 同 priority 重新分配（核心场景：测试源不覆盖真实源）
+  - endpoint 大小写不敏感
+  - 混合场景（新增 + 更新 + 重排）
+  - 按 priority 升序排序
+  - 不修改原始数组
+  - 强制 enabled=false
+  - 现有源 enabled 不被修改
+  - 多个新源 priority 连续冲突时递增分配
 - `chunkPack` 分块逻辑（7 个用例：单块/阈值/多块/3 块/chunkHash/空字符串/真实包往返）
 - `assembleChunks` 校验链（13 个用例：单块/多块/乱序/重复/缺失/空数组/format/version/totalChunks/totalBytes/chunkIndex 越界/chunkHash 不匹配/payload 篡改）
 - 常量定义（2 个用例：`CHUNKED_PACK_FORMAT` / `MAX_CHUNK_BYTES`）

@@ -1,0 +1,30 @@
+{
+  "format": "eew-app-source-pack",
+  "version": 1,
+  "exportedAt": 1785300000000,
+  "exportedBy": "mangxuCEA-PR(WS)",
+  "sources": [
+    {
+      "type": "customSource",
+      "name": "mangxuCEA-PR(WS)",
+      "enabled": false,
+      "priority": 105,
+      "category": "eew",
+      "protocol": "ws",
+      "endpoint": "wss://ws.mangxufurry.cc.cd/ws/agency/cea_pr",
+      "note": "CEA-PR（中国地震台网省级）地震预警 - WebSocket 实时推流。",
+      "fieldMapping": {
+        "listPath": "$.earthquakes",
+        "eventId": "$.id",
+        "originTime": "$.cea_data.event_time",
+        "magnitude": "$.magnitude",
+        "depth": "$.depth_km",
+        "lat": "$.latitude",
+        "lng": "$.longitude",
+        "location": "$.location",
+        "intensity": "$.cea_data.epiIntensity",
+        "reportNum": "$.cea_data.updates"
+      }
+    }
+  ]
+}

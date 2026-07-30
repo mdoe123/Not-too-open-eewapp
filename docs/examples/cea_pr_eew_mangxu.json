@@ -1,0 +1,31 @@
+{
+  "format": "eew-app-source-pack",
+  "version": 1,
+  "exportedAt": 1785300000000,
+  "exportedBy": "mangxuCEA-PR(HTTP)",
+  "sources": [
+    {
+      "type": "customSource",
+      "name": "mangxuCEA-PR(HTTP)",
+      "enabled": false,
+      "priority": 103,
+      "category": "eew",
+      "protocol": "http",
+      "endpoint": "https://ws.mangxufurry.cc.cd/agency/cea_pr/json",
+      "pollIntervalMs": 2000,
+      "note": "mangxu的CEA-PR（中国地震台网省级）地震预警。HTTP 2s 轮询。源",
+      "fieldMapping": {
+        "listPath": "$.earthquakes",
+        "eventId": "$.id",
+        "originTime": "$.cea_data.event_time",
+        "magnitude": "$.magnitude",
+        "depth": "$.depth_km",
+        "lat": "$.latitude",
+        "lng": "$.longitude",
+        "location": "$.location",
+        "intensity": "$.cea_data.epiIntensity",
+        "reportNum": "$.cea_data.updates"
+      }
+    }
+  ]
+}

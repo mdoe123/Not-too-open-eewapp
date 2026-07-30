@@ -19,8 +19,10 @@
 // }
 // ```
 //
-// 唯一标识：SourceConfig 使用 `priority` 作为去重键（与 useEewStream 一致），
-// 因此合并导入时按 priority 判断冲突，同 priority 覆盖。
+// 唯一标识：SourceConfig 使用 `endpoint` 作为去重键（同一 API 地址视为同一源的不同配置版本）。
+// 合并导入时按 endpoint 判断冲突：同 endpoint 更新，不同 endpoint 追加；
+// 追加时若 priority 与现有源冲突则重新分配一个未使用的值，避免覆盖其他无关源。
+// 注意：priority 仅用于源排序（数字越小越优先），不作为唯一标识。
 
 import {FieldMapping, SourceConfig} from '../../types/config';
 
@@ -98,10 +100,12 @@ export type ParseResult = ParseOk | ParseErr;
 export interface MergeResult {
   /** 合并后的源列表 */
   merged: SourceConfig[];
-  /** 新增数量 */
+  /** 新增数量（不同 endpoint，追加为新源） */
   added: number;
-  /** 覆盖数量（同 priority） */
+  /** 更新数量（同 endpoint，覆盖现有源配置） */
   updated: number;
+  /** 重新分配 priority 的数量（新源 priority 与现有源冲突，已自动重新分配） */
+  reassigned: number;
 }
 
 // ======================== 导出 ========================
@@ -377,10 +381,41 @@ export function isValidEndpoint(url: string): boolean {
 // ======================== 合并 ========================
 
 /**
+ * 自定义源起始 priority（避开 wolfx 源的 1-15 区间）
+ *
+ * 与 SourceManageSection.CUSTOM_SOURCE_START_PRIORITY 保持一致。
+ */
+const MERGE_START_PRIORITY = 100;
+
+/**
+ * 找一个未使用的 priority 值
+ *
+ * 策略：从 MERGE_START_PRIORITY 开始递增，找到第一个未使用的值。
+ * 用于导入新源时 priority 与现有源冲突的重新分配。
+ */
+function nextAvailablePriority(used: Set<number>): number {
+  let p = MERGE_START_PRIORITY;
+  while (used.has(p)) {
+    p++;
+  }
+  return p;
+}
+
+/**
  * 合并导入的源到现有源列表
  *
- * 策略：按 priority 去重，已存在则覆盖，不存在则追加。
- * 注意：合并仅基于 priority，不检查其他字段。
+ * 策略：按 endpoint 去重（大小写不敏感），同 endpoint 视为同一源进行更新，
+ * 不同 endpoint 视为新源追加。若新源的 priority 与现有源冲突，重新分配
+ * 一个未使用的 priority，避免覆盖其他无关源。
+ *
+ * 设计理由：
+ * - 之前按 priority 去重会导致"导入测试源覆盖真实源"——只要 priority 相同就覆盖，
+ *   不管 endpoint 是否不同。改为 endpoint 去重后，同 API 地址才视为同一源。
+ * - priority 冲突时重新分配，保留用户导入源的字段映射等配置，仅调整排序值。
+ *
+ * 安全设计：
+ * - 导入的源强制 enabled=false（即使用户分享包中 enabled=true），需手动启用
+ * - 同 endpoint 更新时同样强制 enabled=false（覆盖后需重新启用，确保用户主动确认）
  *
  * @param existing 现有源列表
  * @param imported 待导入的源列表（已通过 validatePack 校验）
@@ -390,29 +425,72 @@ export function mergeImported(
   existing: SourceConfig[],
   imported: SourceConfig[],
 ): MergeResult {
-  const priorityMap = new Map<number, SourceConfig>();
-  let added = 0;
-  let updated = 0;
+  // 用 endpoint（小写）作为去重键，同 endpoint 视为同一源
+  const endpointMap = new Map<string, SourceConfig>();
+  // 用 priority 集合检测冲突，便于为新源重新分配
+  const usedPriorities = new Set<number>();
+  // 最终合并后的列表（mutable，便于同 endpoint 时原地替换）
+  const merged: SourceConfig[] = [];
 
   // 先放入现有源
   for (const s of existing) {
-    priorityMap.set(s.priority, s);
+    const key = (s.endpoint ?? '').toLowerCase();
+    // 若 existing 本身有同 endpoint 重复（异常数据），保留最后一个
+    endpointMap.set(key, s);
+    usedPriorities.add(s.priority);
+    merged.push(s);
   }
+
+  let added = 0;
+  let updated = 0;
+  let reassigned = 0;
 
   // 合并导入源（安全设计：导入的源默认禁用，用户手动启用）
   for (const s of imported) {
-    if (priorityMap.has(s.priority)) {
+    const key = (s.endpoint ?? '').toLowerCase();
+    const safeSource: SourceConfig = {...s, enabled: false};
+
+    if (endpointMap.has(key)) {
+      // 同 endpoint：更新该源（保留旧 priority 避免破坏用户排序）
+      const old = endpointMap.get(key)!;
+      const reassignedSource = {...safeSource, priority: old.priority};
+      // 替换 merged 中的旧源（用引用比较定位）
+      const idx = merged.findIndex(m => m === old);
+      if (idx >= 0) {
+        merged[idx] = reassignedSource;
+      } else {
+        // 兜底：按 endpoint 再找一次（防御性编程）
+        const idxByEndpoint = merged.findIndex(
+          m => (m.endpoint ?? '').toLowerCase() === key,
+        );
+        if (idxByEndpoint >= 0) {
+          merged[idxByEndpoint] = reassignedSource;
+        } else {
+          merged.push(reassignedSource);
+        }
+      }
+      endpointMap.set(key, reassignedSource);
       updated++;
     } else {
+      // 新源：若 priority 冲突则重新分配
+      if (usedPriorities.has(s.priority)) {
+        const newPriority = nextAvailablePriority(usedPriorities);
+        safeSource.priority = newPriority;
+        usedPriorities.add(newPriority);
+        reassigned++;
+      } else {
+        usedPriorities.add(s.priority);
+      }
+      endpointMap.set(key, safeSource);
+      merged.push(safeSource);
       added++;
     }
-    priorityMap.set(s.priority, {...s, enabled: false});
   }
 
-  // 转回数组，按 priority 升序
-  const merged = Array.from(priorityMap.values()).sort((a, b) => a.priority - b.priority);
+  // 按 priority 升序
+  merged.sort((a, b) => a.priority - b.priority);
 
-  return {merged, added, updated};
+  return {merged, added, updated, reassigned};
 }
 
 // ======================== 便捷工具 ========================
@@ -429,7 +507,7 @@ export function mergeImported(
 export function importFromJson(
   json: string,
   existing: SourceConfig[],
-): {ok: true; merged: SourceConfig[]; added: number; updated: number}
+): {ok: true; merged: SourceConfig[]; added: number; updated: number; reassigned: number}
   | {ok: false; errors: string[]} {
   const parsed = parsePack(json);
   if (!parsed.ok) {
@@ -447,6 +525,7 @@ export function importFromJson(
     merged: result.merged,
     added: result.added,
     updated: result.updated,
+    reassigned: result.reassigned,
   };
 }
 

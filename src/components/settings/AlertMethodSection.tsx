@@ -6,7 +6,8 @@ import {AlertConfig} from '../../types';
 import {AppColors} from '../../theme/colors';
 import {SettingRow} from './SettingRow';
 import {ToggleRow} from './ToggleRow';
-import {BellIcon, VibrateIcon, FlashlightIcon, MoonIcon} from '../icons/SettingsIcons';
+import {SliderRow} from './SliderRow';
+import {BellIcon, VibrateIcon, FlashlightIcon, MoonIcon, VolumeIcon} from '../icons/SettingsIcons';
 
 export interface AlertMethodSectionProps {
   /** 当前报警配置 */
@@ -63,6 +64,29 @@ export function AlertMethodSection({
         onValueChange={v => updateAlert({flashlightEnabled: v})}
         colors={colors}
       />
+      <View style={[styles.subGroup, {borderBottomColor: colors.border}]}>
+        <ToggleRow
+          label="自动调节音量"
+          description="预警时自动调高媒体音量，结束后恢复"
+          icon={<VolumeIcon size={20} color={colors.text} />}
+          value={alert.autoVolumeEnabled}
+          onValueChange={v => updateAlert({autoVolumeEnabled: v})}
+          colors={colors}
+        />
+        {alert.autoVolumeEnabled ? (
+          <SliderRow
+            label="预警音量"
+            value={alert.alertVolume}
+            minimum={0}
+            maximum={100}
+            step={1}
+            unit="%"
+            formatValue={v => `${Math.round(v)}`}
+            onSlidingComplete={v => updateAlert({alertVolume: Math.round(v)})}
+            colors={colors}
+          />
+        ) : null}
+      </View>
       <View style={[styles.subGroup, {borderBottomColor: colors.border}]}>
         <ToggleRow
           label="免打扰时段"

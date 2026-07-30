@@ -23,13 +23,14 @@
 // - 所有显示中事件都归零 + 30 秒后停止
 
 import {useCallback, useEffect, useRef, useState} from 'react';
-import {DeviceEventEmitter} from 'react-native';
+import {AppState, AppStateStatus, DeviceEventEmitter} from 'react-native';
 import {EewEvent, AlertLevel, UserLocation} from '../types';
 import {computeSWaveArrival, calcCsis, haversineDistance} from '../utils/eew';
 import {FloatingWindowManager, FloatingWindowContent} from '../native/FloatingWindowManager';
 import {SoundManager} from '../native/SoundManager';
 import {FlashlightManager} from '../native/FlashlightManager';
 import {VibratorManager} from '../native/VibratorManager';
+import {BackgroundServiceManager} from '../native/BackgroundServiceManager';
 import {log} from '../utils/logger';
 
 /** AlertLevel 严重程度排序（数字越大越严重） */
@@ -44,6 +45,8 @@ const ALERT_LEVEL_ORDER: Record<AlertLevel, number> = {
 const MIN_SHOW_LEVEL: AlertLevel = 'blue';
 const COUNTDOWN_INTERVAL_MS = 1000;
 const ALERT_CONTINUE_AFTER_ARRIVAL_SEC = -30;
+/** 新事件（未显示过的）S 波到达超过此秒数不显示（解决重启 App 误触发） */
+const MAX_PAST_ARRIVAL_FOR_NEW_EVENT_SEC = -60;
 const CANCEL_HIDE_DELAY_MS = 3000;
 const FLASHLIGHT_INTENSITY_THRESHOLD = 5;
 const FLASHLIGHT_BLINK_INTERVAL_MS = 1000;
@@ -85,6 +88,10 @@ export interface UseFloatingWindowParams {
   vibrationEnabled: boolean;
   /** 是否启用闪光灯警报 */
   flashlightEnabled: boolean;
+  /** 是否启用自动调节媒体音量 */
+  autoVolumeEnabled: boolean;
+  /** 预警媒体音量百分比（0-100） */
+  alertVolume: number;
 }
 
 /** useFloatingWindow 返回值 */
@@ -147,9 +154,12 @@ function selectDisplayEvents(activeEvents: ActiveEvent[]): ActiveEvent[] {
     if (ae.userDismissed) return false;
     if (ae.event.isCancel === true) return true; // 取消报不过滤
     const remain = Math.ceil((ae.arrivalMs - Date.now()) / 1000);
-    // remain > -30：倒计时归零后 30 秒内仍算活跃，让大震独占显示
-    // 这样小震在此时不会成为候选，直到大震 remain <= -30 被过滤掉
-    return remain > ALERT_CONTINUE_AFTER_ARRIVAL_SEC;
+    // 已显示过的事件（arrived 已标记）：remain > -30 仍算活跃（大震独占显示）
+    // 新事件（未显示过）：remain > -60 才显示（S 波到达超过 60 秒的旧事件不显示，解决重启误触发）
+    const threshold = ae.arrived
+      ? ALERT_CONTINUE_AFTER_ARRIVAL_SEC
+      : MAX_PAST_ARRIVAL_FOR_NEW_EVENT_SEC;
+    return remain > threshold;
   });
 
   if (candidates.length === 0) return [];
@@ -186,13 +196,15 @@ function buildContent(ae: ActiveEvent): FloatingWindowContent {
     epicenterDistance: ae.distance,
     originTime: ae.event.originTime,
     isCancel: ae.event.isCancel === true,
+    reportNum: ae.event.reportNum,
+    sourceName: ae.event.sourceName,
   };
 }
 
 export function useFloatingWindow(
   params: UseFloatingWindowParams,
 ): UseFloatingWindowResult {
-  const {events, alertLevels, userLocation, soundEnabled, vibrationEnabled, flashlightEnabled} = params;
+  const {events, alertLevels, userLocation, soundEnabled, vibrationEnabled, flashlightEnabled, autoVolumeEnabled, alertVolume} = params;
 
   const [hasPermission, setHasPermission] = useState<boolean | null>(null);
 
@@ -210,6 +222,8 @@ export function useFloatingWindow(
   const mountedRef = useRef(true);
   /** 取消报延迟隐藏定时器 Map */
   const cancelTimeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  /** 当前 AppState（后台时不显示悬浮窗，交给原生锁屏/后台悬浮窗处理） */
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState);
 
   /** 清除倒计时定时器 */
   const clearTick = useCallback(() => {
@@ -224,6 +238,7 @@ export function useFloatingWindow(
     SoundManager.stopAlertSound().catch(() => {});
     VibratorManager.stopVibrating().catch(() => {});
     FlashlightManager.stopBlinking().catch(() => {});
+    SoundManager.restoreMediaVolume().catch(() => {});
     alertsStartedRef.current = false;
   }, []);
 
@@ -255,6 +270,15 @@ export function useFloatingWindow(
   const startAlertsIfNeeded = useCallback(() => {
     if (alertsStartedRef.current) return;
     alertsStartedRef.current = true;
+    // 通知后台服务所有活跃事件已由 JS 层触发警报
+    // 防止 App 切到后台后后台服务重复触发同一事件的悬浮窗和警报
+    for (const ae of activeEventsRef.current) {
+      BackgroundServiceManager.markEventTriggered(ae.event.id);
+    }
+    // 自动调节媒体音量：在播放声音前保存并设置目标音量
+    if (soundEnabled && autoVolumeEnabled) {
+      SoundManager.saveAndSetMediaVolume(alertVolume).catch(() => {});
+    }
     if (soundEnabled) {
       SoundManager.playAlertSound().catch(() => {});
     }
@@ -269,7 +293,7 @@ export function useFloatingWindow(
       FlashlightManager.startBlinking(FLASHLIGHT_BLINK_INTERVAL_MS).catch(() => {});
     }
     log('FLOAT', '启动合并警报', {topIntensity: top?.intensity});
-  }, [soundEnabled, vibrationEnabled, flashlightEnabled]);
+  }, [soundEnabled, vibrationEnabled, flashlightEnabled, autoVolumeEnabled, alertVolume]);
 
   /**
    * 启动每秒 tick
@@ -338,6 +362,11 @@ export function useFloatingWindow(
    */
   const refreshDisplay = useCallback(() => {
     if (!userLocation || !mountedRef.current) return;
+    // 后台时不显示悬浮窗（交给原生锁屏 Activity / 后台悬浮窗处理）
+    if (appStateRef.current !== 'active') {
+      log('FLOAT', 'refreshDisplay 跳过：App 在后台', {});
+      return;
+    }
 
     const active = activeEventsRef.current;
     const displayList = selectDisplayEvents(active);
@@ -430,6 +459,30 @@ export function useFloatingWindow(
       mountedRef.current = false;
     };
   }, []);
+
+  // 监听 AppState 变化：后台时隐藏悬浮窗并停止警报，前台时重新评估显示
+  // 避免后台时 RN 前端调用 setEvents 显示悬浮窗，与原生锁屏 Activity 重复显示
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextState: AppStateStatus) => {
+      const prev = appStateRef.current;
+      appStateRef.current = nextState;
+      log('FLOAT', 'AppState 变化', {prev, next: nextState});
+
+      if (nextState !== 'active') {
+        // 进入后台/非活跃：隐藏悬浮窗，停止 tick 和警报
+        FloatingWindowManager.hide().catch(() => {});
+        isVisibleRef.current = false;
+        stopAllAlerts();
+        clearTick();
+      } else if (prev !== 'active') {
+        // 回到前台：重新评估显示
+        refreshDisplay();
+      }
+    });
+    return () => {
+      subscription.remove();
+    };
+  }, [refreshDisplay, stopAllAlerts, clearTick]);
 
   // 事件列表变化时重建 activeEvents 并刷新显示
   useEffect(() => {

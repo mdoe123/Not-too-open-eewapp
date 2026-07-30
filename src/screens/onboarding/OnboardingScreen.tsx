@@ -19,6 +19,7 @@ import {
   Pressable,
   ScrollView,
   StatusBar,
+  Image,
   useColorScheme,
 } from 'react-native';
 import {SafeAreaView} from 'react-native-safe-area-context';
@@ -26,10 +27,12 @@ import {useFocusEffect} from '@react-navigation/native';
 import {getColors} from '../../theme/colors';
 import {PERMISSION_ITEMS} from './permissionItems';
 import PermissionRow from './PermissionRow';
-import {WaveLogoIcon} from './OnboardingIcons';
 import {usePermissions} from '../../hooks/usePermissions';
 import {useOnboarding} from '../../hooks/useOnboarding';
 import type {OnboardingScreenProps} from '../../navigation/types';
+
+// 应用图标（与 AndroidManifest.xml 的 ic_launcher 一致）
+const APP_ICON = require('../../assets/app_icon.png');
 
 /**
  * 权限引导页组件
@@ -78,9 +81,7 @@ export default function OnboardingScreen({
         bounces={false}>
         {/* 顶部 logo + 标题 */}
         <View style={styles.header}>
-          <View style={[styles.logoWrap, {borderColor: colors.text}]}>
-            <WaveLogoIcon size={40} color={colors.text} />
-          </View>
+          <Image source={APP_ICON} style={styles.logo} resizeMode="contain" />
           <Text style={[styles.title, {color: colors.text}]}>地震预警</Text>
           <Text style={[styles.subtitle, {color: colors.textSecondary}]}>
             开启以下权限以确保预警及时送达
@@ -169,14 +170,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 24,
   },
-  logoWrap: {
+  logo: {
     width: 72,
     height: 72,
-    borderRadius: 36,
-    borderWidth: 1.5,
-    alignItems: 'center',
-    justifyContent: 'center',
     marginBottom: 16,
+    borderRadius: 16,
   },
   title: {
     fontSize: 24,

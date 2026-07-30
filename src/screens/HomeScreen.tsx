@@ -112,6 +112,8 @@ export default function HomeScreen({navigation}: HomeScreenProps) {
     soundEnabled: alertConfig.soundEnabled,
     vibrationEnabled: alertConfig.vibrationEnabled,
     flashlightEnabled: alertConfig.flashlightEnabled,
+    autoVolumeEnabled: alertConfig.autoVolumeEnabled,
+    alertVolume: alertConfig.alertVolume,
   });
 
   // 后台保活：backgroundEnabled=true 时启动前台服务（常驻通知）
@@ -125,12 +127,14 @@ export default function HomeScreen({navigation}: HomeScreenProps) {
 
   // 同步用户位置到原生层（供 EewBackgroundService 计算震中距/烈度）
   // GPS 模式跟随实际定位，手动模式使用手动坐标
+  // GPS 模式下 mock 状态（尚未获取真实定位）不同步，避免用默认 mock 坐标（北京）计算震中距
   useEffect(() => {
     if (!userLocation) return;
+    if (locationConfig.mode === 'gps' && isMock) return;
     BackgroundServiceManager.updateLocation(
       buildLocationUpdate(locationConfig, userLocation),
     );
-  }, [userLocation, locationConfig]);
+  }, [userLocation, locationConfig, isMock]);
 
   // 同步当前活跃 customSource 到原生层（供 EewBackgroundService 锁屏预警接收数据）
   // 策略：从 config.sources 中筛选 enabled && customSource && category=eew 的源，
@@ -162,7 +166,8 @@ export default function HomeScreen({navigation}: HomeScreenProps) {
           BackgroundServiceManager.notifyAppInForeground();
           // 同时刷新配置，确保后台服务有最新状态
           BackgroundServiceManager.updateConfig(alertConfig);
-          if (userLocation) {
+          // GPS 模式下 mock 状态不同步位置（避免用默认 mock 坐标计算震中距）
+          if (userLocation && !(locationConfig.mode === 'gps' && isMock)) {
             BackgroundServiceManager.updateLocation(
               buildLocationUpdate(locationConfig, userLocation),
             );
@@ -174,7 +179,7 @@ export default function HomeScreen({navigation}: HomeScreenProps) {
       },
     );
     return () => subscription.remove();
-  }, [alertConfig, userLocation, locationConfig]);
+  }, [alertConfig, userLocation, locationConfig, isMock]);
 
   // 远程日志自动连接：配置启用且有 URL 时连接（App 启动后自动恢复）
   const debugConfig = config?.debug ?? DEFAULT_CONFIG.debug;

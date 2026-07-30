@@ -184,3 +184,118 @@ const {
 - **主代理需在 AndroidManifest.xml 添加**：`ACCESS_FINE_LOCATION`、`POST_NOTIFICATIONS` 权限声明。
 - **设置页（Task 6 扩展）**：可调用 `useOnboarding().resetOnboarding()` 提供重新引导入口。
 - **Task 4 后台服务**：完成后可考虑在引导页增加后台服务保活提示的准确性。
+
+## 8. 用户协议弹窗（DisclaimerModal）
+
+### 8.1 设计目标
+
+- **首次启动拦截**：App 首次启动时展示用户协议/免责声明，用户必须同意才能进入主应用。
+- **老用户升级覆盖**：升级到含本特性的版本后，所有用户都会看到一次（AsyncStorage 未设置标志）。
+- **强制同意**：无"拒绝"按钮，拦截返回键，用户若不同意需手动卸载。
+- **可复用文案**：协议文案集中管理，关于页面共用。
+
+### 8.2 模块结构
+
+```
+src/
+├── hooks/
+│   └── useLegalDisclaimer.ts       # 免责声明状态 Hook
+├── components/
+│   └── DisclaimerModal.tsx         # 全屏协议弹窗
+├── legal/
+│   └── agreementText.ts            # 协议文案常量（摘要 + 完整版）
+└── App.tsx                          # 最外层拦截层接入
+```
+
+### 8.3 启动流程（三层拦截）
+
+App.tsx 按以下优先级判断渲染层级：
+
+```
+启动
+ ├─ useLegalDisclaimer.isAcknowledged === null  → 空白启动屏（加载中）
+ ├─ useLegalDisclaimer.isAcknowledged === false → DisclaimerModal（强制拦截）
+ └─ useLegalDisclaimer.isAcknowledged === true
+     ├─ useOnboarding.isCompleted === null  → 空白启动屏
+     ├─ useOnboarding.isCompleted === false → OnboardingScreen
+     └─ useOnboarding.isCompleted === true  → HomeScreen
+```
+
+### 8.4 关键文件
+
+| 文件 | 作用 |
+|------|------|
+| `src/hooks/useLegalDisclaimer.ts` | 读取/写入 `LEGAL_DISCLAIMER_ACKNOWLEDGED_KEY`，暴露 `isAcknowledged` 与 `acknowledge` |
+| `src/components/DisclaimerModal.tsx` | 全屏弹窗，顶部黄色横幅 + 协议摘要 ScrollView + "同意并继续"按钮，拦截返回键 |
+| `src/legal/agreementText.ts` | `AGREEMENT_TITLE` / `AGREEMENT_SUMMARY`（弹窗用）/ `AGREEMENT_FULL`（关于页用） |
+| `src/types/config.ts` | 定义 `LEGAL_DISCLAIMER_ACKNOWLEDGED_KEY` 常量（v11 引入，本特性补全使用） |
+
+### 8.5 设计决策
+
+| 决策 | 原因 |
+|------|------|
+| 全屏 SafeAreaView 而非半透明 Modal | 协议需用户充分阅读，全屏更合适，与 ImportSourceModal 模式一致 |
+| 无"拒绝并退出"按钮 | RN 0.86 已移除 `BackHandler.exitApp`；主流 App（微信/支付宝）免责声明均为必须同意才能使用 |
+| 顶部黄色横幅 + 黑色文字 | 与 ImportSourceModal 免责横幅样式一致，亮/暗模式都用黑字（黄色背景上可读性最佳） |
+| 拦截 hardwareBackPress | 阻止返回键跳过协议，用户必须点击"同意并继续" |
+| 协议文案分离到 `legal/agreementText.ts` | 弹窗用摘要（精简）、关于页用完整版，避免重复维护 |
+
+## 9. 关于页面（AboutScreen）
+
+### 9.1 设计目标
+
+- 提供应用元信息展示（名称、版本、包名、开源协议、GitHub 仓库）
+- 提供完整用户协议查看入口（可展开/收起）
+- 复用应用 launcher icon 而非 SVG 线条图标
+
+### 9.2 入口
+
+设置页底部"关于"卡片 → `navigation.navigate('About')`
+
+### 9.3 布局
+
+```
+┌────────────────────────────┐
+│      [App Icon 88x88]       │
+│         NTOEEW             │
+│   Not Too Open EEW App     │
+│       版本 1.0.0           │
+├────────────────────────────┤
+│ 包名     com.mdoeeewapp... │
+│ 开源协议  LGPL-3.0-only    │
+│ GitHub 仓库          查看源码 >│
+├────────────────────────────┤
+│ 用户协议与免责声明         │
+│ 点击查看完整协议         v │
+├────────────────────────────┤
+│ （展开后显示完整协议正文） │
+├────────────────────────────┤
+│ 本应用不是官方预警渠道...  │
+└────────────────────────────┘
+```
+
+### 9.4 关键文件
+
+| 文件 | 作用 |
+|------|------|
+| `src/screens/AboutScreen.tsx` | 关于页面主组件 |
+| `src/navigation/types.ts` | 添加 `About` 路由与 `AboutScreenProps` 类型 |
+| `src/screens/SettingsScreen.tsx` | 添加"关于"导航卡片 |
+| `src/assets/app_icon.png` | 从 `mipmap-xxxhdpi/ic_launcher.png` 复制，供 RN Image 组件引用 |
+
+## 10. 应用图标统一应用
+
+### 10.1 背景
+
+之前 Onboarding 和 About 页面使用 SVG 线条图标（WaveLogoIcon），与应用 launcher icon 不一致。
+
+### 10.2 改动
+
+- 将 `android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png` 复制到 `src/assets/app_icon.png`
+- `OnboardingScreen.tsx`：用 `<Image source={require('../../assets/app_icon.png')} />` 替换 `<WaveLogoIcon />`
+- `AboutScreen.tsx`：同样用 `<Image>` 替换 `<WaveLogoIcon />`
+- 样式：72x72（Onboarding）/ 88x88（About），带圆角
+
+### 10.3 同步策略
+
+`src/assets/app_icon.png` 是 launcher icon 的副本。若未来更换 launcher icon，需同步更新此文件。

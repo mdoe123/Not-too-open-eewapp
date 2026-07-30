@@ -68,6 +68,16 @@ interface ManagedSource {
   status: SourceStatus;
 }
 
+/**
+ * 生成数据源在 managedSourcesRef 中的唯一 key
+ *
+ * 用 endpoint + priority 组合，避免仅用 priority 时同优先级源互相覆盖。
+ * 注意：endpoint 大小写不敏感处理，避免同一 URL 不同大小写被当成两个源。
+ */
+function getSourceKey(src: SourceConfig): string {
+  return `${(src.endpoint ?? '').toLowerCase()}#${src.priority}`;
+}
+
 /** 真实预警事件流返回值 */
 export interface UseEewStreamResult {
   /** 预警事件列表（最新在前，来自 eew 数据源） */
@@ -255,7 +265,8 @@ export function useEewStream(): UseEewStreamResult {
             log('STREAM', `${src.type} 状态 ${status}${message ? ' ' + message : ''}`);
 
             // 更新该源的状态
-            const managed = managedSourcesRef.current.get(String(src.priority));
+            const sourceKey = getSourceKey(src);
+            const managed = managedSourcesRef.current.get(sourceKey);
             if (managed) {
               managed.status = status;
             }
@@ -279,7 +290,7 @@ export function useEewStream(): UseEewStreamResult {
         );
 
         manager.registerAdapter(src, adapter);
-        managedSourcesRef.current.set(String(src.priority), {manager, config: src, status: 'connecting'});
+        managedSourcesRef.current.set(getSourceKey(src), {manager, config: src, status: 'connecting'});
       }
 
       // 启动所有 manager

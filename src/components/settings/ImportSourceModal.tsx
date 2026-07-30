@@ -60,6 +60,7 @@ interface PreviewState {
   sources?: SourceConfig[];
   added?: number;
   updated?: number;
+  reassigned?: number;
 }
 
 /** Tab 视图模式 */
@@ -112,6 +113,7 @@ export const ImportSourceModal = memo(function ImportSourceModal({
       sources: validated.sources,
       added: mergeResult.added,
       updated: mergeResult.updated,
+      reassigned: mergeResult.reassigned,
     });
   }, [existingSources]);
 
@@ -345,7 +347,7 @@ export const ImportSourceModal = memo(function ImportSourceModal({
           <>
             <ScrollView style={styles.scrollView} contentContainerStyle={styles.scrollContent}>
               <Text style={[styles.hint, {color: colors.textSecondary}]}>
-                粘贴其他用户分享的源配置 JSON。导入时按 priority 去重，已存在的同 priority 源会被覆盖。
+                粘贴其他用户分享的源配置 JSON。导入时按 endpoint 去重：同 API 地址的源会被更新，不同地址的源会追加为新源（priority 冲突时自动重新分配）。
               </Text>
 
               <TextInput
@@ -386,7 +388,7 @@ export const ImportSourceModal = memo(function ImportSourceModal({
                     解析成功
                   </Text>
                   <Text style={[styles.previewText, {color: colors.text}]}>
-                    待导入 {preview.sources?.length ?? 0} 个源（新增 {preview.added ?? 0}，覆盖 {preview.updated ?? 0}）
+                    待导入 {preview.sources?.length ?? 0} 个源（新增 {preview.added ?? 0}，更新 {preview.updated ?? 0}{preview.reassigned ? `，重排 ${preview.reassigned}` : ''}）
                   </Text>
                   {preview.sources?.map((s, i) => (
                     <Text key={i} style={[styles.previewSource, {color: colors.textSecondary}]}>
@@ -565,7 +567,7 @@ export const ImportSourceModal = memo(function ImportSourceModal({
                   解析成功
                 </Text>
                 <Text style={[styles.previewText, {color: colors.text}]}>
-                  待导入 {preview.sources?.length ?? 0} 个源（新增 {preview.added ?? 0}，覆盖 {preview.updated ?? 0}）
+                  待导入 {preview.sources?.length ?? 0} 个源（新增 {preview.added ?? 0}，更新 {preview.updated ?? 0}{preview.reassigned ? `，重排 ${preview.reassigned}` : ''}）
                 </Text>
                 {preview.sources?.map((s, i) => (
                   <Text key={i} style={[styles.previewSource, {color: colors.textSecondary}]}>

@@ -183,6 +183,9 @@ object EewAlertEngine {
       val isCancel = mapping.isCancel?.let {
         FieldMappingParser.extractBoolean(eventObj, it)
       } ?: false
+      val reportNum = mapping.reportNum?.let {
+        FieldMappingParser.extractNumber(eventObj, it)
+      }
 
       ParsedCencEvent(
         eventId = eventId,
@@ -195,6 +198,7 @@ object EewAlertEngine {
         maxIntensity = intensity,
         isCancel = isCancel,
         isFinal = isFinal,
+        reportNum = reportNum?.toInt(),
       )
     } catch (_: Exception) {
       null
@@ -232,4 +236,6 @@ data class ParsedCencEvent(
   val isCancel: Boolean,
   /** 是否为最终报 */
   val isFinal: Boolean,
+  /** 报数（第几报，若数据源提供） */
+  val reportNum: Int? = null,
 )

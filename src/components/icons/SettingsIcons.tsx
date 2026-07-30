@@ -154,6 +154,32 @@ export function FlashlightIcon({size = 24, color = '#000'}: IconProps) {
   );
 }
 
+/** 扬声器 - 自动调节音量 */
+export function VolumeIcon({size = 24, color = '#000'}: IconProps) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <Path
+        d="M4 9.5H7.5L13 5.5V18.5L7.5 14.5H4V9.5Z"
+        stroke={color}
+        strokeWidth={STROKE_W}
+        strokeLinejoin={STROKE_JOIN}
+      />
+      <Path
+        d="M16 9C17 10 17 14 16 15"
+        stroke={color}
+        strokeWidth={STROKE_W}
+        strokeLinecap={STROKE_CAP}
+      />
+      <Path
+        d="M18.5 7C20.5 9.5 20.5 14.5 18.5 17"
+        stroke={color}
+        strokeWidth={STROKE_W}
+        strokeLinecap={STROKE_CAP}
+      />
+    </Svg>
+  );
+}
+
 /** 月亮 - 免打扰 */
 export function MoonIcon({size = 24, color = '#000'}: IconProps) {
   return (

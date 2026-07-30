@@ -1,6 +1,8 @@
 package com.mdoeeewapp.android.cn.sound
 
+import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.os.Handler
 import android.os.Looper
@@ -24,8 +26,10 @@ import com.mdoeeewapp.android.cn.background.ReactContextProvider
  * - MediaPlayer 每次播放后 release，下次播放重新 create，避免状态混乱
  * - Handler.postDelayed(1000ms) 实现循环间隔
  * - stopInternal 通过 looping=false + removeCallbacks + release 停止播放
- * - 使用 USAGE_ALARM 流类型，确保走警报通道
+ * - 使用 USAGE_MEDIA 流类型（媒体音量通道），配合 STREAM_MUSIC 自动调节音量
  * - 所有原生调用 try-catch 包裹，避免主线程崩溃
+ * - 自动调节音量：saveAndSetMediaVolume 保存当前媒体音量并设为指定值，
+ *   restoreMediaVolume 恢复原音量（预警结束后调用）
  *
  * 全局注册：构造时注册到 ReactContextProvider，供 LockScreenAlertActivity
  * 在锁屏时直接调用 playAlertSound()/stopAlertSound()（无需经过 RN 桥）。
@@ -52,6 +56,10 @@ class SoundModule(
   @Volatile
   private var looping = false
 
+  /** 自动调节音量：保存的原媒体音量（-1 表示未保存） */
+  @Volatile
+  private var savedMediaVolume: Int = -1
+
   init {
     // 注册到全局提供者，供 LockScreenAlertActivity 直接调用
     ReactContextProvider.setSoundModule(this)
@@ -61,6 +69,8 @@ class SoundModule(
 
   override fun invalidate() {
     stopInternal()
+    // 恢复音量（若已保存）
+    restoreMediaVolumeInternal()
     // 清除全局引用，避免 LockScreenAlertActivity 持有已失效的模块实例
     ReactContextProvider.setSoundModule(null)
     super.invalidate()
@@ -75,6 +85,11 @@ class SoundModule(
   @ReactMethod
   fun playAlertSound() {
     try {
+      // 幂等：如果已在循环播放且 MediaPlayer 正在播放，不重复触发
+      // 防止前后台切换时 JS 层和后台服务交叉调用导致"中断重启"
+      if (looping && mediaPlayer?.isPlaying == true) {
+        return
+      }
       // 先停止上一次的播放
       stopInternal()
       // 启动循环
@@ -108,7 +123,7 @@ class SoundModule(
 
       mp.setAudioAttributes(
         AudioAttributes.Builder()
-          .setUsage(AudioAttributes.USAGE_ALARM)
+          .setUsage(AudioAttributes.USAGE_MEDIA)
           .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
           .build()
       )
@@ -156,6 +171,61 @@ class SoundModule(
         }
         mediaPlayer = null
       }
+    }
+  }
+
+  // ======================== 自动调节媒体音量 ========================
+
+  /**
+   * 保存当前媒体音量并设置为指定百分比
+   *
+   * 在预警开始前调用（仅当 autoVolumeEnabled=true）。
+   * 重复调用不会覆盖已保存的值（防止多次预警嵌套保存）。
+   *
+   * @param volumePercent 目标音量百分比（0-100）
+   */
+  @ReactMethod
+  fun saveAndSetMediaVolume(volumePercent: Int) {
+    try {
+      val audioManager = reactContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        ?: run {
+          emitError("saveAndSetMediaVolume", "AudioManager 不可用")
+          return
+        }
+      // 仅在未保存时才保存（防止嵌套覆盖）
+      if (savedMediaVolume < 0) {
+        savedMediaVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+      }
+      val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+      val targetVolume = (maxVolume * volumePercent / 100).coerceIn(0, maxVolume)
+      audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, targetVolume, 0)
+    } catch (e: Exception) {
+      emitError("saveAndSetMediaVolume", e.message ?: e::class.java.simpleName)
+    }
+  }
+
+  /**
+   * 恢复之前保存的媒体音量
+   *
+   * 在预警结束后调用。若未保存过则无操作。
+   */
+  @ReactMethod
+  fun restoreMediaVolume() {
+    restoreMediaVolumeInternal()
+  }
+
+  /** 恢复音量内部实现（供 invalidate 调用，不经过 RN 桥） */
+  private fun restoreMediaVolumeInternal() {
+    if (savedMediaVolume < 0) return
+    try {
+      val audioManager = reactContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+      if (audioManager != null) {
+        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, savedMediaVolume, 0)
+      }
+    } catch (e: Exception) {
+      emitError("restoreMediaVolume", e.message ?: e::class.java.simpleName)
+    } finally {
+      savedMediaVolume = -1
     }
   }
 

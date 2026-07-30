@@ -2,7 +2,9 @@ package com.mdoeeewapp.android.cn.floatingwindow
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -94,11 +96,12 @@ class FloatingWindowModule(
     val eventId: String,
     val rootView: View,
     val layoutParams: WindowManager.LayoutParams,
-    val magnitudeText: TextView,
-    val countdownText: TextView,
-    val locationText: TextView,
-    val levelText: TextView,
-    val infoText: TextView,
+    val magnitudeText: StrokeTextView,
+    val countdownText: StrokeTextView,
+    val locationText: StrokeTextView,
+    val levelText: StrokeTextView,
+    val intensityText: StrokeTextView,
+    val infoText: StrokeTextView,
     val dividerView: View,
     val sep1View: View,
     val sep2View: View,
@@ -324,13 +327,13 @@ class FloatingWindowModule(
       orientation = LinearLayout.HORIZONTAL
       gravity = Gravity.CENTER_VERTICAL
     }
-    val cdLabel = TextView(ctx).apply {
+    val cdLabel = StrokeTextView(ctx).apply {
       text = "S 波到达"
       setTextColor(labelColor)
       textSize = 11f
       layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
     }
-    val closeBtn = TextView(ctx).apply {
+    val closeBtn = StrokeTextView(ctx).apply {
       text = "✕"
       setTextColor(textColor)
       textSize = 18f
@@ -345,7 +348,7 @@ class FloatingWindowModule(
     topRow.addView(cdLabel)
     topRow.addView(closeBtn)
 
-    val countdownText = TextView(ctx).apply {
+    val countdownText = StrokeTextView(ctx).apply {
       text = formatCountdown(content)
       setTextColor(textColor)
       textSize = 48f
@@ -368,7 +371,7 @@ class FloatingWindowModule(
       setPadding(0, padTop, 0, 0)
     }
 
-    val magnitudeText = TextView(ctx).apply {
+    val magnitudeText = StrokeTextView(ctx).apply {
       text = formatMagnitude(content)
       setTextColor(textColor)
       textSize = 16f
@@ -380,7 +383,7 @@ class FloatingWindowModule(
       setBackgroundColor(dividerColor)
       layoutParams = LinearLayout.LayoutParams(dp(ctx, 1), dp(ctx, 12))
     }
-    val locationText = TextView(ctx).apply {
+    val locationText = StrokeTextView(ctx).apply {
       text = formatLocation(content)
       setTextColor(textColor)
       textSize = 13f
@@ -393,22 +396,39 @@ class FloatingWindowModule(
       setBackgroundColor(dividerColor)
       layoutParams = LinearLayout.LayoutParams(dp(ctx, 1), dp(ctx, 12))
     }
-    val levelText = TextView(ctx).apply {
+    val levelText = StrokeTextView(ctx).apply {
       text = formatLevel(content)
       setTextColor(textColor)
-      textSize = 12f
-      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.2f)
+      textSize = 13f
+      setTypeface(typeface, Typeface.BOLD)
       gravity = Gravity.CENTER
       maxLines = 1
       ellipsize = android.text.TextUtils.TruncateAt.END
     }
+    val intensityText = StrokeTextView(ctx).apply {
+      text = formatIntensity(content)
+      setTextColor(labelColor)
+      textSize = 11f
+      gravity = Gravity.CENTER
+      maxLines = 1
+      val padTop = dp(ctx, 2)
+      setPadding(0, padTop, 0, 0)
+    }
+    // 预警等级 + 预估烈度垂直排列容器
+    val levelColumn = LinearLayout(ctx).apply {
+      orientation = LinearLayout.VERTICAL
+      gravity = Gravity.CENTER
+      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.2f)
+    }
+    levelColumn.addView(levelText)
+    levelColumn.addView(intensityText)
     bottomRow.addView(magnitudeText)
     bottomRow.addView(sep1View)
     bottomRow.addView(locationText)
     bottomRow.addView(sep2View)
-    bottomRow.addView(levelText)
+    bottomRow.addView(levelColumn)
 
-    val infoText = TextView(ctx).apply {
+    val infoText = StrokeTextView(ctx).apply {
       text = formatInfoLine(content)
       setTextColor(labelColor)
       textSize = 11f
@@ -453,6 +473,7 @@ class FloatingWindowModule(
         countdownText = countdownText,
         locationText = locationText,
         levelText = levelText,
+        intensityText = intensityText,
         infoText = infoText,
         dividerView = dividerView,
         sep1View = sep1View,
@@ -506,6 +527,8 @@ class FloatingWindowModule(
     entry.locationText.setTextColor(textColor)
     entry.levelText.text = formatLevel(content)
     entry.levelText.setTextColor(textColor)
+    entry.intensityText.text = formatIntensity(content)
+    entry.intensityText.setTextColor(labelColor)
     entry.infoText.text = formatInfoLine(content)
     entry.infoText.setTextColor(labelColor)
     entry.dividerView.setBackgroundColor(dividerColor)
@@ -588,28 +611,48 @@ class FloatingWindowModule(
     return Color.parseColor(color)
   }
 
-  private fun intensityToTextColor(content: ReadableMap): Int {
+  /**
+   * 是否为黄色预警背景（烈度 3~5）
+   * 黄色背景下文字改用深褐色，无需描边
+   */
+  private fun isYellowLevel(content: ReadableMap): Boolean {
     val intensity = safeGetDouble(content, "intensity", 0.0)
-    return if (intensity >= 3 && intensity < 5) {
-      Color.parseColor("#E6000000")
+    return intensity >= 3 && intensity < 5
+  }
+
+  /**
+   * 主文字颜色
+   * 黄色预警下用深褐（#3D2410），与黄色背景同色系，对比协调
+   * 其他背景用白色
+   */
+  private fun intensityToTextColor(content: ReadableMap): Int {
+    return if (isYellowLevel(content)) {
+      Color.parseColor("#3D2410")
     } else {
       Color.parseColor(TEXT_COLOR)
     }
   }
 
+  /**
+   * 标签文字颜色
+   * 黄色预警下用深褐（#3D2410）
+   * 其他背景用半透明白（#99FFFFFF）
+   */
   private fun intensityToLabelColor(content: ReadableMap): Int {
-    val intensity = safeGetDouble(content, "intensity", 0.0)
-    return if (intensity >= 3 && intensity < 5) {
-      Color.parseColor("#99000000")
+    return if (isYellowLevel(content)) {
+      Color.parseColor("#3D2410")
     } else {
       Color.parseColor(LABEL_COLOR)
     }
   }
 
+  /**
+   * 分隔线颜色
+   * 黄色预警下用半透明深褐，其他背景用半透明白
+   */
   private fun intensityToDividerColor(content: ReadableMap): Int {
-    val intensity = safeGetDouble(content, "intensity", 0.0)
-    return if (intensity >= 3 && intensity < 5) {
-      Color.parseColor("#33000000")
+    return if (isYellowLevel(content)) {
+      Color.parseColor("#333D2410")
     } else {
       Color.parseColor("#33FFFFFF")
     }
@@ -630,11 +673,20 @@ class FloatingWindowModule(
   }
 
   private fun formatInfoLine(content: ReadableMap): String {
+    val parts = mutableListOf<String>()
+    // 报数
+    val reportNum = safeGetInt(content, "reportNum", 0)
+    if (reportNum > 0) parts.add("第${reportNum}报")
+    // 数据源名称
+    val sourceName = safeGetString(content, "sourceName", "")
+    if (sourceName.isNotEmpty()) parts.add(sourceName)
+    // 震中距
     val dist = safeGetDouble(content, "epicenterDistance", 0.0)
-    val distStr = "震中距 ${"%.1f".format(dist)} km"
+    parts.add("震中距 ${"%.1f".format(dist)} km")
+    // 发震时间
     val originTimeMs = safeGetDouble(content, "originTime", 0.0).toLong()
-    val timeStr = if (originTimeMs > 0) formatTimestamp(originTimeMs) else "--"
-    return "$distStr · $timeStr"
+    if (originTimeMs > 0) parts.add(formatTimestamp(originTimeMs))
+    return parts.joinToString(" · ")
   }
 
   private fun formatTimestamp(timestampMs: Long): String {
@@ -662,6 +714,14 @@ class FloatingWindowModule(
     }
   }
 
+  private fun safeGetInt(map: ReadableMap, key: String, default: Int): Int {
+    return try {
+      if (map.hasKey(key) && !map.isNull(key)) map.getInt(key) else default
+    } catch (_: Exception) {
+      default
+    }
+  }
+
   private fun formatLocation(content: ReadableMap): String {
     val loc = if (content.hasKey("location")) content.getString("location") else null
     return loc ?: "未知位置"
@@ -669,7 +729,7 @@ class FloatingWindowModule(
 
   private fun formatLevel(content: ReadableMap): String {
     val lv = if (content.hasKey("level")) content.getString("level") else null
-    val baseText = when (lv) {
+    return when (lv) {
       "red" -> "严重破坏"
       "orange" -> "破坏"
       "yellow" -> "强烈有感"
@@ -677,15 +737,17 @@ class FloatingWindowModule(
       "silent" -> ""
       else -> ""
     }
-    if (baseText.isEmpty()) return ""
+  }
+
+  private fun formatIntensity(content: ReadableMap): String {
     val intensity = safeGetDouble(content, "intensity", 0.0)
-    if (intensity <= 0) return baseText
+    if (intensity <= 0) return ""
     val intensityStr = if (intensity == intensity.toInt().toDouble()) {
       intensity.toInt().toString()
     } else {
       String.format("%.1f", intensity)
     }
-    return "$baseText(预估烈度$intensityStr)"
+    return "预估烈度$intensityStr"
   }
 
   // ======================== 事件发送 ========================
@@ -719,3 +781,45 @@ class FloatingWindowModule(
     ).toInt()
   }
 }
+
+/**
+ * 带黑色描边的 TextView
+ *
+ * 仅当 [strokeEnabled] 为 true 时绘制黑色描边，否则等同于普通 TextView。
+ * 用于黄色预警背景下增强白色文字的可读性。
+ */
+class StrokeTextView @JvmOverloads constructor(
+  context: Context,
+  attrs: android.util.AttributeSet? = null,
+  defStyleAttr: Int = 0,
+) : TextView(context, attrs, defStyleAttr) {
+
+  companion object {
+    /** 描边宽度（像素），细描边避免覆盖小字号文字 */
+    private const val STROKE_WIDTH = 1.5f
+    /** 描边颜色 */
+    private const val STROKE_COLOR = Color.BLACK
+  }
+
+  /** 是否启用描边（仅黄色预警背景启用） */
+  var strokeEnabled: Boolean = false
+
+  override fun onDraw(canvas: Canvas) {
+    if (!strokeEnabled) {
+      super.onDraw(canvas)
+      return
+    }
+    // 保存原文字颜色
+    val textColor = currentTextColor
+    // 第一遍：绘制黑色描边（细描边，避免覆盖小字号文字）
+    setTextColor(STROKE_COLOR)
+    paint.style = Paint.Style.STROKE
+    paint.strokeWidth = STROKE_WIDTH
+    super.onDraw(canvas)
+    // 第二遍：绘制原色填充
+    setTextColor(textColor)
+    paint.style = Paint.Style.FILL
+    super.onDraw(canvas)
+  }
+}
+

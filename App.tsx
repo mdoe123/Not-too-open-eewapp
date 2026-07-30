@@ -3,11 +3,14 @@
 // 使用 react-native-gesture-handler 的 GestureHandlerRootView 包裹（导航栈依赖）
 // 根据系统色彩模式切换 Navigation 主题
 //
-// 首次启动检测：
-// - useOnboarding 读取 AsyncStorage '@eew_onboarding_completed' 标志
-// - null（加载中）→ 渲染空白启动屏
-// - false（首次启动）→ 初始路由为 Onboarding
-// - true（已完成）→ 初始路由为 Home
+// 启动流程（三层拦截，优先级从高到低）：
+// 1. 用户协议/免责声明（useLegalDisclaimer）
+//    - null（加载中）→ 渲染空白启动屏
+//    - false（未同意）→ 渲染 DisclaimerModal，用户必须同意才能继续
+// 2. 引导页（useOnboarding）
+//    - null（加载中）→ 渲染空白启动屏
+//    - false（首次启动）→ 初始路由为 Onboarding
+//    - true（已完成）→ 初始路由为 Home
 
 import React, {useMemo} from 'react';
 import {StatusBar, useColorScheme, StyleSheet, View} from 'react-native';
@@ -21,14 +24,19 @@ import HomeScreen from './src/screens/HomeScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
 import EventDetailScreen from './src/screens/EventDetailScreen';
 import SimulateAlertScreen from './src/screens/SimulateAlertScreen';
+import AboutScreen from './src/screens/AboutScreen';
 import OnboardingScreen from './src/screens/onboarding/OnboardingScreen';
+import DisclaimerModal from './src/components/DisclaimerModal';
 import {useOnboarding} from './src/hooks/useOnboarding';
+import {useLegalDisclaimer} from './src/hooks/useLegalDisclaimer';
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
 function App() {
   const isDarkMode = useColorScheme() === 'dark';
   const colors = getColors(isDarkMode);
+  // 免责声明是最外层拦截（优先级高于 onboarding）
+  const {isAcknowledged, acknowledge} = useLegalDisclaimer();
   const {isCompleted} = useOnboarding();
 
   // 自定义导航主题：黑白简约风格
@@ -48,7 +56,31 @@ function App() {
     };
   }, [isDarkMode, colors]);
 
-  // 引导状态加载中：渲染空白启动屏，避免路由闪烁
+  // 第一层：免责声明状态加载中 → 渲染空白启动屏
+  if (isAcknowledged === null) {
+    return (
+      <GestureHandlerRootView style={styles.root}>
+        <SafeAreaProvider>
+          <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
+          <View style={[styles.splash, {backgroundColor: colors.background}]} />
+        </SafeAreaProvider>
+      </GestureHandlerRootView>
+    );
+  }
+
+  // 第一层：未同意免责声明 → 渲染免责声明弹窗（拦截所有后续流程）
+  if (!isAcknowledged) {
+    return (
+      <GestureHandlerRootView style={styles.root}>
+        <SafeAreaProvider>
+          <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
+          <DisclaimerModal onAgree={acknowledge} />
+        </SafeAreaProvider>
+      </GestureHandlerRootView>
+    );
+  }
+
+  // 第二层：引导状态加载中 → 渲染空白启动屏，避免路由闪烁
   if (isCompleted === null) {
     return (
       <GestureHandlerRootView style={styles.root}>
@@ -101,6 +133,11 @@ function App() {
               name="SimulateAlert"
               component={SimulateAlertScreen}
               options={{title: '模拟预警'}}
+            />
+            <Stack.Screen
+              name="About"
+              component={AboutScreen}
+              options={{title: '关于'}}
             />
           </Stack.Navigator>
         </NavigationContainer>

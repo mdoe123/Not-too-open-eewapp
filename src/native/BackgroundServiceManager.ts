@@ -25,6 +25,11 @@ interface BackgroundServiceModuleType {
   /** 通知后台服务 App 已进入后台（AppState background/inactive 时调用） */
   notifyAppInBackground(): void;
   /**
+   * 标记事件已由 JS 层触发警报
+   * 防止 App 切到后台后后台服务重复触发同一事件的悬浮窗和警报。
+   */
+  markEventTriggered(eventId: string): void;
+  /**
    * 更新当前活跃 customSource 配置（JSON 字符串或 null）
    *
    * 传 null 清空配置（后台服务不建立连接）。
@@ -154,6 +159,21 @@ export const BackgroundServiceManager = {
     if (Platform.OS !== 'android') return;
     try {
       BackgroundServiceModule?.notifyAppInBackground();
+    } catch {
+      // 忽略异常
+    }
+  },
+
+  /**
+   * 标记事件已由 JS 层触发警报
+   *
+   * JS 层 useFloatingWindow 启动警报时调用，防止 App 切到后台后
+   * 后台服务重复触发同一事件的悬浮窗和警报。
+   */
+  markEventTriggered(eventId: string): void {
+    if (Platform.OS !== 'android') return;
+    try {
+      BackgroundServiceModule?.markEventTriggered(eventId);
     } catch {
       // 忽略异常
     }

@@ -39,6 +39,10 @@ export interface EewEvent {
    * 时钟回拨或数据源错误可能导致违反，使用前应校验
    */
   receivedAt: number;
+  /** 报数（第几报，若数据源提供。如 CENC 的 ReportNum 字段） */
+  reportNum?: number;
+  /** 数据源显示名称（从 SourceConfig.name 填充，如"中国地震台网"） */
+  sourceName?: string;
 }
 
 /**

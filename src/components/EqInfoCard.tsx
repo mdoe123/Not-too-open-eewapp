@@ -65,7 +65,7 @@ export default function EqInfoCard({event, userLat, userLng, colors}: EqInfoCard
             </Text>
             <View style={[styles.agencyBadge, {backgroundColor: colors.border}]}>
               <Text style={[styles.agencyText, {color: colors.textSecondary}]}>
-                {getSourceAgency(event.source)}
+                {event.sourceName || getSourceAgency(event.source)}
               </Text>
             </View>
           </View>

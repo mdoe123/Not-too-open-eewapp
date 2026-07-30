@@ -1,0 +1,29 @@
+{
+  "format": "eew-app-source-pack",
+  "version": 1,
+  "exportedAt": 1785300000000,
+  "exportedBy": "mangxuCENC(HTTP)",
+  "sources": [
+    {
+      "type": "customSource",
+      "name": "mangxuCENC(HTTP)",
+      "enabled": false,
+      "priority": 102,
+      "category": "eqlist",
+      "protocol": "http",
+      "endpoint": "https://ws.mangxufurry.cc.cd/agency/ceic/json",
+      "pollIntervalMs": 30000,
+      "note": "mangxu的CEIC（中国地震台网）地震速报。HTTP 30s 轮询。源",
+      "fieldMapping": {
+        "listPath": "$.earthquakes",
+        "eventId": "$.id",
+        "originTime": "$.ceic_raw.time",
+        "magnitude": "$.magnitude",
+        "depth": "$.depth_km",
+        "lat": "$.latitude",
+        "lng": "$.longitude",
+        "location": "$.location"
+      }
+    }
+  ]
+}

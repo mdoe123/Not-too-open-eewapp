@@ -1,0 +1,30 @@
+{
+  "format": "eew-app-source-pack",
+  "version": 1,
+  "exportedAt": 1785300000000,
+  "exportedBy": "示例源 - wolfx CENC Eqlist",
+  "sources": [
+    {
+      "type": "customSource",
+      "name": "wolfxCENC(HTTP)-速报",
+      "enabled": false,
+      "priority": 101,
+      "category": "eqlist",
+      "protocol": "http",
+      "endpoint": "https://api.wolfx.jp/cenc_eqlist.json",
+      "pollIntervalMs": 30000,
+      "note": "wolfx 的 中国地震台网中心速报列表。HTTP 30s 轮询源",
+      "fieldMapping": {
+        "listPath": "$.No*",
+        "eventId": "$.time",
+        "originTime": "Date.parse($.time)",
+        "magnitude": "$.magnitude",
+        "depth": "$.depth",
+        "lat": "$.latitude",
+        "lng": "$.longitude",
+        "location": "$.location",
+        "intensity": "$.intensity"
+      }
+    }
+  ]
+}

@@ -114,6 +114,8 @@ export interface FieldMapping {
   isFinal?: string;
   /** 是否取消报（可选，默认 false） */
   isCancel?: string;
+  /** 报数/第几报（可选，如 CENC 的 ReportNum 字段） */
+  reportNum?: string;
 }
 
 /**
@@ -135,6 +137,10 @@ export interface AlertConfig {
   quietHoursStart?: string;
   /** 免打扰结束 "HH:mm" */
   quietHoursEnd?: string;
+  /** 自动调节媒体音量（预警时自动调到 alertVolume，结束后恢复原音量） */
+  autoVolumeEnabled: boolean;
+  /** 预警媒体音量百分比（0-100，默认 80） */
+  alertVolume: number;
 
   // ---- 系统能力开关 ----
   backgroundEnabled: boolean;
@@ -218,8 +224,11 @@ export interface AppConfig {
  *        老用户需通过扫码导入/文件夹扫描/文件选择器/手动填写重新配置源。
  *        新增文件夹扫描和文件选择器导入入口（见 docs/file-import.md）。
  *        原生层 EewBackgroundService 改为读 customSource 配置（不再硬编码 wolfx 端点）。
+ * - v14: AlertConfig 新增 autoVolumeEnabled（自动调节媒体音量，默认 false）和
+ *        alertVolume（预警媒体音量百分比 0-100，默认 80）。
+ *        迁移策略：新字段可选，旧配置通过 DEFAULT_CONFIG 合并自动补齐默认值。
  */
-export const CURRENT_CONFIG_VERSION = 13;
+export const CURRENT_CONFIG_VERSION = 14;
 
 /**
  * AsyncStorage 中存储免责声明确认标记的 key
@@ -261,6 +270,8 @@ export const DEFAULT_CONFIG: AppConfig = {
     floatingWindowEnabled: true,
     lockScreenEnabled: true,
     autoStartEnabled: true,
+    autoVolumeEnabled: false,
+    alertVolume: 80,
   },
   // 默认使用 GPS 自动定位；手动模式默认坐标为北京（与 GPS 降级值一致）
   location: {

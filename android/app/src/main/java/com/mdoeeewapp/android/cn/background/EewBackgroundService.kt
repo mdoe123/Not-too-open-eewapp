@@ -89,6 +89,9 @@ class EewBackgroundService : Service() {
     /** 倒计时归零后警报继续的秒数（与 JS 层 ALERT_CONTINUE_AFTER_ARRIVAL_SEC 一致） */
     private const val ALERT_CONTINUE_AFTER_ARRIVAL_SEC = -30
 
+    /** 新事件 S 波到达超过此秒数不处理（解决重启 App 误触发旧事件） */
+    private const val MAX_PAST_ARRIVAL_FOR_NEW_EVENT_SEC = -60
+
     /** 并列事件与顶级事件的最大级别差（0 = 同级别才算并列，差 ≥ 1 档算大小关系） */
     private const val PEER_LEVEL_MAX_DIFF = 0
 
@@ -148,8 +151,19 @@ class EewBackgroundService : Service() {
    *
    * 用于独立去重"触发悬浮窗"动作：同一个事件在前台时不触发，
    * 切到后台后仍可触发一次（只要未过期）。触发后标记，避免重复触发。
+   *
+   * 改为 Set 支持多事件去重。JS 层通过 markEventTriggered 通知已处理的事件 ID。
    */
-  private var lastTriggeredEventId: String? = null
+  private val triggeredEventIds: MutableSet<String> = mutableSetOf()
+
+  /**
+   * 用户已手动关闭的后台悬浮窗事件 ID 集合。
+   *
+   * 用户点击✕关闭后台悬浮窗后，该事件 ID 被记录于此。
+   * 后续同 ID 新报告到来时，不再重新弹出悬浮窗（用户已明确表示不需要此事件）。
+   * 当事件自然过期（倒计时结束 + 30秒）或收到取消报时，从集合中移除。
+   */
+  private val userDismissedEventIds: MutableSet<String> = mutableSetOf()
 
   /** ComponentCallbacks2 用于检测 App 前后台切换 */
   private var componentCallbacks: ComponentCallbacks2? = null
@@ -263,6 +277,7 @@ class EewBackgroundService : Service() {
         intensity = fmObj.optString("intensity", "").ifEmpty { null },
         isFinal = fmObj.optString("isFinal", "").ifEmpty { null },
         isCancel = fmObj.optString("isCancel", "").ifEmpty { null },
+        reportNum = fmObj.optString("reportNum", "").ifEmpty { null },
       )
       // 必填字段校验
       if (mapping.eventId.isEmpty() || mapping.originTime.isEmpty() ||
@@ -509,28 +524,139 @@ class EewBackgroundService : Service() {
 
     // 取消报：不触发悬浮窗（JS 层处理显示"地震预警取消"）
     if (event.isCancel) {
+      // 清理已关闭记录（事件已取消，后续无需再屏蔽）
+      userDismissedEventIds.remove(event.eventId)
+      triggeredEventIds.remove(event.eventId)
       if (isNewReport) Log.i(TAG, "取消报，不触发悬浮窗")
       return
     }
 
+    // S 波到达超过 60 秒的新事件不处理（解决重启 App 误触发旧事件）
+    // 仅对 backgroundEvents 中不存在的新事件检查，已在队列中的事件不受影响
+    val isNewEvent = !backgroundEvents.containsKey(event.eventId)
+    if (isNewEvent) {
+      val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+      val userLat = prefs.getFloat("userLat", 39.9f).toDouble()
+      val userLng = prefs.getFloat("userLng", 116.4f).toDouble()
+      val arrivalMs = EewAlertEngine.computeSWaveArrivalMs(
+        event.originTime, event.lat, event.lng, userLat, userLng
+      )
+      val remainSec = ((arrivalMs - System.currentTimeMillis()) / 1000.0).toInt()
+      if (remainSec < MAX_PAST_ARRIVAL_FOR_NEW_EVENT_SEC) {
+        Log.i(TAG, "新事件 S 波已到达超过 60 秒（remain=${remainSec}s），丢弃不处理")
+        return
+      }
+    }
+
     // 如果 App 在前台，由 JS 层 useFloatingWindow 处理（避免重复触发）
     if (appInForeground) {
+      // 标记已由 JS 层处理，切到后台后同一事件不重复触发
+      triggeredEventIds.add(event.eventId)
       if (isNewReport) Log.i(TAG, "App 在前台，由 JS 层处理悬浮窗")
       return
     }
 
-    // 触发去重：同一 eventId 只触发一次悬浮窗
-    // （前台收到时不触发也不标记，切到后台后仍可触发一次）
-    if (event.eventId == lastTriggeredEventId) {
-      Log.i(TAG, "事件 ${event.eventId} 已触发过悬浮窗，跳过")
+    // 触发去重：同一 eventId 只触发一次警报（避免重复启动声音/震动/闪光灯）
+    // 但仍需更新数据到已显示的悬浮窗/锁屏（同 ID 报告升级场景）
+    if (triggeredEventIds.contains(event.eventId)) {
+      Log.i(TAG, "事件 ${event.eventId} 已触发过警报，尝试更新已显示的 UI")
+      updateDisplayedEvent(event)
       return
     }
 
     // App 不在前台，检查触发条件并触发悬浮窗
     Log.i(TAG, "App 在后台，开始检查触发条件: appInForeground=$appInForeground eventId=${event.eventId}")
     if (tryTriggerFloatingWindow(event)) {
-      lastTriggeredEventId = event.eventId
+      triggeredEventIds.add(event.eventId)
     }
+  }
+
+  /**
+   * 更新已显示的悬浮窗/锁屏 UI（同 ID 报告升级时调用）
+   *
+   * 不重新触发声音/震动/闪光灯警报（已由首次触发启动），
+   * 仅更新事件数据（震级、烈度、级别等）到已显示的 UI。
+   *
+   * - 锁屏 Activity 在运行 → 调用 addEvent 更新（addEvent 已支持同 ID 更新）
+   * - 后台悬浮窗在显示 → 更新 backgroundEvents 并刷新显示
+   * - 两者都未显示 → 忽略（不应发生，但防御性处理）
+   */
+  private fun updateDisplayedEvent(event: ParsedCencEvent) {
+    // 用户已手动关闭此事件的后台悬浮窗 → 不再重新弹出
+    if (userDismissedEventIds.contains(event.eventId)) {
+      Log.i(TAG, "事件 ${event.eventId} 已被用户关闭，跳过更新")
+      return
+    }
+
+    val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    val userLat = prefs.getFloat("userLat", 39.9f).toDouble()
+    val userLng = prefs.getFloat("userLng", 116.4f).toDouble()
+    val distance = EewAlertEngine.haversineDistance(event.lat, event.lng, userLat, userLng)
+    val intensity = EewAlertEngine.calcCsis(event.magnitude, event.depth, distance)
+    val alertLevel = EewAlertEngine.computeAlertLevelByIntensity(intensity)
+    val arrivalMs = EewAlertEngine.computeSWaveArrivalMs(
+      event.originTime, event.lat, event.lng, userLat, userLng
+    )
+
+    // 锁屏 Activity 在运行 → 更新锁屏
+    if (LockScreenAlertActivity.isRunning()) {
+      val eventData = LockScreenAlertActivity.LockScreenEvent(
+        eventId = event.eventId,
+        magnitude = event.magnitude,
+        depth = event.depth,
+        intensity = intensity,
+        distance = distance,
+        location = event.location,
+        alertLevel = alertLevel,
+        originTime = event.originTime,
+        arrivalMs = arrivalMs,
+        reportNum = event.reportNum,
+        sourceName = activeSourceConfig?.name,
+      )
+      LockScreenAlertActivity.instance?.addEvent(eventData)
+      Log.i(TAG, "更新锁屏事件: eventId=${event.eventId} mag=${event.magnitude} intensity=$intensity level=$alertLevel")
+      return
+    }
+
+    // 屏幕已锁屏但 Activity 未运行 → 启动锁屏 Activity
+    // 场景：之前在后台显示悬浮窗，屏幕随后锁屏，同 ID 新报告到来时应切换到锁屏 Activity
+    if (isScreenLocked()) {
+      Log.i(TAG, "屏幕已锁屏但 Activity 未运行，启动锁屏 Activity: eventId=${event.eventId}")
+      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs)
+      return
+    }
+
+    // 后台悬浮窗在显示 → 更新 backgroundEvents 并刷新
+    if (backgroundEvents.containsKey(event.eventId)) {
+      val bgEvent = BackgroundEvent(event, intensity, distance, alertLevel, arrivalMs)
+      // 保留旧的 arrived/alertsStopped 状态
+      val old = backgroundEvents[event.eventId]
+      if (old != null) {
+        bgEvent.arrived = old.arrived
+        bgEvent.alertsStopped = old.alertsStopped
+      }
+      backgroundEvents[event.eventId] = bgEvent
+      refreshBackgroundFloatingWindows()
+      Log.i(TAG, "更新后台悬浮窗事件: eventId=${event.eventId} mag=${event.magnitude} intensity=$intensity level=$alertLevel")
+      return
+    }
+
+    // 既不在锁屏也不在后台悬浮窗（如 App 从前台切到后台后首次收到同 ID 新报告）
+    // → 添加到后台悬浮窗队列并显示
+    Log.i(TAG, "事件 ${event.eventId} 未在任何显示中，添加到后台悬浮窗: intensity=$intensity level=$alertLevel")
+    showFloatingWindowFromBackground(event, intensity, distance, alertLevel, arrivalMs)
+  }
+
+  /**
+   * 标记事件为用户已关闭（供 LockScreenAlertActivity 调用）
+   *
+   * 用户在锁屏界面关闭某事件后，后续同 ID 新报告不再重新弹出后台悬浮窗。
+   */
+  fun markUserDismissed(eventId: String) {
+    userDismissedEventIds.add(eventId)
+    // 同步从后台悬浮窗队列移除，避免锁屏关闭后后台 tick 仍显示该事件悬浮窗
+    backgroundEvents.remove(eventId)
+    Log.i(TAG, "标记事件 $eventId 为用户已关闭（来自锁屏界面），已从后台队列移除")
   }
 
   /**
@@ -624,13 +750,16 @@ class EewBackgroundService : Service() {
     arrivalMs: Long,
   ) {
     try {
-      // 读取警报配置（声音/震动/闪光灯），通过 Intent extras 传给 Activity
+      // 读取警报配置（声音/震动/闪光灯/自动音量），通过 Intent extras 传给 Activity
       val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
       val soundEnabled = prefs.getBoolean("soundEnabled", true)
       val vibrationEnabled = prefs.getBoolean("vibrationEnabled", true)
       val flashlightEnabled = prefs.getBoolean("flashlightEnabled", true)
+      val autoVolumeEnabled = prefs.getBoolean("autoVolumeEnabled", false)
+      val alertVolume = prefs.getInt("alertVolume", 80)
 
       // 构造事件数据（用于 addEvent 调用）
+      val sourceName = activeSourceConfig?.name
       val eventData = LockScreenAlertActivity.LockScreenEvent(
         eventId = event.eventId,
         magnitude = event.magnitude,
@@ -641,17 +770,28 @@ class EewBackgroundService : Service() {
         alertLevel = alertLevel,
         originTime = event.originTime,
         arrivalMs = arrivalMs,
+        reportNum = event.reportNum,
+        sourceName = sourceName,
       )
 
       // === 多事件模式 ===
-      // 若 Activity 已运行，直接调用 addEvent 添加事件，无需 startActivity
+      // 若 Activity 已运行，直接调用 addEvent 添加事件（或更新已有事件），无需 startActivity
       if (LockScreenAlertActivity.isRunning()) {
-        val added = LockScreenAlertActivity.instance?.addEvent(eventData) ?: false
-        Log.i(TAG, "Activity 已运行，addEvent: eventId=${event.eventId} added=$added")
+        LockScreenAlertActivity.instance?.addEvent(eventData)
+        Log.i(TAG, "Activity 已运行，addEvent: eventId=${event.eventId}")
         return
       }
 
       // Activity 未运行，启动 Activity（首个事件）
+      // 锁屏接管显示，停止后台悬浮窗 tick 并清理队列，避免锁屏与悬浮窗同时显示
+      stopBackgroundFloatingWindowTick()
+      backgroundEvents.clear()
+      try {
+        ReactContextProvider.floatingWindowModule?.hide()
+      } catch (_: Exception) {
+        // 忽略
+      }
+      stopAlertsFromBackground()
       val intent = Intent(this, LockScreenAlertActivity::class.java).apply {
         // FLAG_ACTIVITY_NEW_TASK：Service 启动 Activity 必须设置
         // FLAG_ACTIVITY_CLEAR_TOP：如果 Activity 已存在，清除其上方的 Activity
@@ -670,11 +810,19 @@ class EewBackgroundService : Service() {
         putExtra(LockScreenAlertActivity.EXTRA_ALERT_LEVEL, alertLevel)
         putExtra(LockScreenAlertActivity.EXTRA_ORIGIN_TIME, event.originTime)
         putExtra(LockScreenAlertActivity.EXTRA_ARRIVAL_MS, arrivalMs)
+        if (event.reportNum != null && event.reportNum > 0) {
+          putExtra(LockScreenAlertActivity.EXTRA_REPORT_NUM, event.reportNum)
+        }
+        if (!sourceName.isNullOrEmpty()) {
+          putExtra(LockScreenAlertActivity.EXTRA_SOURCE_NAME, sourceName)
+        }
         putExtra(LockScreenAlertActivity.EXTRA_SOUND_ENABLED, soundEnabled)
         putExtra(LockScreenAlertActivity.EXTRA_VIBRATION_ENABLED, vibrationEnabled)
         putExtra(LockScreenAlertActivity.EXTRA_FLASHLIGHT_ENABLED, flashlightEnabled)
+        putExtra(LockScreenAlertActivity.EXTRA_AUTO_VOLUME_ENABLED, autoVolumeEnabled)
+        putExtra(LockScreenAlertActivity.EXTRA_ALERT_VOLUME, alertVolume)
       }
-      Log.i(TAG, "启动 LockScreenAlertActivity: eventId=${event.eventId} sound=$soundEnabled vibrate=$vibrationEnabled flashlight=$flashlightEnabled")
+      Log.i(TAG, "启动 LockScreenAlertActivity: eventId=${event.eventId} sound=$soundEnabled vibrate=$vibrationEnabled flashlight=$flashlightEnabled autoVolume=$autoVolumeEnabled volume=$alertVolume")
 
       // === 双管齐下策略（适配 MIUI 等定制 ROM）===
       // 1. 直接 startActivity：前台服务（ForegroundService）有权启动 Activity，
@@ -779,8 +927,10 @@ class EewBackgroundService : Service() {
     try {
       // 设置关闭回调：用户点击✕关闭某事件悬浮窗时，从队列移除并刷新显示
       module.onClosedCallback = { eventId ->
-        Log.i(TAG, "用户关闭后台悬浮窗 eventId=$eventId，从队列移除")
+        Log.i(TAG, "用户关闭后台悬浮窗 eventId=$eventId，从队列移除并标记已关闭")
         backgroundEvents.remove(eventId)
+        // 记录用户已关闭，后续同 ID 新报告不再重新弹出
+        userDismissedEventIds.add(eventId)
         // 如果队列空，停止 tick 和警报
         if (backgroundEvents.isEmpty()) {
           stopBackgroundFloatingWindowTick()
@@ -1017,6 +1167,13 @@ class EewBackgroundService : Service() {
     content.putDouble("epicenterDistance", distance)
     content.putDouble("originTime", event.originTime.toDouble())
     content.putBoolean("isCancel", event.isCancel)
+    if (event.reportNum != null && event.reportNum > 0) {
+      content.putInt("reportNum", event.reportNum)
+    }
+    val sName = activeSourceConfig?.name
+    if (!sName.isNullOrEmpty()) {
+      content.putString("sourceName", sName)
+    }
     return content
   }
 
@@ -1033,9 +1190,15 @@ class EewBackgroundService : Service() {
     val soundEnabled = prefs.getBoolean("soundEnabled", true)
     val vibrationEnabled = prefs.getBoolean("vibrationEnabled", true)
     val flashlightEnabled = prefs.getBoolean("flashlightEnabled", true)
+    val autoVolumeEnabled = prefs.getBoolean("autoVolumeEnabled", false)
+    val alertVolume = prefs.getInt("alertVolume", 80)
 
     if (soundEnabled) {
       try {
+        // 自动调节媒体音量：在播放声音前保存并设置目标音量
+        if (autoVolumeEnabled) {
+          ReactContextProvider.soundModule?.saveAndSetMediaVolume(alertVolume)
+        }
         ReactContextProvider.soundModule?.playAlertSound()
         Log.i(TAG, "后台声音警报已启动")
       } catch (e: Exception) {
@@ -1071,6 +1234,10 @@ class EewBackgroundService : Service() {
     } catch (_: Exception) {}
     try {
       ReactContextProvider.flashlightModule?.stopBlinking()
+    } catch (_: Exception) {}
+    try {
+      // 恢复原媒体音量
+      ReactContextProvider.soundModule?.restoreMediaVolume()
     } catch (_: Exception) {}
   }
 
@@ -1158,6 +1325,7 @@ class EewBackgroundService : Service() {
         maxIntensity = null,
         isCancel = false,
         isFinal = false,
+        reportNum = 1,
       )
 
       // 转发给 JS 层（若 JS 仍存活），使用当前活跃源或 test 标识
@@ -1324,6 +1492,11 @@ class EewBackgroundService : Service() {
       event.maxIntensity?.let { map.putDouble("intensity", it) }
       map.putBoolean("isCancel", event.isCancel)
       map.putBoolean("isFinal", event.isFinal)
+      event.reportNum?.let { map.putInt("reportNum", it) }
+      val sName = config?.name
+      if (!sName.isNullOrEmpty()) {
+        map.putString("sourceName", sName)
+      }
       map.putDouble("receivedAt", System.currentTimeMillis().toDouble())
 
       ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
@@ -1356,7 +1529,7 @@ class EewBackgroundService : Service() {
    *
    * @param alertMap 包含字段：minMagnitude, lockScreenIntensity, lockScreenEnabled,
    *                 floatingWindowEnabled, soundEnabled, vibrationEnabled, flashlightEnabled,
-   *                 backgroundEnabled, autoStartEnabled
+   *                 backgroundEnabled, autoStartEnabled, autoVolumeEnabled, alertVolume
    */
   fun updateAlertConfig(alertMap: com.facebook.react.bridge.ReadableMap) {
     val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
@@ -1386,6 +1559,12 @@ class EewBackgroundService : Service() {
     }
     if (alertMap.hasKey("autoStartEnabled")) {
       prefs.putBoolean("autoStartEnabled", alertMap.getBoolean("autoStartEnabled"))
+    }
+    if (alertMap.hasKey("autoVolumeEnabled")) {
+      prefs.putBoolean("autoVolumeEnabled", alertMap.getBoolean("autoVolumeEnabled"))
+    }
+    if (alertMap.hasKey("alertVolume")) {
+      prefs.putInt("alertVolume", alertMap.getInt("alertVolume"))
     }
     prefs.apply()
     Log.i(TAG, "alert 配置已更新")
@@ -1504,10 +1683,18 @@ class EewBackgroundService : Service() {
    *
    * RN 层在 AppState 'active' 时调用此方法，更新 appInForeground=true。
    * 这样下次收到事件时不会触发悬浮窗（由 JS 层处理）。
+   *
+   * 仅停止后台悬浮窗 tick（由 JS 层接管倒计时刷新）。
+   * 不停止声音/震动/闪光灯警报，避免误停止 JS 层已启动的警报
+   * （场景：App 在前台已有警报，切到后台再切回前台，警报应继续）。
+   * 如果后台服务在 App 后台时启动了警报，JS 层 refreshDisplay 会通过
+   * playAlertSound（内部先 stop 再 play）自然接管。
    */
   fun notifyAppInForeground() {
     appInForeground = true
-    Log.i(TAG, "App 回到前台")
+    Log.i(TAG, "App 回到前台，停止后台悬浮窗 tick")
+    // 停止后台悬浮窗 tick（由 JS 层接管倒计时刷新）
+    stopBackgroundFloatingWindowTick()
   }
 
   /**
@@ -1520,6 +1707,21 @@ class EewBackgroundService : Service() {
   fun notifyAppInBackground() {
     appInForeground = false
     Log.i(TAG, "App 进入后台（RN AppState 通知）")
+  }
+
+  /**
+   * 由 RN 层调用：标记事件已由 JS 层触发警报
+   *
+   * JS 层 useFloatingWindow 启动警报时调用此方法，将事件 ID 加入 triggeredEventIds。
+   * 这样 App 切到后台后，后台服务轮询到同一事件不会重复触发悬浮窗和警报。
+   *
+   * 解决场景：App 在前台时 JS 层通过 WebSocket/HTTP 先收到事件并启动警报，
+   * 但后台服务的 HTTP 轮询尚未执行，triggeredEventIds 中没有该事件 ID，
+   * App 切到后台后后台服务轮询到同一事件会重复触发。
+   */
+  fun markEventTriggered(eventId: String) {
+    triggeredEventIds.add(eventId)
+    Log.i(TAG, "JS 层标记事件已触发: eventId=$eventId (总数=${triggeredEventIds.size})")
   }
 
   // ======================== 通知 ========================

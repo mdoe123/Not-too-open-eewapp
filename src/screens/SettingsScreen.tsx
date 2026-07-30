@@ -167,6 +167,25 @@ export default function SettingsScreen({navigation}: SettingsScreenProps) {
           </View>
           <ChevronRightIcon size={22} color={colors.textSecondary} />
         </Pressable>
+
+        {/* 关于入口 */}
+        <Pressable
+          style={({pressed}) => [
+            styles.navCard,
+            {borderColor: colors.border},
+            pressed && {backgroundColor: colors.surface},
+          ]}
+          onPress={() => navigation.navigate('About')}
+          accessibilityRole="button"
+          accessibilityLabel="关于">
+          <View style={styles.navLeft}>
+            <Text style={[styles.navLabel, {color: colors.text}]}>关于</Text>
+            <Text style={[styles.navDesc, {color: colors.textSecondary}]}>
+              用户协议、应用信息与开源许可
+            </Text>
+          </View>
+          <ChevronRightIcon size={22} color={colors.textSecondary} />
+        </Pressable>
       </ScrollView>
     </SafeAreaView>
   );

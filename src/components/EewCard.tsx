@@ -112,7 +112,7 @@ export default function EewCard({event, userLat, userLng, colors}: EewCardProps)
             </Text>
             <View style={[styles.agencyBadge, {backgroundColor: colors.border}]}>
               <Text style={[styles.agencyText, {color: colors.textSecondary}]}>
-                {getSourceAgency(event.source)}
+                {event.sourceName || getSourceAgency(event.source)}
               </Text>
             </View>
           </View>

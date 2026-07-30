@@ -4,7 +4,9 @@ import android.app.Activity
 import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
@@ -100,6 +102,8 @@ class LockScreenAlertActivity : Activity() {
     const val EXTRA_SOUND_ENABLED = "soundEnabled"
     const val EXTRA_VIBRATION_ENABLED = "vibrationEnabled"
     const val EXTRA_FLASHLIGHT_ENABLED = "flashlightEnabled"
+    const val EXTRA_AUTO_VOLUME_ENABLED = "autoVolumeEnabled"
+    const val EXTRA_ALERT_VOLUME = "alertVolume"
 
     /** 事件数据 Intent extras keys（从 EewBackgroundService 传入） */
     const val EXTRA_EVENT_ID = "eventId"
@@ -111,6 +115,8 @@ class LockScreenAlertActivity : Activity() {
     const val EXTRA_ALERT_LEVEL = "alertLevel"
     const val EXTRA_ORIGIN_TIME = "originTime"
     const val EXTRA_ARRIVAL_MS = "arrivalMs"
+    const val EXTRA_REPORT_NUM = "reportNum"
+    const val EXTRA_SOURCE_NAME = "sourceName"
 
     /**
      * 当前活跃的 Activity 实例（供 EewBackgroundService 调用 addEvent）
@@ -150,15 +156,22 @@ class LockScreenAlertActivity : Activity() {
     val arrivalMs: Long,
     var arrived: Boolean = false,
     var alertsStopped: Boolean = false,
+    val reportNum: Int? = null,
+    val sourceName: String? = null,
   )
 
   /** 警报配置（从首个 Intent extras 读取，后续事件沿用） */
   private var soundEnabled: Boolean = true
   private var vibrationEnabled: Boolean = true
   private var flashlightEnabled: Boolean = true
+  private var autoVolumeEnabled: Boolean = false
+  private var alertVolume: Int = 80
 
   /** 事件列表（按级别排序，最多 MAX_DISPLAY_EVENTS 个） */
   private val events: MutableMap<String, LockScreenEvent> = LinkedHashMap()
+
+  /** 用户已手动关闭的事件 ID（后续同 ID 新报告不再添加） */
+  private val dismissedEventIds: MutableSet<String> = mutableSetOf()
 
   /** 事件卡片 View 引用（key: eventId） */
   private val cardViews: MutableMap<String, EventCardViews> = mutableMapOf()
@@ -166,13 +179,17 @@ class LockScreenAlertActivity : Activity() {
   /** 事件列表容器（垂直排列所有事件卡片） */
   private var eventsContainer: LinearLayout? = null
 
+  /** 外层 View（用于刷新顶级事件变化时更新背景色） */
+  private var rootView: View? = null
+
   /** 单个事件卡片的 View 引用（tick 时更新） */
   private data class EventCardViews(
-    val countdownText: TextView,
-    val magnitudeText: TextView,
-    val locationText: TextView,
-    val levelText: TextView,
-    val infoText: TextView,
+    val countdownText: StrokeTextView,
+    val magnitudeText: StrokeTextView,
+    val locationText: StrokeTextView,
+    val levelText: StrokeTextView,
+    val intensityText: StrokeTextView,
+    val infoText: StrokeTextView,
   )
 
   /** 倒计时 tick */
@@ -204,8 +221,10 @@ class LockScreenAlertActivity : Activity() {
     soundEnabled = intent.getBooleanExtra(EXTRA_SOUND_ENABLED, true)
     vibrationEnabled = intent.getBooleanExtra(EXTRA_VIBRATION_ENABLED, true)
     flashlightEnabled = intent.getBooleanExtra(EXTRA_FLASHLIGHT_ENABLED, true)
+    autoVolumeEnabled = intent.getBooleanExtra(EXTRA_AUTO_VOLUME_ENABLED, false)
+    alertVolume = intent.getIntExtra(EXTRA_ALERT_VOLUME, 80)
 
-    Log.i(TAG, "onCreate: sound=$soundEnabled vibrate=$vibrationEnabled flashlight=$flashlightEnabled")
+    Log.i(TAG, "onCreate: sound=$soundEnabled vibrate=$vibrationEnabled flashlight=$flashlightEnabled autoVolume=$autoVolumeEnabled volume=$alertVolume")
 
     // 解析首个事件
     val firstEvent = parseEventFromIntent(intent)
@@ -221,8 +240,8 @@ class LockScreenAlertActivity : Activity() {
     requestDismissKeyguard()
 
     // 构建 UI
-    val rootView = buildUI()
-    setContentView(rootView)
+    val view = buildUI()
+    setContentView(view)
 
     // 获取 WakeLock 保持屏幕常亮
     acquireWakeLock()
@@ -249,6 +268,8 @@ class LockScreenAlertActivity : Activity() {
    */
   private fun parseEventFromIntent(intent: Intent): LockScreenEvent? {
     val eventId = intent.getStringExtra(EXTRA_EVENT_ID) ?: return null
+    val reportNum = intent.getIntExtra(EXTRA_REPORT_NUM, 0)
+    val sourceName = intent.getStringExtra(EXTRA_SOURCE_NAME)
     return LockScreenEvent(
       eventId = eventId,
       magnitude = intent.getDoubleExtra(EXTRA_MAGNITUDE, 0.0),
@@ -259,6 +280,8 @@ class LockScreenAlertActivity : Activity() {
       alertLevel = intent.getStringExtra(EXTRA_ALERT_LEVEL) ?: EewAlertEngine.LEVEL_BLUE,
       originTime = intent.getLongExtra(EXTRA_ORIGIN_TIME, 0L),
       arrivalMs = intent.getLongExtra(EXTRA_ARRIVAL_MS, 0L),
+      reportNum = if (reportNum > 0) reportNum else null,
+      sourceName = sourceName,
     )
   }
 
@@ -267,6 +290,8 @@ class LockScreenAlertActivity : Activity() {
    *
    * 若 Activity 已运行，直接调用此方法添加新事件；
    * 若 Activity 未运行，Service 应调用 startLockScreenActivity() 启动 Activity。
+   *
+   * 若事件已存在（同 ID），视为"报告更新"，更新事件数据并刷新显示。
    */
   fun addEvent(event: LockScreenEvent) {
     mainHandler.post { addEventInternal(event) }
@@ -277,17 +302,27 @@ class LockScreenAlertActivity : Activity() {
   /**
    * 添加事件（内部实现，主线程调用）
    *
-   * 1. 加入 events 列表
+   * 1. 加入 events 列表（同 ID 则更新数据，保留 arrived/alertsStopped 状态）
    * 2. 重新排序、选择要显示的事件（顶级 + 并列）
    * 3. 重建 UI 卡片
    */
   private fun addEventInternal(event: LockScreenEvent) {
-    if (events.containsKey(event.eventId)) {
-      Log.i(TAG, "事件 ${event.eventId} 已存在，跳过")
+    // 用户已手动关闭此事件 → 不再重新添加
+    if (dismissedEventIds.contains(event.eventId)) {
+      Log.i(TAG, "事件 ${event.eventId} 已被用户关闭，跳过添加")
       return
     }
-    events[event.eventId] = event
-    Log.i(TAG, "添加事件: eventId=${event.eventId} mag=${event.magnitude} level=${event.alertLevel} 总数=${events.size}")
+    val existing = events[event.eventId]
+    if (existing != null) {
+      // 同 ID 事件：更新数据，保留 arrived/alertsStopped 状态
+      event.arrived = existing.arrived
+      event.alertsStopped = existing.alertsStopped
+      events[event.eventId] = event
+      Log.i(TAG, "更新事件: eventId=${event.eventId} mag=${event.magnitude}→${event.magnitude} level=${event.alertLevel} 总数=${events.size}")
+    } else {
+      events[event.eventId] = event
+      Log.i(TAG, "添加事件: eventId=${event.eventId} mag=${event.magnitude} level=${event.alertLevel} 总数=${events.size}")
+    }
     refreshDisplay()
   }
 
@@ -350,6 +385,17 @@ class LockScreenAlertActivity : Activity() {
       finish()
       return
     }
+
+    // 更新外层背景色（按当前顶级事件的烈度）
+    // 解决：先到蓝色预警，后到红色预警时背景色不更新的问题
+    val topIntensity = displayList.firstOrNull()?.intensity
+      ?: events.values.maxOfOrNull { it.intensity }
+      ?: 0.0
+    val bgColor = intensityToBgColor(topIntensity)
+    Log.i(TAG, "refreshDisplay: topIntensity=$topIntensity bgColor=$bgColor rootView=${rootView != null}")
+    rootView?.setBackgroundColor(bgColor)
+    // 同时更新 window.decorView 背景色作为后备（部分机型 rootView 背景刷新不生效）
+    window?.decorView?.setBackgroundColor(bgColor)
 
     // 清除旧卡片（保留容器）
     container.removeAllViews()
@@ -455,6 +501,9 @@ class LockScreenAlertActivity : Activity() {
       )
     }
     outer.addView(scrollView)
+    rootView = outer
+    // 同时设置 window.decorView 背景色作为后备
+    window?.decorView?.setBackgroundColor(bgColor)
 
     // 创建首个事件卡片
     refreshDisplay()
@@ -507,21 +556,25 @@ class LockScreenAlertActivity : Activity() {
       orientation = LinearLayout.HORIZONTAL
       gravity = Gravity.CENTER_VERTICAL
     }
-    val cdLabel = TextView(ctx).apply {
+    val cdLabel = StrokeTextView(ctx).apply {
       text = "S 波到达"
       setTextColor(labelColor)
       textSize = 11f
       layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
     }
-    val closeBtn = TextView(ctx).apply {
+    val closeBtn = StrokeTextView(ctx).apply {
       text = "✕"
       setTextColor(textColor)
       textSize = 18f
       val pad = dp(8)
       setPadding(pad, 0, pad, 0)
       setOnClickListener {
-        Log.i(TAG, "用户关闭事件 ${evt.eventId}")
+        Log.i(TAG, "用户关闭事件 ${evt.eventId}，标记已关闭")
         events.remove(evt.eventId)
+        dismissedEventIds.add(evt.eventId)
+        // 通知后台服务记录用户已关闭，防止后台悬浮窗重新弹出
+        com.mdoeeewapp.android.cn.background.EewBackgroundService.instance
+          ?.markUserDismissed(evt.eventId)
         refreshDisplay()
       }
     }
@@ -529,7 +582,7 @@ class LockScreenAlertActivity : Activity() {
     topRow.addView(closeBtn)
 
     // ---- 倒计时大字 ----
-    val countdownText = TextView(ctx).apply {
+    val countdownText = StrokeTextView(ctx).apply {
       text = formatCountdown(evt)
       setTextColor(textColor)
       textSize = 48f
@@ -556,7 +609,7 @@ class LockScreenAlertActivity : Activity() {
       val padTop = dp(30)
       setPadding(0, padTop, 0, 0)
     }
-    val magnitudeText = TextView(ctx).apply {
+    val magnitudeText = StrokeTextView(ctx).apply {
       text = formatMagnitude(evt)
       setTextColor(textColor)
       textSize = 16f
@@ -568,7 +621,7 @@ class LockScreenAlertActivity : Activity() {
       setBackgroundColor(dividerColor)
       layoutParams = LinearLayout.LayoutParams(dp(1), dp(20))
     }
-    val locationText = TextView(ctx).apply {
+    val locationText = StrokeTextView(ctx).apply {
       text = formatLocation(evt)
       setTextColor(textColor)
       textSize = 16f
@@ -582,24 +635,40 @@ class LockScreenAlertActivity : Activity() {
       setBackgroundColor(dividerColor)
       layoutParams = LinearLayout.LayoutParams(dp(1), dp(20))
     }
-    val levelText = TextView(ctx).apply {
+    val levelText = StrokeTextView(ctx).apply {
       text = formatLevel(evt)
       setTextColor(textColor)
       textSize = 16f
       setTypeface(typeface, Typeface.BOLD)
-      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
       gravity = Gravity.CENTER
       maxLines = 1
       ellipsize = android.text.TextUtils.TruncateAt.END
     }
+    val intensityText = StrokeTextView(ctx).apply {
+      text = formatIntensity(evt)
+      setTextColor(labelColor)
+      textSize = 13f
+      gravity = Gravity.CENTER
+      maxLines = 1
+      val padTop = dp(4)
+      setPadding(0, padTop, 0, 0)
+    }
+    // 预警等级 + 预估烈度垂直排列容器
+    val levelColumn = LinearLayout(ctx).apply {
+      orientation = LinearLayout.VERTICAL
+      gravity = Gravity.CENTER
+      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+    }
+    levelColumn.addView(levelText)
+    levelColumn.addView(intensityText)
     bottomRow.addView(magnitudeText)
     bottomRow.addView(sep1View)
     bottomRow.addView(locationText)
     bottomRow.addView(sep2View)
-    bottomRow.addView(levelText)
+    bottomRow.addView(levelColumn)
 
     // ---- 信息行 ----
-    val infoText = TextView(ctx).apply {
+    val infoText = StrokeTextView(ctx).apply {
       text = formatInfoLine(evt)
       setTextColor(labelColor)
       textSize = 12f
@@ -621,6 +690,7 @@ class LockScreenAlertActivity : Activity() {
       magnitudeText = magnitudeText,
       locationText = locationText,
       levelText = levelText,
+      intensityText = intensityText,
       infoText = infoText,
     )
 
@@ -675,6 +745,10 @@ class LockScreenAlertActivity : Activity() {
       if (soundEnabled) {
         val soundModule = ReactContextProvider.soundModule
         if (soundModule != null) {
+          // 自动调节媒体音量：在播放声音前保存并设置目标音量
+          if (autoVolumeEnabled) {
+            soundModule.saveAndSetMediaVolume(alertVolume)
+          }
           soundModule.playAlertSound()
           Log.i(TAG, "声音警报已启动")
         } else {
@@ -718,6 +792,8 @@ class LockScreenAlertActivity : Activity() {
       ReactContextProvider.soundModule?.stopAlertSound()
       ReactContextProvider.vibratorModule?.stopVibrating()
       ReactContextProvider.flashlightModule?.stopBlinking()
+      // 恢复原媒体音量
+      ReactContextProvider.soundModule?.restoreMediaVolume()
       Log.i(TAG, "声音/震动/闪光灯警报已停止")
     } catch (e: Exception) {
       Log.e(TAG, "停止警报失败: ${e.message}")
@@ -727,44 +803,71 @@ class LockScreenAlertActivity : Activity() {
   // ======================== 颜色与格式化 ========================
 
   /**
-   * 外层背景色（按最高级别事件烈度分档，暗色系）
+   * 外层背景色（按最高级别事件烈度分档，鲜色系，与悬浮窗一致）
+   *
+   * 分档与 EewAlertEngine.computeAlertLevelByIntensity 一致：
+   * - >=7 红色预警 → 鲜红
+   * - >=5 橙色预警 → 鲜橙
+   * - >=3 黄色预警 → 鲜黄
+   * - <3  蓝色预警 → 鲜蓝
+   *
+   * 颜色值与 FloatingWindowModule.intensityToBgColor 保持一致，
+   * 确保锁屏与悬浮窗在同级别预警下视觉一致。
    */
   private fun intensityToBgColor(intensity: Double): Int {
     return when {
-      intensity < 4 -> Color.parseColor("#1E3A8A")  // 深蓝
-      intensity < 6 -> Color.parseColor("#713F12")  // 暗黄
-      intensity < 8 -> Color.parseColor("#7C2D12")  // 暗橙
-      else -> Color.parseColor("#7F1D1D")            // 深红
+      intensity >= 7 -> Color.parseColor("#CCDC2828")  // 鲜红
+      intensity >= 5 -> Color.parseColor("#CCF09614")  // 鲜橙
+      intensity >= 3 -> Color.parseColor("#CCFAE600")  // 鲜黄
+      else -> Color.parseColor("#CC3764FF")            // 鲜蓝
     }
   }
 
   /**
    * 卡片背景色（半透明，让外层背景色透出）
+   *
+   * 分档与 intensityToBgColor 一致
    */
   private fun intensityToCardBgColor(intensity: Double): Int {
     return when {
-      intensity < 4 -> Color.parseColor("#334F8AFF")  // 半透明蓝
-      intensity < 6 -> Color.parseColor("#33FAE600")  // 半透明黄
-      intensity < 8 -> Color.parseColor("#33F09614")  // 半透明橙
-      else -> Color.parseColor("#33DC2828")            // 半透明红
+      intensity >= 7 -> Color.parseColor("#33DC2828")  // 半透明红
+      intensity >= 5 -> Color.parseColor("#33F09614")  // 半透明橙
+      intensity >= 3 -> Color.parseColor("#33FAE600")  // 半透明黄
+      else -> Color.parseColor("#334F8AFF")            // 半透明蓝
     }
   }
 
-  /** 主文字颜色（锁屏统一白色） */
-  private fun intensityToTextColor(@Suppress("UNUSED_PARAMETER") intensity: Double): Int {
-    return Color.parseColor("#FFFFFF")
+  /**
+   * 主文字颜色
+   * 黄色预警（烈度 3~5）用深褐（#3D2410），与黄色背景同色系，对比协调
+   * 其他背景用白色
+   */
+  private fun intensityToTextColor(intensity: Double): Int {
+    return if (intensity >= 3 && intensity < 5) {
+      Color.parseColor("#3D2410")
+    } else {
+      Color.parseColor("#FFFFFF")
+    }
   }
 
-  /** 标签文字颜色（锁屏统一白色） */
-  private fun intensityToLabelColor(@Suppress("UNUSED_PARAMETER") intensity: Double): Int {
-    return Color.parseColor("#FFFFFF")
+  /** 标签文字颜色（与主文字同色） */
+  private fun intensityToLabelColor(intensity: Double): Int {
+    return if (intensity >= 3 && intensity < 5) {
+      Color.parseColor("#3D2410")
+    } else {
+      Color.parseColor("#FFFFFF")
+    }
   }
 
-  /** 分隔线颜色 */
+  /**
+   * 分隔线颜色
+   * 黄色预警下用半透明深褐，其他背景用半透明白
+   */
   private fun intensityToDividerColor(intensity: Double): Int {
-    return when {
-      intensity < 6 -> Color.parseColor("#404040")
-      else -> Color.parseColor("#A3A3A3")
+    return if (intensity >= 3 && intensity < 5) {
+      Color.parseColor("#333D2410")
+    } else {
+      Color.parseColor("#33FFFFFF")
     }
   }
 
@@ -789,12 +892,31 @@ class LockScreenAlertActivity : Activity() {
     }
   }
 
+  private fun formatIntensity(evt: LockScreenEvent): String {
+    if (evt.intensity <= 0) return ""
+    val intensityStr = if (evt.intensity == evt.intensity.toInt().toDouble()) {
+      evt.intensity.toInt().toString()
+    } else {
+      String.format("%.1f", evt.intensity)
+    }
+    return "预估烈度$intensityStr"
+  }
+
   private fun formatInfoLine(evt: LockScreenEvent): String {
-    val timeStr = if (evt.originTime > 0) {
+    val parts = mutableListOf<String>()
+    // 报数
+    if (evt.reportNum != null && evt.reportNum > 0) parts.add("第${evt.reportNum}报")
+    // 数据源名称
+    if (!evt.sourceName.isNullOrEmpty()) parts.add(evt.sourceName)
+    // 发震时间
+    if (evt.originTime > 0) {
       val sdf = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.CHINA)
-      sdf.format(java.util.Date(evt.originTime))
-    } else ""
-    return "发震 $timeStr  深度 ${evt.depth.toInt()}km  距离 ${evt.distance.toInt()}km"
+      parts.add("发震 ${sdf.format(java.util.Date(evt.originTime))}")
+    }
+    // 深度 + 距离
+    parts.add("深度 ${evt.depth.toInt()}km")
+    parts.add("距离 ${evt.distance.toInt()}km")
+    return parts.joinToString("  ")
   }
 
   // ======================== 工具方法 ========================

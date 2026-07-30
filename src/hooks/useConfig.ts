@@ -99,6 +99,8 @@ function inferCategory(type: string): SourceCategory {
  * - v13: 彻底合规改造——删除所有 wolfx* 适配器代码和 SourceType 字面量。
  *        强制清空所有 type 非 'customSource' 的源（包括老用户已配置的 wolfx 源）。
  *        SourceType 联合仅保留 'customSource' | 'simulated'。
+ * - v14: AlertConfig 新增 autoVolumeEnabled / alertVolume 字段。
+ *        迁移策略：通过 DEFAULT_CONFIG.alert spread 自动补齐默认值，无需特殊处理。
  */
 function migrateConfig(stored: Partial<AppConfig>): AppConfig {
   // 基础合并：用默认值补齐缺失字段

@@ -3,7 +3,7 @@
 // 到预警列表，触发悬浮窗/锁屏报警联动
 //
 // 事件注入机制：通过 simulatedEventBus 单例发布事件，useEewStream 订阅后注入 events 列表
-// 坐标计算：根据震中距 + 随机方位角 + 用户位置（北京 mock）反算虚拟震中坐标
+// 坐标计算：根据震中距 + 随机方位角 + 用户当前位置反算虚拟震中坐标
 //
 // 两个触发按钮：
 // 1. 「触发模拟预警」：JS 层模拟（前台联动，锁屏后失效）
@@ -26,6 +26,9 @@ import {SliderRow} from '../components/settings/SliderRow';
 import {simulatedEventBus} from '../utils/simulatedEventBus';
 import {calcCsis} from '../utils/eew';
 import {BackgroundServiceManager} from '../native/BackgroundServiceManager';
+import {useConfig} from '../hooks/useConfig';
+import {useUserLocation} from '../hooks/useUserLocation';
+import {DEFAULT_CONFIG} from '../types';
 import {EewEvent} from '../types';
 import type {SimulateAlertScreenProps} from '../navigation/types';
 
@@ -39,10 +42,6 @@ function intensityToColor(intensity: number): string {
   if (intensity < 8) return '#FF9800'; // 橙色
   return '#FF5722'; // 橙红色
 }
-
-/** Mock 用户位置（北京，与 HomeScreen 一致） */
-const MOCK_USER_LAT = 39.9;
-const MOCK_USER_LNG = 116.4;
 
 /**
  * 根据震中距 + 随机方位角 + 用户位置反算虚拟震中坐标
@@ -63,10 +62,22 @@ function calcEpicenter(distanceKm: number, userLat: number, userLng: number): {l
  * 模拟预警页面
  *
  * 参数不持久化（每次进入页面重置为默认值），符合"不回填"偏好。
+ *
+ * 震中坐标基于用户当前位置计算（GPS 定位或手动输入），
+ * 不再使用硬编码的北京坐标，确保模拟预警的震中距与用户实际位置匹配。
  */
 export default function SimulateAlertScreen(_: SimulateAlertScreenProps) {
   const isDark = useColorScheme() === 'dark';
   const colors = getColors(isDark);
+
+  // 获取用户当前位置（GPS 定位或手动输入）
+  const {config} = useConfig();
+  const locationConfig = config?.location ?? DEFAULT_CONFIG.location;
+  const {location: userLocation} = useUserLocation({
+    mode: locationConfig.mode,
+    manualLat: locationConfig.manualLat,
+    manualLng: locationConfig.manualLng,
+  });
 
   // 模拟参数（不持久化）
   const [magnitude, setMagnitude] = useState(5.5);
@@ -103,7 +114,7 @@ export default function SimulateAlertScreen(_: SimulateAlertScreenProps) {
     clearAllTimers();
 
     const fireEvent = () => {
-      const epicenter = calcEpicenter(distance, MOCK_USER_LAT, MOCK_USER_LNG);
+      const epicenter = calcEpicenter(distance, userLocation.lat, userLocation.lng);
       const event: EewEvent = {
         id: `simulate:${Date.now()}`,
         source: 'simulated',
@@ -112,7 +123,7 @@ export default function SimulateAlertScreen(_: SimulateAlertScreenProps) {
         depth,
         lat: epicenter.lat,
         lng: epicenter.lng,
-        location: `模拟震中（距北京${distance}km）`,
+        location: '模拟预警',
         isFinal: false, // 持续预警状态
         receivedAt: Date.now(),
       };
@@ -147,7 +158,7 @@ export default function SimulateAlertScreen(_: SimulateAlertScreenProps) {
       // 立即触发
       fireEvent();
     }
-  }, [magnitude, depth, distance, delaySeconds, clearAllTimers]);
+  }, [magnitude, depth, distance, delaySeconds, userLocation, clearAllTimers]);
 
   /** 取消倒计时 */
   const handleCancel = useCallback(() => {
@@ -171,8 +182,8 @@ export default function SimulateAlertScreen(_: SimulateAlertScreenProps) {
    *      --es magnitude 6.0 --es depth 15 --es lat 40.0 --es lng 116.0 --ez forceTrigger true
    */
   const handleTestLockScreenAlert = useCallback(() => {
-    // 复用当前参数计算虚拟震中坐标
-    const epicenter = calcEpicenter(distance, MOCK_USER_LAT, MOCK_USER_LNG);
+    // 复用当前参数 + 用户当前位置计算虚拟震中坐标
+    const epicenter = calcEpicenter(distance, userLocation.lat, userLocation.lng);
     BackgroundServiceManager.testAlert({
       magnitude,
       depth,
@@ -195,7 +206,7 @@ export default function SimulateAlertScreen(_: SimulateAlertScreenProps) {
         `--es lat ${epicenter.lat.toFixed(2)} --es lng ${epicenter.lng.toFixed(2)} ` +
         `--ez forceTrigger true`,
     );
-  }, [magnitude, depth, distance]);
+  }, [magnitude, depth, distance, userLocation]);
 
   const isCounting = countdown !== null && countdown > 0;
 

@@ -23,8 +23,11 @@ import {log} from '../utils/logger';
 const MOCK_USER_LAT = 39.9;
 const MOCK_USER_LNG = 116.4;
 
-/** 首次定位超时（毫秒），超时后降级 mock */
-const INITIAL_TIMEOUT_MS = 15000;
+/** 首次定位超时（毫秒），超时后降级到低精度重试 */
+const INITIAL_TIMEOUT_MS = 8000;
+
+/** 高精度失败后的低精度（网络定位）重试超时（毫秒） */
+const FALLBACK_TIMEOUT_MS = 7000;
 
 /** 接受缓存位置的最大年龄（毫秒），避免重复冷启动 GPS */
 const MAX_CACHE_AGE_MS = 60000;
@@ -74,12 +77,16 @@ export function useUserLocation(options: UseUserLocationOptions): UseUserLocatio
   const watchIdRef = useRef<number | null>(null);
 
   useEffect(() => {
+    log('LOCATION', `useEffect 触发 mode=${mode} platform=${Platform.OS}`);
+
     // 手动模式：不启动 GPS
     if (mode === 'manual') {
+      log('LOCATION', '手动模式，跳过 GPS');
       return;
     }
     // 非 Android 直接降级（iOS 未适配）
     if (Platform.OS !== 'android') {
+      log('LOCATION', '非 Android 平台，跳过 GPS');
       return;
     }
 
@@ -97,7 +104,27 @@ export function useUserLocation(options: UseUserLocationOptions): UseUserLocatio
       log('LOCATION', `定位成功 ${next.lat.toFixed(4)}, ${next.lng.toFixed(4)}`);
     };
 
+    let lowAccuracyRetried = false;
+
     const handleError = (err: GeolocationError) => {
+      if (!mounted) return;
+      log('LOCATION', `定位失败 code=${err.code} message=${err.message}`);
+      // 高精度超时且未做过低精度重试时，降级到网络定位重试一次
+      // 适用场景：室内/弱信号 GPS 无法定位，但网络定位可用
+      if (err.code === 3 && !lowAccuracyRetried) {
+        lowAccuracyRetried = true;
+        log('LOCATION', '高精度超时，降级到低精度（网络定位）重试');
+        Geolocation.getCurrentPosition(handleSuccess, handleErrorFallback, {
+          enableHighAccuracy: false,
+          timeout: FALLBACK_TIMEOUT_MS,
+          maximumAge: MAX_CACHE_AGE_MS,
+        });
+        return;
+      }
+      handleErrorFallback(err);
+    };
+
+    const handleErrorFallback = (err: GeolocationError) => {
       if (!mounted) return;
       setGpsIsMock(prev => {
         if (!prev) {
@@ -112,13 +139,15 @@ export function useUserLocation(options: UseUserLocationOptions): UseUserLocatio
       );
     };
 
+    log('LOCATION', `调用 getCurrentPosition enableHighAccuracy=true timeout=${INITIAL_TIMEOUT_MS}`);
     Geolocation.getCurrentPosition(handleSuccess, handleError, {
       enableHighAccuracy: true,
       timeout: INITIAL_TIMEOUT_MS,
       maximumAge: MAX_CACHE_AGE_MS,
     });
 
-    watchIdRef.current = Geolocation.watchPosition(handleSuccess, handleError, {
+    log('LOCATION', `调用 watchPosition`);
+    watchIdRef.current = Geolocation.watchPosition(handleSuccess, handleErrorFallback, {
       enableHighAccuracy: true,
       interval: WATCH_INTERVAL_MS,
       fastestInterval: WATCH_INTERVAL_MS,

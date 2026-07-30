@@ -409,4 +409,6 @@ data class FieldMapping(
   val isFinal: String? = null,
   /** 是否取消报（可选） */
   val isCancel: String? = null,
+  /** 报数/第几报（可选，如 CENC 的 ReportNum 字段） */
+  val reportNum: String? = null,
 )

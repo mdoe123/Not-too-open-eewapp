@@ -71,7 +71,7 @@ class BackgroundServiceModule(
    *
    * @param alertMap 包含字段：minMagnitude, lockScreenIntensity, lockScreenEnabled,
    *                 floatingWindowEnabled, soundEnabled, vibrationEnabled, flashlightEnabled,
-   *                 backgroundEnabled, autoStartEnabled
+   *                 backgroundEnabled, autoStartEnabled, autoVolumeEnabled, alertVolume
    */
   @ReactMethod
   fun updateConfig(alertMap: ReadableMap) {
@@ -103,6 +103,12 @@ class BackgroundServiceModule(
       }
       if (alertMap.hasKey("autoStartEnabled")) {
         prefs.putBoolean("autoStartEnabled", alertMap.getBoolean("autoStartEnabled"))
+      }
+      if (alertMap.hasKey("autoVolumeEnabled")) {
+        prefs.putBoolean("autoVolumeEnabled", alertMap.getBoolean("autoVolumeEnabled"))
+      }
+      if (alertMap.hasKey("alertVolume")) {
+        prefs.putInt("alertVolume", alertMap.getInt("alertVolume"))
       }
       prefs.apply()
       Log.i(TAG, "alert 配置已写入 SharedPreferences")
@@ -162,6 +168,19 @@ class BackgroundServiceModule(
   fun notifyAppInBackground() {
     EewBackgroundService.instance?.notifyAppInBackground()
       ?: Log.d(TAG, "EewBackgroundService 未启动，notifyAppInBackground 已忽略")
+  }
+
+  /**
+   * 标记事件已由 JS 层触发警报（由 RN 层调用）
+   *
+   * JS 层 useFloatingWindow 启动警报时调用此方法，防止 App 切到后台后
+   * 后台服务重复触发同一事件的悬浮窗和警报。
+   *
+   * @param eventId 已触发警报的事件 ID
+   */
+  @ReactMethod
+  fun markEventTriggered(eventId: String) {
+    EewBackgroundService.instance?.markEventTriggered(eventId)
   }
 
   /**
