@@ -12,7 +12,7 @@
       "category": "eew",
       "protocol": "ws",
       "endpoint": "wss://ws.mangxufurry.cc.cd/ws/agency/cea_pr",
-      "note": "CEA-PR（中国地震台网省级）地震预警 - WebSocket 实时推流。",
+      "note": "mangxu的CEA-PR（中国地震台网省级）地震预警 - WebSocket 实时推流 源",
       "fieldMapping": {
         "listPath": "$.earthquakes",
         "eventId": "$.id",

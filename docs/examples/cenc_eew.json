@@ -22,7 +22,8 @@
         "lat": "$.Latitude",
         "lng": "$.Longitude",
         "location": "$.HypoCenter",
-        "intensity": "$.MaxIntensity"
+        "intensity": "$.MaxIntensity",
+        "reportNum": "$.ReportNum"
       }
     }
   ]
