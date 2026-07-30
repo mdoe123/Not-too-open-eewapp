@@ -25,11 +25,11 @@ P2 修复遵循"最小化改动、零信任改动、不引入新依赖"原则，
 
 ### 批次 3：工具函数健壮性
 
-| 编号 | 问题 | 修复文件 | 修复方式 |
-|------|------|---------|---------|
-| P2-13 | formatOriginTime 对 Invalid Date 输出 "NaN-NaN-NaN NaN:NaN:NaN" | utils/eew.ts | 新增 isNaN(d.getTime()) 防护，返回占位符 '--' |
-| P2-14 | 缺少 EewEvent 数值字段合理性校验，非法值（负震级、纬度 > 90）流入 UI | utils/eew.ts | 新增 validateEewEvent 函数，校验 magnitude / depth / lat / lng 范围 + receivedAt >= originTime 单调性 |
-| P2-15 | EewEvent 类型无范围约束文档 | types/eew.ts | 在 magnitude / depth / lat / lng / receivedAt 字段添加范围约束与单调性注释 |
+| 编号 | 问题 | 修复文件 | 修复方式 | 核实状态 |
+|------|------|---------|---------|---------|
+| P2-13 | formatOriginTime 对 Invalid Date 输出 "NaN-NaN-NaN NaN:NaN:NaN" | utils/eew.ts | 新增 isNaN(d.getTime()) 防护，返回占位符 '--' | ✅ 已修复（eew.ts:145-148） |
+| P2-14 | 缺少 EewEvent 数值字段合理性校验，非法值（负震级、纬度 > 90）流入 UI | utils/eew.ts | 新增 validateEewEvent 函数，校验 magnitude / depth / lat / lng 范围 + receivedAt >= originTime 单调性 | ✅ 已修复（eew.ts:160-180） |
+| P2-15 | EewEvent 类型无范围约束文档 | types/eew.ts | 在 magnitude / depth / lat / lng / receivedAt 字段添加范围约束与单调性注释 | ✅ 已修复（eew.ts:18,20,22,24,37-40） |
 
 ### 批次 4：Kotlin 原生清理
 
@@ -45,10 +45,10 @@ P2 修复遵循"最小化改动、零信任改动、不引入新依赖"原则，
 
 ### 批次 5：React 渲染优化与配置一致性
 
-| 编号 | 问题 | 修复文件 | 修复方式 |
-|------|------|---------|---------|
-| P2-7 (TS) | App.tsx navigationTheme 每次渲染重建对象，导致 NavigationContainer 不必要重渲染 | App.tsx | 使用 useMemo 缓存 navigationTheme，依赖 [isDarkMode, colors] |
-| P2-9 | AlertMethodSection quietEnabled 用 OR 逻辑，仅有一个时间即视为启用，半残状态 | components/settings/AlertMethodSection.tsx | 改为 AND 逻辑 + isValidTime 双端校验：`isValidTime(start) && isValidTime(end)` |
+| 编号 | 问题 | 修复文件 | 修复方式 | 核实状态 |
+|------|------|---------|---------|---------|
+| P2-7 (TS) | App.tsx navigationTheme 每次渲染重建对象，导致 NavigationContainer 不必要重渲染 | App.tsx | 使用 useMemo 缓存 navigationTheme，依赖 [isDarkMode, colors] | ✅ 已修复（App.tsx:44-57 useMemo） |
+| P2-9 | AlertMethodSection quietEnabled 用 OR 逻辑，仅有一个时间即视为启用，半残状态 | components/settings/AlertMethodSection.tsx | 改为 AND 逻辑 + isValidTime 双端校验：`isValidTime(start) && isValidTime(end)` | ✅ 已修复（AlertMethodSection.tsx:25-27 isValidTime + :37-39 AND 逻辑） |
 
 ## 验证
 

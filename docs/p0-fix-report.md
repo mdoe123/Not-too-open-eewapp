@@ -2,31 +2,33 @@
 
 本报告记录基于循环式安全审查后，针对 P0 级问题进行的修复内容。
 
+> 核实状态说明：✅ 已修复 / ⚠️ 部分修复 / ❌ 未修复（含文件已重构/删除）
+
 ## 修复清单
 
-| 编号 | 问题 | 修复文件 | 修复方式 |
-|------|------|---------|---------|
-| P0-1 | FullScreenAlertActivity.registerReceiver 未指定导出标志，Android 14 崩溃 | fullscreenalert/FullScreenAlertActivity.kt | API 33+ 使用 RECEIVER_NOT_EXPORTED 三参重载，API 26-32 走原两参重载（@Suppress 兼容） |
-| P0-2 | manifest 缺 FOREGROUND_SERVICE_DATA_SYNC 权限，startForeground 崩溃 | AndroidManifest.xml | 添加 `<uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />` |
-| P0-3 | SourceManager.handleFailure 中 activate 的 Promise 未捕获 | sources/SourceManager.ts | activate 内 try-catch 包裹 connect，失败时上报 error 并触发下一轮切换 |
-| P0-4 | SourceManager 切换逻辑并发竞态，多源同时激活 | sources/SourceManager.ts | 引入 isSwitching 标志位串行化切换；切换前先 disconnect 旧源；切换期间忽略旧源延迟回调 |
-| P0-5 | FloatingWindowModule.show 字段类型不匹配时主线程崩溃 | floatingwindow/FloatingWindowModule.kt | show 主入口加 try-catch；新增 safeGetDouble 工具函数，hasKey + isNull + try-catch 三重保护 |
-| P0-6 | useMockEewStream.switchToBackup 闭包过期，事件 source 与显示源名不一致 | hooks/useMockEewStream.ts | activeSource 改为 useRef 存储，startEventInterval 内部读 ref；reconnect/switchToBackup timer 存入 ref，卸载时统一清理 |
-| P0-7 | useLockScreenAlert.triggerAlert 忽略调用方 level，近场强破坏性地震不触发 | hooks/useLockScreenAlert.ts | triggerAlert 增加可选 level 参数，调用方传入综合计算的 level；未传则降级用 computeAlertLevel（向后兼容） |
-| P0-8 | useLockScreenAlert 无事件去重，同一事件重复触发全屏报警 | hooks/useLockScreenAlert.ts | 内部维护 triggeredEventIdsRef: Set<string>，同一 event.id 只触发一次；新增 resetTriggered 方法清理记录 |
-| P0-9 | 核心预警联动 Hook 全部未集成 | screens/HomeScreen.tsx、screens/SettingsScreen.tsx | HomeScreen 集成 useFloatingWindow + useLockScreenAlert + useConfig；SettingsScreen 集成 useConfig + settings/ 四组组件（替换占位页） |
-| P0-10 | SourceManageSection 直接变异源对象，违反不可变性 | components/settings/SourceManageSection.tsx | moveUp/moveDown 内 `sorted.map(s => ({...s}))` 深拷贝后再交换 priority |
-| P0-11 | apiKey 明文存储于 AsyncStorage | hooks/useConfig.ts | 新增 stripApiKeys 函数，所有持久化前剥离 sources 中的 apiKey 字段，仅运行时内存持有 |
+| 编号 | 问题 | 修复文件 | 修复方式 | 核实状态 |
+|------|------|---------|---------|---------|
+| P0-1 | FullScreenAlertActivity.registerReceiver 未指定导出标志，Android 14 崩溃 | fullscreenalert/FullScreenAlertActivity.kt | API 33+ 使用 RECEIVER_NOT_EXPORTED 三参重载，API 26-32 走原两参重载（@Suppress 兼容） | ✅ 已修复（实际位于 EewBackgroundService.kt，FullScreenAlertActivity 已重命名为 LockScreenAlertActivity 且无 registerReceiver） |
+| P0-2 | manifest 缺 FOREGROUND_SERVICE_DATA_SYNC 权限，startForeground 崩溃 | AndroidManifest.xml | 添加 `<uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />` | ✅ 已修复（AndroidManifest.xml:25） |
+| P0-3 | SourceManager.handleFailure 中 activate 的 Promise 未捕获 | sources/SourceManager.ts | activate 内 try-catch 包裹 connect，失败时上报 error 并触发下一轮切换 | ✅ 已修复（SourceManager.ts:119-136） |
+| P0-4 | SourceManager 切换逻辑并发竞态，多源同时激活 | sources/SourceManager.ts | 引入 isSwitching 标志位串行化切换；切换前先 disconnect 旧源；切换期间忽略旧源延迟回调 | ✅ 已修复（SourceManager.ts:35） |
+| P0-5 | FloatingWindowModule.show 字段类型不匹配时主线程崩溃 | floatingwindow/FloatingWindowModule.kt | show 主入口加 try-catch；新增 safeGetDouble 工具函数，hasKey + isNull + try-catch 三重保护 | ✅ 已修复（FloatingWindowModule.kt:701 safeGetDouble + :129 show try-catch） |
+| P0-6 | useMockEewStream.switchToBackup 闭包过期，事件 source 与显示源名不一致 | hooks/useMockEewStream.ts | activeSource 改为 useRef 存储，startEventInterval 内部读 ref；reconnect/switchToBackup timer 存入 ref，卸载时统一清理 | ❌ 未修复（useMockEewStream.ts 已删除，被 useEewStream.ts 取代；替代实现用 useState 而非 useRef，架构已重构为多源并行） |
+| P0-7 | useLockScreenAlert.triggerAlert 忽略调用方 level，近场强破坏性地震不触发 | hooks/useLockScreenAlert.ts | triggerAlert 增加可选 level 参数，调用方传入综合计算的 level；未传则降级用 computeAlertLevel（向后兼容） | ❌ 未修复（useLockScreenAlert.ts 已删除，锁屏预警改由原生 EewBackgroundService + LockScreenAlertActivity 实现） |
+| P0-8 | useLockScreenAlert 无事件去重，同一事件重复触发全屏报警 | hooks/useLockScreenAlert.ts | 内部维护 triggeredEventIdsRef: Set<string>，同一 event.id 只触发一次；新增 resetTriggered 方法清理记录 | ❌ 未修复（useLockScreenAlert.ts 已删除；事件去重逻辑已迁移至原生 EewBackgroundService 层） |
+| P0-9 | 核心预警联动 Hook 全部未集成 | screens/HomeScreen.tsx、screens/SettingsScreen.tsx | HomeScreen 集成 useFloatingWindow + useLockScreenAlert + useConfig；SettingsScreen 集成 useConfig + settings/ 四组组件（替换占位页） | ⚠️ 部分修复（HomeScreen 已集成 useFloatingWindow + useConfig；SettingsScreen 已集成 useConfig + 四组设置组件；但 useLockScreenAlert 已删除，锁屏预警由原生服务承担） |
+| P0-10 | SourceManageSection 直接变异源对象，违反不可变性 | components/settings/SourceManageSection.tsx | moveUp/moveDown 内 `sorted.map(s => ({...s}))` 深拷贝后再交换 priority | ✅ 已修复（SourceManageSection.tsx:205,230） |
+| P0-11 | apiKey 明文存储于 AsyncStorage | hooks/useConfig.ts | 新增 stripApiKeys 函数，所有持久化前剥离 sources 中的 apiKey 字段，仅运行时内存持有 | ✅ 已修复（useConfig.ts:36-47） |
 
 ## 顺手修复的相关问题
 
-| 编号 | 问题 | 修复方式 |
-|------|------|---------|
-| P1-1 | SourceManager.start 主源用 `!` 非空断言 | 改为存在性校验，缺失时上报 error 并 return |
-| P1-3 | SourceManager.stop 不清理引用 | stop 清空 activeSource/backupQueue/adapters，新增 isStopped 标志 |
-| P1-10 | threshold=0 边界语义不明 | 构造函数 `Math.max(1, threshold)` 下限校验 |
-| P1-11 | useMockEewStream.reconnect/switchToBackup 返回的清理函数被丢弃 | timer 存入 ref，主 useEffect 清理时统一清除 |
-| P2-7 | HomeScreen 内联 render 函数未 useCallback | renderCard/renderItemSeparator/renderEmpty 用 useCallback 包裹 |
+| 编号 | 问题 | 修复方式 | 核实状态 |
+|------|------|---------|---------|
+| P1-1 | SourceManager.start 主源用 `!` 非空断言 | 改为存在性校验，缺失时上报 error 并 return | ✅ 已修复（SourceManager.ts:79-85） |
+| P1-3 | SourceManager.stop 不清理引用 | stop 清空 activeSource/backupQueue/adapters，新增 isStopped 标志 | ✅ 已修复（SourceManager.ts:213-230） |
+| P1-10 | threshold=0 边界语义不明 | 构造函数 `Math.max(1, threshold)` 下限校验 | ✅ 已修复（SourceManager.ts:43） |
+| P1-11 | useMockEewStream.reconnect/switchToBackup 返回的清理函数被丢弃 | timer 存入 ref，主 useEffect 清理时统一清除 | ❌ 未修复（useMockEewStream.ts 已删除，架构已重构） |
+| P2-7 | HomeScreen 内联 render 函数未 useCallback | renderCard/renderItemSeparator/renderEmpty 用 useCallback 包裹 | ✅ 已修复（HomeScreen.tsx:199,227,229） |
 
 ## 未在本次修复范围（待后续处理）
 
