@@ -106,6 +106,10 @@ src/
 | 报警烈度 | `lockScreenIntensity` | -3~6 | 1 | 度 |
 
 - 浮点滑块用 `round1` 修正浮点累加误差
+- **作用范围（前后台一致）**：阈值同时作用于前台和后台触发路径
+  - 前台：`HomeScreen.activeEvents` 按 `minMagnitude` + `lockScreenIntensity` 过滤事件，低于阈值的不弹悬浮窗
+  - 后台：`EewBackgroundService.tryTriggerFloatingWindow()` 检查同样阈值，低于阈值的不触发锁屏/后台悬浮窗
+  - **消息通知不受阈值影响**：无论阈值如何设置，只要 `notificationEnabled` 开启，所有事件均发送系统通知栏消息
 - 烈度滑块用 `Math.round` 取整
 - 烈度范围 -3~6：负值表示"极敏感"（几乎所有事件都报警），6 表示只有高烈度才报警
 

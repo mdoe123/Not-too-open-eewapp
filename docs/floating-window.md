@@ -162,14 +162,18 @@ HomeScreen (useEffect)
 > allowHttp 同步：`config.allowHttp` 变化时通过 `BackgroundServiceManager.updateAllowHttp()` 同步到原生层 SharedPreferences，并触发 `reloadCustomSources()` 重连所有源（开关关闭时非 localhost 的 HTTP 源会被拒绝连接）。
 
 **触发条件**（必须全部满足，在 `EewBackgroundService.tryTriggerFloatingWindow()` 中检查）：
-1. `alert.lockScreenEnabled == true`
-2. `alert.floatingWindowEnabled == true`
-3. 事件震级 `>= alert.minMagnitude`
-4. 计算预估烈度 `>= alert.lockScreenIntensity`
-5. 预警级别 `!= silent`
-6. S 波尚未到达（`remainSec > 0`）
-7. App 不在前台（`appInForeground == false`，避免与 JS 层重复触发）
-8. 非取消报（`isCancel == false`）
+1. **屏幕开关检查（按屏幕状态分别判断）**：
+   - 屏幕已锁屏时：要求 `alert.lockScreenEnabled == true`（否则跳过，不触发锁屏预警）
+   - 屏幕未锁屏时：要求 `alert.floatingWindowEnabled == true`（否则跳过，不触发后台悬浮窗）
+   - 两者均关闭时，无论是否锁屏都不触发
+2. 事件震级 `>= alert.minMagnitude`
+3. 计算预估烈度 `>= alert.lockScreenIntensity`
+4. 预警级别 `!= silent`
+5. S 波尚未到达（`remainSec > 0`）
+6. App 不在前台（`appInForeground == false`，避免与 JS 层重复触发）
+7. 非取消报（`isCancel == false`）
+
+> **按屏幕状态分别检查开关的修复**：早期版本要求 `lockScreenEnabled` 和 `floatingWindowEnabled` 同时开启才触发，导致用户关闭锁屏但保留悬浮窗时后台不弹窗。现改为按屏幕状态分别检查对应开关，两者独立控制各自的触发路径。
 
 > **前台悬浮窗阈值过滤**：前台触发路径（JS 层 `useFloatingWindow`）现在也按 `alert.minMagnitude` + `alert.lockScreenIntensity` 过滤事件，低于阈值的事件不弹悬浮窗（与后台/锁屏触发路径的阈值检查一致），避免低烈度事件打扰用户。
 
@@ -384,6 +388,7 @@ stopAlertSound()
 - **eqlist 事件**（速报数据源）：事件到达时发送系统通知栏消息
 - **不受阈值影响**：消息通知不检查 `minMagnitude` / `lockScreenIntensity`，所有事件均发送通知
 - **开关控制**：由 `alert.notificationEnabled` 控制（默认开启），关闭后不发送任何通知
+- **前台后台均发送**：无论 App 在前台还是后台，只要开关开启且收到新报告就发送通知（前台时已有悬浮窗+卡片，通知作为辅助提醒；后台时通知是唯一的轻量提醒渠道）
 
 ### eqlist 事件处理
 
@@ -392,6 +397,33 @@ eqlist（速报数据源）事件在原生层**只发通知，不弹悬浮窗**�
 - eqlist 事件不满足预警实时性要求（速报数据源为地震信息列表，非实时预警），因此不触发悬浮窗/锁屏预警
 - eqlist 事件仅通过系统通知栏消息告知用户，避免速报事件干扰预警悬浮窗显示
 - eew 事件（预警数据源）则按原有逻辑触发悬浮窗/锁屏预警，同时发送通知
+
+### 通知渠道与 ID 设计
+
+消息通知使用独立的通知渠道和固定通知 ID，与保活通知、全屏预警通知完全隔离：
+
+| 通知类型 | 渠道 ID | 通知 ID | 优先级 | 用途 |
+|----------|---------|---------|--------|------|
+| 保活通知 | `eew_service` | 1 | LOW | 前台服务常驻通知 |
+| 全屏预警通知 | `eew_full_screen_alert` | 2 | HIGH | 锁屏预警 Activity 启动 |
+| 消息通知 | `eew_message` | 3 | DEFAULT | eew+eqlist 事件消息提示 |
+
+**固定通知 ID 的设计取舍**：
+
+- 所有消息通知共用 `MSG_NOTIF_ID = 3`，新通知会覆盖旧通知
+- 优点：通知栏不会被大量历史地震通知淹没，用户只看到最新事件
+- 缺点：短时间多事件并发时，早期事件通知会被覆盖（用户可能漏看）
+- 当前选择"新覆盖旧"策略，因为地震预警场景下用户最关心的是最新事件
+
+### 通知内容格式
+
+通知标题和内容根据事件 `category` 和 `reportType` 动态生成：
+
+- **标题**：eqlist 事件显示"地震速报"，eew 事件显示"地震预警"
+- **内容**：`M{震级} {地点}`
+- **副标题（InboxStyle）**：
+  - 第 1 行：`{测定类型标签} {震源深度}km`（测定类型标签来自 `reportType` 字段，`auto`→自动测定，`reviewed`→正式测定）
+  - 第 2 行：`发震时刻: {originTime}`
 
 ### 与其他警报的关系
 

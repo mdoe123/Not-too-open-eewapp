@@ -159,6 +159,67 @@ $env:ANDROID_HOME="$env:LOCALAPPDATA\Android\Sdk"
 yarn android
 ```
 
+### JDK 版本要求
+
+**必须使用 JDK 17**。系统已安装多个 JDK（Zulu 8/17/21/26），但：
+
+- **JDK 17（推荐）**：与 Gradle 9.3.1 完全兼容，构建稳定通过
+- **JDK 21**：可能兼容，未充分验证
+- **JDK 26（不可用）**：Gradle 9.3.1 的 jlink transform 在 JDK 26 下失败，报 `WARNING: A restricted method in java.lang.System has been called` 和沙箱权限错误，无法完成构建
+
+### 短路径构建（必读）
+
+**必须从短路径 `D:\eew\android` 构建_release APK，不能从原始路径 `D:\xiangmu\eewapp\android-eew-app\android` 构建**。
+
+`D:\eew` 是指向 `D:\xiangmu\eewapp\android-eew-app` 的 NTFS Junction，用于绕过 Windows MAX_PATH（260 字符）限制：
+
+```powershell
+# 正确：从短路径构建（release）
+cd D:\eew\android
+.\gradlew.bat assembleRelease --no-daemon
+
+# 错误：从原始路径构建会失败
+cd D:\xiangmu\eewapp\android-eew-app\android
+.\gradlew.bat assembleRelease --no-daemon  # CMake ninja 会因路径过长 mkdir 失败
+```
+
+**失败现象**：从原始路径构建时，CMake ninja 在编译 `react-native-gesture-handler` 的 codegen 产物时报错：
+
+```
+ninja: error: mkdir(rngesturehandler_codegen_autolinked_build/CMakeFiles/...
+  react_codegen_rngesturehandler_codegen.dir/D_/xiangmu/eewapp/android-eew-app/
+  node_modules/react-native-gesture-handler/shared/shadowNodes/react/renderer):
+  No such file or directory
+```
+
+这是因为 codegen 生成的 CMake 目标路径超过 260 字符，ninja 无法创建目录。
+
+**清理 CMake 缓存**：若曾从原始路径构建失败，需清理缓存后再从短路径构建：
+
+```powershell
+Remove-Item -Recurse -Force "D:\eew\android\app\.cxx" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "D:\eew\android\app\build" -ErrorAction SilentlyContinue
+```
+
+### 构建产物
+
+Release 构建生成两个 ABI 独立 APK：
+
+```
+D:\eew\android\app\build\outputs\apk\release\
+├── app-arm64-v8a-release.apk      # 64 位 ARM（现代设备，~26MB）
+└── app-armeabi-v7a-release.apk    # 32 位 ARM（老旧设备，~20MB）
+```
+
+### 安装到设备
+
+```powershell
+$adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
+& $adb install -r "D:\eew\android\app\build\outputs\apk\release\app-arm64-v8a-release.apk"
+```
+
+> `adb` 不在系统 PATH 中，需用完整路径或先 `cd` 到 platform-tools 目录。
+
 ## 构建中修复的代码问题
 
 ### FloatingWindowModule.kt

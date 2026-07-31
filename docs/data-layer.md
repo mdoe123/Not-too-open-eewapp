@@ -16,7 +16,7 @@
 src/
 ├── types/
 │   ├── eew.ts             # 核心数据模型：EewEvent、SourceType、SourceCategory、SourceStatus、AlertLevel、UserLocation
-│   ├── config.ts          # 配置类型：SourceConfig、FieldMapping、AlertConfig、AppConfig、DEFAULT_CONFIG（CURRENT_CONFIG_VERSION=13）
+│   ├── config.ts          # 配置类型：SourceConfig、FieldMapping、AlertConfig、AppConfig、DEFAULT_CONFIG（CURRENT_CONFIG_VERSION=17）
 │   └── index.ts           # 统一导出
 └── sources/
     ├── SourceAdapter.ts        # 数据源适配器抽象接口
@@ -144,7 +144,7 @@ type AlertLevel = 'silent' | 'blue' | 'yellow' | 'orange' | 'red';
 - **sources**：空数组 `[]`（合规改造后不预置任何数据源）
 - 全局轮询兜底 30000ms
 - 心跳失败切换阈值 3 次
-- 配置版本号 `CURRENT_CONFIG_VERSION = 13`
+- 配置版本号 `CURRENT_CONFIG_VERSION = 17`
 
 ### 4.5 配置版本历史
 
@@ -163,6 +163,10 @@ type AlertLevel = 'silent' | 'blue' | 'yellow' | 'orange' | 'red';
 | v11 | 合规改造——DEFAULT_CONFIG.sources 清空为 []；保留 wolfx 适配器代码做向后兼容 |
 | v12 | FieldMapping 新增可选 listPath 字段，支持列表 API 直消费 |
 | v13 | **彻底合规改造**——删除所有 wolfx* 适配器代码和 SourceType 字面量。SourceType 联合仅保留 `'customSource' | 'simulated'`。强制清空所有 type 非 'customSource' 的源。新增文件夹扫描和文件选择器导入入口。原生层 EewBackgroundService 改为读 customSource 配置。 |
+| v14 | AlertConfig 新增 autoVolumeEnabled（自动调节媒体音量，默认 false）和 alertVolume（预警音量百分比，默认 80） |
+| v15 | AppConfig 新增 allowHttp（允许 HTTP 明文连接，默认 false） |
+| v16 | FieldMapping 新增可选 reportType 字段（测定类型映射，如 `auto`=自动测定、`reviewed`=正式测定） |
+| v17 | AlertConfig 新增 notificationEnabled（消息通知开关，默认 true）。eew+eqlist 事件到达时发送系统通知栏消息，不受阈值影响 |
 
 ## 5. SourceAdapter 接口
 
