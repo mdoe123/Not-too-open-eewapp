@@ -13,11 +13,13 @@ customSource 是 App 唯一支持的真实数据源类型。用户通过设置�
 - **protocol**：连接协议（`ws` 或 `http`）
 - **fieldMapping**：字段映射规则（按路径表达式从 JSON 提取字段）
 - **authToken**：鉴权 token（可选）
+- **wsAuthMessage**：WS 连接建立后发送的鉴权/订阅文本（可选，仅 `protocol='ws'`）
+- **heartbeatKeyword**：心跳包关键词（可选，仅 `protocol='ws'`，默认 `heartbeat`）
 - **pollIntervalMs**：HTTP 轮询间隔（可选，默认 2000ms）
 
 | 协议 | 适用场景 | 鉴权方式 | 延迟 |
 |------|---------|---------|------|
-| `ws`（WebSocket） | 实时推送 API | URL 追加 `?token=<authToken>` 查询参数 | 最低 |
+| `ws`（WebSocket） | 实时推送 API | URL 追加 `?token=<authToken>` 查询参数 + 可选 `wsAuthMessage` 连接后发送 | 最低 |
 | `http`（GET 轮询） | REST API | 请求头 `Authorization: Bearer <authToken>` | 取决于 `pollIntervalMs` |
 
 ### 数据源分类（SourceCategory）
@@ -379,15 +381,68 @@ WebSocket 模式下，`authToken` 非空时，适配器在 URL 追加查询参�
 wss://api.example.com/eew?token=<authToken>
 ```
 
-### 5.3 安全设计
+### 5.3 WebSocket 连接后发送消息（wsAuthMessage）
+
+某些 WS 服务器要求客户端在 `onOpen` 后主动发送一条消息完成订阅或鉴权
+（如发送 JSON 订阅指令、发送 token 字符串等）。配置 `wsAuthMessage` 后，
+适配器在 WS `onOpen` 时调用 `ws.send(wsAuthMessage)` 一次。
+
+- 与 `authToken` 互不影响：`authToken` 走 URL 查询参数/HTTP 头，本字段走 WS 消息体
+- 字段内容原样发送，不做任何转义或 JSON 包装（如需 JSON 自行填写完整字符串）
+- 不配置时跳过此步骤，仅依赖 URL 鉴权
+
+示例配置：
+
+```json
+{
+  "protocol": "ws",
+  "endpoint": "wss://api.example.com/eew",
+  "wsAuthMessage": "{\"action\":\"subscribe\",\"channel\":\"eew\",\"token\":\"your-token\"}"
+}
+```
+
+### 5.4 安全设计
 
 - `authToken` 与 `apiKey` 一样，**不持久化到 AsyncStorage**（仅运行时内存持有）
 - 导出源配置时默认剥离 `authToken`，用户需显式勾选"包含鉴权 token"才保留
 - `authToken` 仅用于上述两种鉴权方式，不参与字段映射或 URL 路径拼接
+- `wsAuthMessage` 中若包含敏感信息（如 token 字符串），同样不持久化（与 `authToken` 同等保护级别）
 
 ---
 
-## 6. 关键实现细节
+## 6. WebSocket 心跳检测
+
+### 6.1 工作机制
+
+部分 WS 服务器会定期推送心跳包（如 `heartbeat`、`ping`、`{"type":"pong"}`）。
+适配器在 `onMessage` 中检测：若收到的文本**包含** `heartbeatKeyword`，视为心跳包，
+不传给事件解析器，并记录时间戳用于超时重连检测。
+
+### 6.2 配置项
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `heartbeatKeyword` | `heartbeat` | 心跳包关键词；收到的文本包含此词即视为心跳。配置为空字符串禁用心跳检测 |
+
+### 6.3 超时重连策略
+
+| 阶段 | 超时阈值 |
+|------|---------|
+| 首次（未观察到间隔） | 60 秒 |
+| 收到 ≥2 次心跳后 | `max(30s, 间隔 × 2)`，上限 300 秒 |
+
+超时未收到心跳时，适配器主动关闭 WS（触发 `onclose` → 指数退避重连）。
+
+间隔仅在合理范围内更新（1s ~ 10min），避免重连后第一拍污染阈值。
+
+### 6.4 跨层一致性
+
+JS 层（`CustomSourceAdapter.ts`）和原生层（`EewBackgroundService.SourceConnection`）
+**双层一致实现**，保证前台/锁屏心跳检测行为一致。
+
+---
+
+## 7. 关键实现细节
 
 ### 6.1 事件 ID 生成
 
@@ -430,7 +485,7 @@ dedupKey = `${originTime}_${lat.toFixed(2)}_${lng.toFixed(2)}_${magnitude.toFixe
 
 ---
 
-## 7. 默认配置
+## 8. 默认配置
 
 文件 `src/types/config.ts` 中的 `DEFAULT_CONFIG`：
 

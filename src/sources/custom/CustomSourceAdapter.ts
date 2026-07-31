@@ -39,6 +39,21 @@ const HEARTBEAT_TIMEOUT_MULTIPLIER = 3;
 /** HTTP 心跳超时下限（毫秒） */
 const HEARTBEAT_TIMEOUT_MIN_MS = 10000;
 
+/** WS 心跳包默认关键词（用户未配置 heartbeatKeyword 时使用） */
+const DEFAULT_WS_HEARTBEAT_KEYWORD = 'heartbeat';
+
+/** WS 心跳超时：首次未观察到间隔时的默认超时（毫秒） */
+const WS_HEARTBEAT_DEFAULT_TIMEOUT_MS = 60_000;
+
+/** WS 心跳超时：基于观察到的间隔计算时的下限（毫秒） */
+const WS_HEARTBEAT_TIMEOUT_MIN_MS = 30_000;
+
+/** WS 心跳超时：基于观察到的间隔计算时的上限（毫秒） */
+const WS_HEARTBEAT_TIMEOUT_MAX_MS = 300_000;
+
+/** WS 心跳超时：观察到的间隔的倍数（超时 = max(min, interval × multiplier)） */
+const WS_HEARTBEAT_TIMEOUT_MULTIPLIER = 2;
+
 /**
  * 自定义数据源适配器
  *
@@ -57,6 +72,16 @@ export class CustomSourceAdapter implements SourceAdapter {
   private isManualClose = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
+
+  // WS 心跳检测相关
+  /** 心跳包关键词（空字符串表示禁用心跳检测） */
+  private readonly heartbeatKeyword: string;
+  /** 上次收到心跳的时间戳（Unix 毫秒） */
+  private lastHeartbeatAt = 0;
+  /** 上次观察到的心跳间隔（毫秒，收到 ≥2 次心跳后填充） */
+  private lastHeartbeatIntervalMs = 0;
+  /** 心跳超时检测定时器 */
+  private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
 
   // HTTP 相关
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -88,6 +113,8 @@ export class CustomSourceAdapter implements SourceAdapter {
       HEARTBEAT_TIMEOUT_MIN_MS,
     );
     this.idPrefix = `customSource-${extractHost(config.endpoint ?? '')}-${config.priority}`;
+    // 心跳关键词：用户未配置（undefined）使用默认 'heartbeat'；显式配置空字符串禁用检测
+    this.heartbeatKeyword = config.heartbeatKeyword ?? DEFAULT_WS_HEARTBEAT_KEYWORD;
   }
 
   /**
@@ -129,6 +156,11 @@ export class CustomSourceAdapter implements SourceAdapter {
       this.reconnectTimer = null;
     }
 
+    if (this.heartbeatTimer) {
+      clearTimeout(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+
     if (this.ws) {
       this.ws.onopen = null;
       this.ws.onmessage = null;
@@ -148,6 +180,8 @@ export class CustomSourceAdapter implements SourceAdapter {
     }
 
     this.lastSuccessAt = 0;
+    this.lastHeartbeatAt = 0;
+    this.lastHeartbeatIntervalMs = 0;
     this.setStatus('disconnected');
   }
 
@@ -192,7 +226,13 @@ export class CustomSourceAdapter implements SourceAdapter {
   /**
    * 创建 WebSocket 连接并注册事件回调
    *
-   * 鉴权：URL 追加 ?token=<authToken>（如有）
+   * 鉴权：
+   * 1. URL 追加 ?token=<authToken>（如有）
+   * 2. onOpen 时 ws.send(wsAuthMessage)（如有），用于订阅/鉴权场景
+   *
+   * 心跳检测：
+   * - onMessage 检测包含 heartbeatKeyword 的文本视为心跳，不传给解析器
+   * - 启动心跳超时定时器，超时主动关闭 WS 并重连
    */
   private openWebSocket(): void {
     const url = this.buildWsUrl();
@@ -202,13 +242,34 @@ export class CustomSourceAdapter implements SourceAdapter {
       this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
       this.setStatus('connected');
       log('CUSTOM', `${this.config.name} WS 已连接`);
+
+      // onOpen 后发送鉴权/订阅消息（如配置）
+      const authMsg = this.config.wsAuthMessage;
+      if (authMsg) {
+        try {
+          this.ws?.send(authMsg);
+          log('CUSTOM', `${this.config.name} WS 已发送鉴权消息 (${authMsg.length} 字符)`);
+        } catch (e) {
+          log('CUSTOM', `${this.config.name} WS 发送鉴权消息失败 ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+
+      // 启动心跳超时检测（关键词非空时）
+      this.startHeartbeatWatchdog();
     };
 
     this.ws.onmessage = (ev: WebSocketMessageEvent) => {
       if (!this.ws) return;
+      const data =
+        typeof ev.data === 'string' ? ev.data : String(ev.data);
+
+      // 心跳包检测：包含关键词视为心跳，不传给解析器
+      if (this.heartbeatKeyword && data.includes(this.heartbeatKeyword)) {
+        this.onHeartbeatReceived();
+        return;
+      }
+
       try {
-        const data =
-          typeof ev.data === 'string' ? ev.data : String(ev.data);
         const parsed = JSON.parse(data);
         const events = this.buildEvents(parsed);
         if (events.length > 0) {
@@ -230,6 +291,7 @@ export class CustomSourceAdapter implements SourceAdapter {
 
     this.ws.onclose = () => {
       this.ws = null;
+      this.stopHeartbeatWatchdog();
       if (this.isManualClose) {
         log('CUSTOM', `${this.config.name} WS 已断开（主动）`);
         this.setStatus('disconnected');
@@ -239,6 +301,75 @@ export class CustomSourceAdapter implements SourceAdapter {
         this.scheduleReconnect();
       }
     };
+  }
+
+  /**
+   * 启动心跳超时检测定时器
+   *
+   * 超时阈值计算：
+   * - 首次（lastHeartbeatIntervalMs === 0）：使用默认 60 秒
+   * - 已观察到间隔：max(30s, interval × 2)，上限 300 秒
+   *
+   * 超时后主动关闭 WS（触发 onclose → scheduleReconnect）
+   */
+  private startHeartbeatWatchdog(): void {
+    if (!this.heartbeatKeyword) return;
+    this.stopHeartbeatWatchdog();
+
+    const timeoutMs = this.computeHeartbeatTimeoutMs();
+    this.lastHeartbeatAt = Date.now();
+    log('CUSTOM', `${this.config.name} 心跳检测启动，超时 ${timeoutMs}ms`);
+
+    this.heartbeatTimer = setTimeout(() => {
+      this.heartbeatTimer = null;
+      if (!this.ws || this.isManualClose) return;
+      const elapsed = Date.now() - this.lastHeartbeatAt;
+      log('CUSTOM', `${this.config.name} 心跳超时 ${elapsed}ms（阈值 ${timeoutMs}ms），主动关闭重连`);
+      try {
+        this.ws.close();
+      } catch {
+        // 忽略关闭异常
+      }
+      // onclose 会接管：清理 + scheduleReconnect
+    }, timeoutMs);
+  }
+
+  /** 计算当前心跳超时阈值（毫秒） */
+  private computeHeartbeatTimeoutMs(): number {
+    if (this.lastHeartbeatIntervalMs === 0) {
+      return WS_HEARTBEAT_DEFAULT_TIMEOUT_MS;
+    }
+    const computed = this.lastHeartbeatIntervalMs * WS_HEARTBEAT_TIMEOUT_MULTIPLIER;
+    return Math.min(
+      Math.max(computed, WS_HEARTBEAT_TIMEOUT_MIN_MS),
+      WS_HEARTBEAT_TIMEOUT_MAX_MS,
+    );
+  }
+
+  /**
+   * 收到心跳时调用：更新时间戳、计算间隔、重启定时器
+   */
+  private onHeartbeatReceived(): void {
+    const now = Date.now();
+    if (this.lastHeartbeatAt > 0) {
+      const interval = now - this.lastHeartbeatAt;
+      // 仅在合理范围内更新（避免异常值污染，如 >10 分钟的间隔通常是重连后第一拍）
+      if (interval > 1000 && interval < 600_000) {
+        this.lastHeartbeatIntervalMs = interval;
+        log('CUSTOM', `${this.config.name} 心跳间隔 ${interval}ms`);
+      }
+    }
+    this.lastHeartbeatAt = now;
+    // 每次收到心跳都重启定时器（按最新阈值）
+    this.startHeartbeatWatchdog();
+  }
+
+  /** 停止心跳超时检测定时器 */
+  private stopHeartbeatWatchdog(): void {
+    if (this.heartbeatTimer) {
+      clearTimeout(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
   }
 
   /**

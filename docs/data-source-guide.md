@@ -89,6 +89,8 @@ CustomSource 是 App 当前唯一的真实数据源类型。用户通过设置�
 - 连接协议（`protocol: 'ws' | 'http'`）
 - 字段映射规则（`fieldMapping`）
 - 鉴权 token（`authToken`，可选）
+- WS 连接后发送消息（`wsAuthMessage`，可选，仅 `ws` 协议）
+- 心跳包关键词（`heartbeatKeyword`，可选，仅 `ws` 协议，默认 `heartbeat`）
 
 App 按用户配置的路径表达式从 API 返回的 JSON 中提取字段，**不执行任何用户代码**，仅做 JSON 解析。
 
@@ -173,11 +175,25 @@ interface FieldMapping {
 | 协议 | 鉴权方式 |
 |------|---------|
 | HTTP | 请求头 `Authorization: Bearer <authToken>` |
-| WebSocket | URL 追加 `?token=<authToken>` 查询参数 |
+| WebSocket | URL 追加 `?token=<authToken>` 查询参数 + 可选 `wsAuthMessage` 连接后发送 |
+
+**WS 连接后发送消息**（`wsAuthMessage`，可选）：
+某些 WS 服务器要求客户端在 `onOpen` 后主动发送一条消息完成订阅或鉴权
+（如发送 JSON 订阅指令、token 字符串等）。配置后适配器在 `onOpen` 时 `ws.send()` 一次，
+内容原样发送不做转义。与 `authToken` 互不影响。
+
+**心跳检测**（`heartbeatKeyword`，默认 `heartbeat`）：
+部分 WS 服务器定期推送心跳包。适配器在 `onMessage` 中检测：若收到的文本**包含**此关键词，
+视为心跳包，不传给事件解析器，并记录时间戳用于超时重连检测。
+- 首次未观察到间隔时：默认超时 60 秒
+- 收到 ≥2 次心跳后：超时 = `max(30s, 间隔 × 2)`，上限 300 秒
+- 超时未收到心跳：主动关闭 WS 并触发指数退避重连
+- 配置为空字符串禁用心跳检测（不推荐，可能导致僵死连接无法恢复）
 
 安全设计：
 - `authToken` 与 `apiKey` 一样，**不持久化到 AsyncStorage**（仅运行时内存持有）
 - 导出源配置时默认剥离 `authToken`，用户需显式勾选才保留
+- `wsAuthMessage` 若包含敏感信息，同等保护级别（不持久化）
 
 ### 3.5 WS 指数退避重连
 

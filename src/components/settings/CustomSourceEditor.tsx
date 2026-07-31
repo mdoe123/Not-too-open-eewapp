@@ -54,6 +54,8 @@ interface FormState {
   protocol: 'ws' | 'http';
   endpoint: string;
   authToken: string;
+  wsAuthMessage: string;
+  heartbeatKeyword: string;
   pollIntervalMs: number;
   listPath: string;
   eventId: string;
@@ -78,6 +80,8 @@ const EMPTY_FORM: FormState = {
   protocol: 'http',
   endpoint: '',
   authToken: '',
+  wsAuthMessage: '',
+  heartbeatKeyword: '',
   pollIntervalMs: 30000,
   listPath: '',
   eventId: '',
@@ -107,6 +111,8 @@ function sourceToForm(src?: SourceConfig): FormState {
     protocol: src.protocol ?? 'http',
     endpoint: src.endpoint ?? '',
     authToken: src.authToken ?? '',
+    wsAuthMessage: src.wsAuthMessage ?? '',
+    heartbeatKeyword: src.heartbeatKeyword ?? '',
     pollIntervalMs: src.pollIntervalMs ?? 30000,
     listPath: fm.listPath ?? '',
     eventId: fm.eventId ?? '',
@@ -176,6 +182,9 @@ function formToSource(form: FormState, priority: number): SourceConfig {
     protocol: form.protocol,
     pollIntervalMs: form.protocol === 'http' ? form.pollIntervalMs : undefined,
     authToken: form.authToken.trim() || undefined,
+    // wsAuthMessage / heartbeatKeyword 仅 ws 协议下保留
+    wsAuthMessage: form.protocol === 'ws' ? (form.wsAuthMessage.trim() || undefined) : undefined,
+    heartbeatKeyword: form.protocol === 'ws' ? (form.heartbeatKeyword.trim() || undefined) : undefined,
     note: form.note.trim() || undefined,
     fieldMapping,
   };
@@ -365,6 +374,29 @@ export const CustomSourceEditor = memo(function CustomSourceEditor({
                 colors={colors}
               />
             </View>
+          )}
+
+          {form.protocol === 'ws' && (
+            <>
+              <FieldRow
+                label="连接后发送消息（可选）"
+                value={form.wsAuthMessage}
+                onChangeText={v => update('wsAuthMessage', v)}
+                placeholder='如 {"action":"subscribe","channel":"eew"}'
+                colors={colors}
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+              <FieldRow
+                label="心跳关键词（可选）"
+                value={form.heartbeatKeyword}
+                onChangeText={v => update('heartbeatKeyword', v)}
+                placeholder="留空 = 默认 heartbeat；含此词视为心跳"
+                colors={colors}
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+            </>
           )}
 
           {/* ====== 字段映射（可折叠）====== */}

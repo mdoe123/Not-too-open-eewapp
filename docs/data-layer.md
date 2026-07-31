@@ -116,6 +116,8 @@ type AlertLevel = 'silent' | 'blue' | 'yellow' | 'orange' | 'red';
 | `protocol` | ❌ | 连接协议（`'ws'` 或 `'http'`，仅 customSource 使用） |
 | `fieldMapping` | ❌ | 字段映射规则（仅 customSource 使用） |
 | `authToken` | ❌ | 鉴权 token（仅 customSource 使用，不持久化） |
+| `wsAuthMessage` | ❌ | WS 连接建立后发送的鉴权/订阅文本（仅 customSource + `protocol='ws'`，不持久化） |
+| `heartbeatKeyword` | ❌ | 心跳包关键词（仅 customSource + `protocol='ws'`，默认 `heartbeat`） |
 | `apiKey` | ❌ | 鉴权密钥（保留兼容，不持久化） |
 | `pollIntervalMs` | ❌ | 轮询间隔（HTTP 源使用，毫秒） |
 | `note` | ❌ | 用户备注（仅 customSource 使用） |
@@ -167,6 +169,7 @@ type AlertLevel = 'silent' | 'blue' | 'yellow' | 'orange' | 'red';
 | v15 | AppConfig 新增 allowHttp（允许 HTTP 明文连接，默认 false） |
 | v16 | FieldMapping 新增可选 reportType 字段（测定类型映射，如 `auto`=自动测定、`reviewed`=正式测定） |
 | v17 | AlertConfig 新增 notificationEnabled（消息通知开关，默认 true）。eew+eqlist 事件到达时发送系统通知栏消息，不受阈值影响 |
+| v18 | SourceConfig 新增 wsAuthMessage（WS 连接后发送的鉴权/订阅文本，仅 `protocol='ws'`）和 heartbeatKeyword（心跳包关键词，默认 `heartbeat`）。前者用于订阅/鉴权场景（如发送 JSON 订阅指令），后者用于检测服务器心跳包并自动重连（首次默认 60s，收到 ≥2 次心跳后超时 = `max(30s, 间隔×2)`，上限 300s） |
 
 ## 5. SourceAdapter 接口
 

@@ -391,6 +391,8 @@ class EewBackgroundService : Service() {
       endpoint = obj.optString("endpoint", ""),
       protocol = obj.optString("protocol", "ws"),
       authToken = obj.optString("authToken", "").ifEmpty { null },
+      wsAuthMessage = obj.optString("wsAuthMessage", "").ifEmpty { null },
+      heartbeatKeyword = obj.optString("heartbeatKeyword", "").ifEmpty { null },
       pollIntervalMs = obj.optLong("pollIntervalMs", 30_000L),
       fieldMapping = mapping,
       priority = obj.optInt("priority", 0),
@@ -1296,6 +1298,8 @@ class EewBackgroundService : Service() {
         endpoint = "",
         protocol = "test",
         authToken = null,
+        wsAuthMessage = null,
+        heartbeatKeyword = null,
         pollIntervalMs = 0L,
         fieldMapping = FieldMapping(
           eventId = "$.eventId",
@@ -1860,6 +1864,32 @@ class EewBackgroundService : Service() {
     /** HTTP 轮询 Runnable */
     private var httpPollRunnable: Runnable? = null
 
+    // ===== WS 心跳检测相关（与 JS 层 CustomSourceAdapter 行为一致） =====
+
+    /** 心跳包关键词（null 表示禁用检测；用户未配置时默认 'heartbeat'） */
+    private val heartbeatKeyword: String? = config.heartbeatKeyword ?: "heartbeat"
+
+    /** 上次收到心跳的时间戳（Unix 毫秒） */
+    private var lastHeartbeatAt = 0L
+
+    /** 上次观察到的心跳间隔（毫秒，收到 ≥2 次心跳后填充） */
+    private var lastHeartbeatIntervalMs = 0L
+
+    /** 心跳超时检测 Runnable */
+    private var heartbeatRunnable: Runnable? = null
+
+    /** WS 心跳超时：首次未观察到间隔时的默认超时（毫秒） */
+    private val wsHeartbeatDefaultTimeoutMs = 60_000L
+
+    /** WS 心跳超时：基于观察到的间隔计算时的下限（毫秒） */
+    private val wsHeartbeatTimeoutMinMs = 30_000L
+
+    /** WS 心跳超时：基于观察到的间隔计算时的上限（毫秒） */
+    private val wsHeartbeatTimeoutMaxMs = 300_000L
+
+    /** WS 心跳超时：观察到的间隔的倍数 */
+    private val wsHeartbeatTimeoutMultiplier = 2L
+
     /**
      * 启动连接
      *
@@ -1909,6 +1939,9 @@ class EewBackgroundService : Service() {
       // 取消 WS 重连
       reconnectRunnable?.let { reconnectHandler.removeCallbacks(it) }
       reconnectRunnable = null
+      // 取消心跳超时检测
+      heartbeatRunnable?.let { reconnectHandler.removeCallbacks(it) }
+      heartbeatRunnable = null
       // 关闭 WS
       try {
         webSocket?.close(1000, "Source stopped")
@@ -1919,6 +1952,9 @@ class EewBackgroundService : Service() {
       // 取消 HTTP 轮询
       httpPollRunnable?.let { httpPollHandler.removeCallbacks(it) }
       httpPollRunnable = null
+      // 重置心跳状态
+      lastHeartbeatAt = 0L
+      lastHeartbeatIntervalMs = 0L
       Log.i(TAG, "源 ${config.name} 已停止")
     }
 
@@ -1927,7 +1963,14 @@ class EewBackgroundService : Service() {
     /**
      * 启动 WebSocket 连接
      *
-     * URL 来自 [CustomSourceConfig.endpoint]，鉴权通过 URL 查询参数 ?token=<authToken>。
+     * 鉴权：
+     * 1. URL 追加 ?token=<authToken> 查询参数
+     * 2. onOpen 时 webSocket.send(wsAuthMessage)（如配置），用于订阅/鉴权场景
+     *
+     * 心跳检测：
+     * - onMessage 检测包含 heartbeatKeyword 的文本视为心跳，不传给解析器
+     * - 启动心跳超时定时器，超时主动关闭 WS 并重连
+     *
      * 若已连接则不重复连接。
      */
     private fun startWebSocket() {
@@ -1962,15 +2005,36 @@ class EewBackgroundService : Service() {
           Log.i(TAG, "源 ${config.name} WebSocket 已连接")
           reconnectDelayMs = 1000L
           emitWsStatus("connected", "${config.name} 已连接")
+
+          // onOpen 后发送鉴权/订阅消息（如配置）
+          val authMsg = config.wsAuthMessage
+          if (!authMsg.isNullOrEmpty()) {
+            try {
+              webSocket.send(authMsg)
+              Log.i(TAG, "源 ${config.name} WS 已发送鉴权消息 (${authMsg.length} 字符)")
+            } catch (e: Exception) {
+              Log.e(TAG, "源 ${config.name} WS 发送鉴权消息失败: ${e.message}")
+            }
+          }
+
+          // 启动心跳超时检测（关键词非空时）
+          startHeartbeatWatchdog()
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
+          // 心跳包检测：包含关键词视为心跳，不传给解析器
+          val kw = heartbeatKeyword
+          if (!kw.isNullOrEmpty() && text.contains(kw)) {
+            onHeartbeatReceived()
+            return
+          }
           handleSourceData(text, config)
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
           Log.e(TAG, "源 ${config.name} WebSocket 错误: ${t.message}")
           this@SourceConnection.webSocket = null
+          stopHeartbeatWatchdog()
           if (!isManualClose) {
             emitWsStatus("error", "${config.name} WebSocket 错误: ${t.message}")
             scheduleReconnect()
@@ -1980,12 +2044,79 @@ class EewBackgroundService : Service() {
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
           Log.i(TAG, "源 ${config.name} WebSocket 已关闭: $code $reason")
           this@SourceConnection.webSocket = null
+          stopHeartbeatWatchdog()
           if (!isManualClose) {
             emitWsStatus("disconnected", "${config.name} WebSocket 意外断开，准备重连")
             scheduleReconnect()
           }
         }
       })
+    }
+
+    /**
+     * 启动心跳超时检测定时器
+     *
+     * 超时阈值计算：
+     * - 首次（lastHeartbeatIntervalMs === 0）：使用默认 60 秒
+     * - 已观察到间隔：max(30s, interval × 2)，上限 300 秒
+     *
+     * 超时后主动关闭 WS（触发 onClosed → scheduleReconnect）
+     */
+    private fun startHeartbeatWatchdog() {
+      val kw = heartbeatKeyword
+      if (kw.isNullOrEmpty()) return
+      stopHeartbeatWatchdog()
+
+      val timeoutMs = computeHeartbeatTimeoutMs()
+      lastHeartbeatAt = System.currentTimeMillis()
+      Log.i(TAG, "源 ${config.name} 心跳检测启动，超时 ${timeoutMs}ms")
+
+      val r = Runnable {
+        if (isManualClose) return@Runnable
+        val ws = webSocket
+        if (ws == null) return@Runnable
+        val elapsed = System.currentTimeMillis() - lastHeartbeatAt
+        Log.w(TAG, "源 ${config.name} 心跳超时 ${elapsed}ms（阈值 ${timeoutMs}ms），主动关闭重连")
+        try {
+          ws.close(1000, "heartbeat timeout")
+        } catch (_: Exception) {
+          // 忽略关闭异常
+        }
+        // onClosed 会接管：清理 + scheduleReconnect
+      }
+      heartbeatRunnable = r
+      reconnectHandler.postDelayed(r, timeoutMs)
+    }
+
+    /** 计算当前心跳超时阈值（毫秒） */
+    private fun computeHeartbeatTimeoutMs(): Long {
+      if (lastHeartbeatIntervalMs == 0L) {
+        return wsHeartbeatDefaultTimeoutMs
+      }
+      val computed = lastHeartbeatIntervalMs * wsHeartbeatTimeoutMultiplier
+      return minOf(maxOf(computed, wsHeartbeatTimeoutMinMs), wsHeartbeatTimeoutMaxMs)
+    }
+
+    /** 收到心跳时调用：更新时间戳、计算间隔、重启定时器 */
+    private fun onHeartbeatReceived() {
+      val now = System.currentTimeMillis()
+      if (lastHeartbeatAt > 0) {
+        val interval = now - lastHeartbeatAt
+        // 仅在合理范围内更新（避免异常值污染，如 >10 分钟的间隔通常是重连后第一拍）
+        if (interval in 1000..600_000) {
+          lastHeartbeatIntervalMs = interval
+          Log.i(TAG, "源 ${config.name} 心跳间隔 ${interval}ms")
+        }
+      }
+      lastHeartbeatAt = now
+      // 每次收到心跳都重启定时器（按最新阈值）
+      startHeartbeatWatchdog()
+    }
+
+    /** 停止心跳超时检测定时器 */
+    private fun stopHeartbeatWatchdog() {
+      heartbeatRunnable?.let { reconnectHandler.removeCallbacks(it) }
+      heartbeatRunnable = null
     }
 
     /**
@@ -2098,6 +2229,10 @@ private data class CustomSourceConfig(
   val protocol: String,
   /** 鉴权 token（可选），WS 追加 ?token= 查询参数，HTTP 添加 Bearer 头 */
   val authToken: String?,
+  /** WS 连接建立后发送的鉴权/订阅文本（可选，仅 protocol='ws' 使用） */
+  val wsAuthMessage: String?,
+  /** 心跳包关键词（可选，仅 protocol='ws' 使用，默认 'heartbeat'；空字符串禁用检测） */
+  val heartbeatKeyword: String?,
   /** HTTP 轮询间隔（毫秒，仅 protocol='http' 使用） */
   val pollIntervalMs: Long,
   /** 字段映射配置 */

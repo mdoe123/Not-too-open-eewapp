@@ -57,6 +57,34 @@ export interface SourceConfig {
    * 安全设计：与 apiKey 一致，不持久化到 AsyncStorage（仅运行时内存持有）。
    */
   authToken?: string;
+  /**
+   * 自定义源专用：WebSocket 连接建立后发送的鉴权/订阅文本（可选，仅 protocol='ws' 使用）
+   *
+   * 某些 WS 服务器要求客户端在 onOpen 后主动发送一条消息完成订阅或鉴权
+   * （如发送 JSON 订阅指令、发送 token 字符串等）。配置后，适配器在 WS onOpen
+   * 时调用 ws.send(wsAuthMessage) 一次。
+   *
+   * - 与 authToken 互不影响：authToken 走 URL 查询参数/HTTP 头，本字段走 WS 消息体
+   * - 字段内容原样发送，不做任何转义或 JSON 包装（如需 JSON 自行填写完整字符串）
+   * - 不配置时跳过此步骤，仅依赖 URL 鉴权
+   */
+  wsAuthMessage?: string;
+  /**
+   * 自定义源专用：心跳包关键词（可选，仅 protocol='ws' 使用，默认 'heartbeat'）
+   *
+   * 部分 WS 服务器会定期推送心跳包（如 'heartbeat'、'ping'、'{"type":"pong"}'）。
+   * 适配器在 onMessage 中检测：若收到的文本**包含**此关键词，视为心跳包，
+   * 不传给事件解析器，并记录时间戳用于超时重连检测。
+   *
+   * - 默认值 'heartbeat'（留空也使用此默认值）
+   * - 大小写敏感：若服务器发送 'PING'，需配置为 'PING'
+   * - 心跳超时重连策略：
+   *   · 首次未观察到间隔：默认 60 秒
+   *   · 收到 ≥2 次心跳后：超时 = max(30s, 间隔 × 2)，上限 300 秒
+   *   · 超时未收到心跳：主动关闭 WS 并触发指数退避重连
+   * - 配置为空字符串时禁用心跳检测（不推荐，可能导致僵死连接无法恢复）
+   */
+  heartbeatKeyword?: string;
   /** 用户自定义备注（如"USGS 轮询源"），仅自定义源使用 */
   note?: string;
 }
@@ -268,8 +296,17 @@ export interface AppConfig {
  * - v17: AlertConfig 新增 notificationEnabled（消息通知开关，默认 true）。
  *        开启后 eew+eqlist 事件均发送系统通知栏消息，不受阈值影响。
  *        迁移策略：新字段可选，旧配置通过 DEFAULT_CONFIG 合并自动补齐默认值。
+ * - v18: SourceConfig 新增 wsAuthMessage（WS 连接后发送的鉴权/订阅文本）和
+ *        heartbeatKeyword（心跳包关键词，默认 'heartbeat'）。
+ *        仅 protocol='ws' 的 customSource 使用。
+ *        - wsAuthMessage：onOpen 时 ws.send() 一次，用于订阅/鉴权场景
+ *          （如发送 JSON 订阅指令、token 字符串）
+ *        - heartbeatKeyword：onMessage 检测包含关键词的文本视为心跳，
+ *          记录间隔自动计算超时阈值（max(30s, 间隔×2)，上限 300s，首次默认 60s），
+ *          超时主动关闭并触发指数退避重连
+ *        迁移策略：新字段可选，旧配置无需特殊处理（不配置即不发送/使用默认关键词）。
  */
-export const CURRENT_CONFIG_VERSION = 17;
+export const CURRENT_CONFIG_VERSION = 18;
 
 /**
  * AsyncStorage 中存储免责声明确认标记的 key
