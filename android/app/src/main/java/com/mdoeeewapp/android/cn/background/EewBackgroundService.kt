@@ -1877,6 +1877,8 @@ class EewBackgroundService : Service() {
 
     /** 心跳超时检测 Runnable */
     private var heartbeatRunnable: Runnable? = null
+    /** 心跳检测代际（每次 stop 递增，回调校验防止残余 Runnable 误触发） */
+    private var heartbeatGeneration: Int = 0
 
     /** WS 心跳超时：首次未观察到间隔时的默认超时（毫秒） */
     private val wsHeartbeatDefaultTimeoutMs = 60_000L
@@ -2010,10 +2012,17 @@ class EewBackgroundService : Service() {
           val authMsg = config.wsAuthMessage
           if (!authMsg.isNullOrEmpty()) {
             try {
-              webSocket.send(authMsg)
-              Log.i(TAG, "源 ${config.name} WS 已发送鉴权消息 (${authMsg.length} 字符)")
+              val sent = webSocket.send(authMsg)
+              if (sent) {
+                Log.i(TAG, "源 ${config.name} WS 已发送鉴权消息 (${authMsg.length} 字符)")
+              } else {
+                // send 返回 false：WS 已关闭或发送队列已满，主动关闭触发重连
+                Log.e(TAG, "源 ${config.name} WS 发送鉴权消息失败（send 返回 false），关闭重连")
+                webSocket.close(1000, "wsAuthMessage send failed")
+              }
             } catch (e: Exception) {
-              Log.e(TAG, "源 ${config.name} WS 发送鉴权消息失败: ${e.message}")
+              Log.e(TAG, "源 ${config.name} WS 发送鉴权消息异常: ${e.message}")
+              webSocket.close(1000, "wsAuthMessage send exception")
             }
           }
 
@@ -2035,6 +2044,9 @@ class EewBackgroundService : Service() {
           Log.e(TAG, "源 ${config.name} WebSocket 错误: ${t.message}")
           this@SourceConnection.webSocket = null
           stopHeartbeatWatchdog()
+          // 重置心跳状态，避免重连后沿用旧连接的间隔值
+          lastHeartbeatAt = 0L
+          lastHeartbeatIntervalMs = 0L
           if (!isManualClose) {
             emitWsStatus("error", "${config.name} WebSocket 错误: ${t.message}")
             scheduleReconnect()
@@ -2045,6 +2057,9 @@ class EewBackgroundService : Service() {
           Log.i(TAG, "源 ${config.name} WebSocket 已关闭: $code $reason")
           this@SourceConnection.webSocket = null
           stopHeartbeatWatchdog()
+          // 重置心跳状态，避免重连后沿用旧连接的间隔值
+          lastHeartbeatAt = 0L
+          lastHeartbeatIntervalMs = 0L
           if (!isManualClose) {
             emitWsStatus("disconnected", "${config.name} WebSocket 意外断开，准备重连")
             scheduleReconnect()
@@ -2068,14 +2083,19 @@ class EewBackgroundService : Service() {
       stopHeartbeatWatchdog()
 
       val timeoutMs = computeHeartbeatTimeoutMs()
-      lastHeartbeatAt = System.currentTimeMillis()
+      // 不在此处设置 lastHeartbeatAt：避免首拍 interval 被误算为"启动到首拍"的时间。
+      // lastHeartbeatAt 仅在 onHeartbeatReceived 中更新，保证 interval 是真实心跳间隔。
+      // 若 lastHeartbeatAt 仍为 0（从未收到心跳），超时回调直接关闭重连。
+      val gen = heartbeatGeneration
       Log.i(TAG, "源 ${config.name} 心跳检测启动，超时 ${timeoutMs}ms")
 
       val r = Runnable {
+        // 代际校验：若期间已被 stop/重启，跳过本次回调
+        if (gen != heartbeatGeneration) return@Runnable
         if (isManualClose) return@Runnable
         val ws = webSocket
         if (ws == null) return@Runnable
-        val elapsed = System.currentTimeMillis() - lastHeartbeatAt
+        val elapsed = if (lastHeartbeatAt > 0L) System.currentTimeMillis() - lastHeartbeatAt else timeoutMs
         Log.w(TAG, "源 ${config.name} 心跳超时 ${elapsed}ms（阈值 ${timeoutMs}ms），主动关闭重连")
         try {
           ws.close(1000, "heartbeat timeout")
@@ -2115,6 +2135,8 @@ class EewBackgroundService : Service() {
 
     /** 停止心跳超时检测定时器 */
     private fun stopHeartbeatWatchdog() {
+      // 递增代际，使任何已派发但未执行的 Runnable 失效
+      heartbeatGeneration++
       heartbeatRunnable?.let { reconnectHandler.removeCallbacks(it) }
       heartbeatRunnable = null
     }

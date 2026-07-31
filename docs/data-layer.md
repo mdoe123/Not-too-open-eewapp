@@ -16,7 +16,7 @@
 src/
 ├── types/
 │   ├── eew.ts             # 核心数据模型：EewEvent、SourceType、SourceCategory、SourceStatus、AlertLevel、UserLocation
-│   ├── config.ts          # 配置类型：SourceConfig、FieldMapping、AlertConfig、AppConfig、DEFAULT_CONFIG（CURRENT_CONFIG_VERSION=17）
+│   ├── config.ts          # 配置类型：SourceConfig、FieldMapping、AlertConfig、AppConfig、DEFAULT_CONFIG（CURRENT_CONFIG_VERSION=18）
 │   └── index.ts           # 统一导出
 └── sources/
     ├── SourceAdapter.ts        # 数据源适配器抽象接口
@@ -146,7 +146,7 @@ type AlertLevel = 'silent' | 'blue' | 'yellow' | 'orange' | 'red';
 - **sources**：空数组 `[]`（合规改造后不预置任何数据源）
 - 全局轮询兜底 30000ms
 - 心跳失败切换阈值 3 次
-- 配置版本号 `CURRENT_CONFIG_VERSION = 17`
+- 配置版本号 `CURRENT_CONFIG_VERSION = 18`
 
 ### 4.5 配置版本历史
 

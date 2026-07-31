@@ -82,6 +82,8 @@ export class CustomSourceAdapter implements SourceAdapter {
   private lastHeartbeatIntervalMs = 0;
   /** 心跳超时检测定时器 */
   private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 心跳检测代际（每次 stop 递增，回调校验防止残余定时器误触发） */
+  private heartbeatGeneration = 0;
 
   // HTTP 相关
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -292,6 +294,9 @@ export class CustomSourceAdapter implements SourceAdapter {
     this.ws.onclose = () => {
       this.ws = null;
       this.stopHeartbeatWatchdog();
+      // 重置心跳状态，避免重连后沿用旧连接的间隔值
+      this.lastHeartbeatAt = 0;
+      this.lastHeartbeatIntervalMs = 0;
       if (this.isManualClose) {
         log('CUSTOM', `${this.config.name} WS 已断开（主动）`);
         this.setStatus('disconnected');
@@ -317,13 +322,18 @@ export class CustomSourceAdapter implements SourceAdapter {
     this.stopHeartbeatWatchdog();
 
     const timeoutMs = this.computeHeartbeatTimeoutMs();
-    this.lastHeartbeatAt = Date.now();
+    // 不在此处设置 lastHeartbeatAt：避免首拍 interval 被误算为"启动到首拍"的时间。
+    // lastHeartbeatAt 仅在 onHeartbeatReceived 中更新，保证 interval 是真实心跳间隔。
+    // 若 lastHeartbeatAt 仍为 0（从未收到心跳），超时回调直接关闭重连。
+    const gen = this.heartbeatGeneration;
     log('CUSTOM', `${this.config.name} 心跳检测启动，超时 ${timeoutMs}ms`);
 
     this.heartbeatTimer = setTimeout(() => {
       this.heartbeatTimer = null;
+      // 代际校验：若期间已被 stop/重启，跳过本次回调
+      if (gen !== this.heartbeatGeneration) return;
       if (!this.ws || this.isManualClose) return;
-      const elapsed = Date.now() - this.lastHeartbeatAt;
+      const elapsed = this.lastHeartbeatAt > 0 ? Date.now() - this.lastHeartbeatAt : timeoutMs;
       log('CUSTOM', `${this.config.name} 心跳超时 ${elapsed}ms（阈值 ${timeoutMs}ms），主动关闭重连`);
       try {
         this.ws.close();
@@ -366,6 +376,8 @@ export class CustomSourceAdapter implements SourceAdapter {
 
   /** 停止心跳超时检测定时器 */
   private stopHeartbeatWatchdog(): void {
+    // 递增代际，使任何已派发但未执行的回调失效
+    this.heartbeatGeneration++;
     if (this.heartbeatTimer) {
       clearTimeout(this.heartbeatTimer);
       this.heartbeatTimer = null;

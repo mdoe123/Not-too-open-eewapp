@@ -88,8 +88,8 @@ android {
         applicationId "com.mdoeeewapp.android.cn"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 3
-        versionName "1.0.2"
+        versionCode 4
+        versionName "1.0.3"
         // 明文 HTTP 流量策略由 res/xml/network_security_config.xml 统一管理
         // 不在 manifestPlaceholders 中设置 usesCleartextTraffic
     }

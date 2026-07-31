@@ -76,7 +76,7 @@ interface FormState {
 const EMPTY_FORM: FormState = {
   name: '',
   note: '',
-  category: 'eqlist',
+  category: 'eew',
   protocol: 'http',
   endpoint: '',
   authToken: '',
@@ -107,7 +107,7 @@ function sourceToForm(src?: SourceConfig): FormState {
   return {
     name: src.name ?? '',
     note: src.note ?? '',
-    category: src.category ?? 'eqlist',
+    category: src.category ?? 'eew',
     protocol: src.protocol ?? 'http',
     endpoint: src.endpoint ?? '',
     authToken: src.authToken ?? '',
