@@ -26,6 +26,22 @@
 | 权限引导页 | 首次启动检测，引导 6 项权限授权 |
 | 模拟预警 | 内置测试页面，支持参数调节和 ADB 广播触发 |
 
+## 截图预览
+
+### 主界面
+
+<img src="docs/image/主界面地震信息.jpg" alt="地震信息" width="240" /> <img src="docs/image/主界面地震预警信息.jpg" alt="地震预警信息" width="240" /> <img src="docs/image/地震详情.jpg" alt="地震详情" width="240" />
+
+### 设置页面
+
+<img src="docs/image/设置页面.jpg" alt="设置页面" width="240" />
+
+### 悬浮窗与锁屏预警
+
+| 非锁屏悬浮窗 | 锁屏预警 |
+|:---:|:---:|
+| <img src="docs/image/非锁屏单震样例.jpg" alt="非锁屏单震" width="320" /> | <img src="docs/image/锁屏单震样例.jpg" alt="锁屏单震" width="320" /> |
+
 ## 技术栈
 
 - **React Native** 0.86.0（Hermes 引擎、新架构）
