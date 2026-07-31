@@ -30,6 +30,11 @@ interface BackgroundServiceModuleType {
    */
   markEventTriggered(eventId: string): void;
   /**
+   * JS 层收到预警事件后发送心跳确认
+   * 原生层据此判断 JS 是否存活，超时未收到心跳则接管预警触发
+   */
+  acknowledgeEewEvent(): void;
+  /**
    * 更新所有活跃 customSource 配置（JSON 数组字符串或 null）
    *
    * 传 null 或空字符串清空配置（后台服务不建立连接）。
@@ -181,6 +186,22 @@ export const BackgroundServiceManager = {
     if (Platform.OS !== 'android') return;
     try {
       BackgroundServiceModule?.markEventTriggered(eventId);
+    } catch {
+      // 忽略异常
+    }
+  },
+
+  /**
+   * JS 层收到预警事件后发送心跳确认
+   *
+   * 在 useEewStream 的 SourceManager.onEvent 回调中调用，
+   * 告诉原生层 JS 线程仍存活。原生层在 handleSourceData 中检查心跳：
+   * 超过 FOREGROUND_HEARTBEAT_TIMEOUT_MS（3秒）未收到心跳则接管预警触发。
+   */
+  acknowledgeEewEvent(): void {
+    if (Platform.OS !== 'android') return;
+    try {
+      BackgroundServiceModule?.acknowledgeEewEvent();
     } catch {
       // 忽略异常
     }

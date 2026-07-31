@@ -92,6 +92,9 @@ class EewBackgroundService : Service() {
     /** 新事件 S 波到达超过此秒数不处理（解决重启 App 误触发旧事件） */
     private const val MAX_PAST_ARRIVAL_FOR_NEW_EVENT_SEC = -60
 
+    /** 前台心跳超时（毫秒），超过此时间未收到 JS 心跳则认为 JS 线程已死 */
+    private const val FOREGROUND_HEARTBEAT_TIMEOUT_MS = 3_000L
+
     /** 并列事件与顶级事件的最大级别差（0 = 同级别才算并列，差 ≥ 1 档算大小关系） */
     private const val PEER_LEVEL_MAX_DIFF = 0
 
@@ -109,6 +112,16 @@ class EewBackgroundService : Service() {
      */
     @Volatile
     private var appInForeground: Boolean = true
+
+    /**
+     * 前台心跳时间戳（Unix 毫秒）
+     *
+     * JS 层每次调用 [notifyAppInForeground] 时更新。
+     * 用于检测 JS 线程是否存活：若超过 [FOREGROUND_HEARTBEAT_TIMEOUT_MS] 未更新，
+     * 认为 JS 已死，[appInForeground] 降级为 false，由原生层接管预警触发。
+     */
+    @Volatile
+    private var lastForegroundHeartbeatMs: Long = 0L
 
     /**
      * 当前活跃的 EewBackgroundService 实例（供 BackgroundServiceModule 调用）
@@ -190,6 +203,8 @@ class EewBackgroundService : Service() {
         // 忽略重复 startForeground 异常
       }
     }
+    // 初始化前台心跳时间戳（避免刚启动时因心跳为 0 被误判为超时）
+    lastForegroundHeartbeatMs = System.currentTimeMillis()
     // 读取 customSource 配置列表并启动所有连接
     reloadCustomSources()
     return START_STICKY
@@ -425,11 +440,19 @@ class EewBackgroundService : Service() {
     }
 
     // 如果 App 在前台，由 JS 层 useFloatingWindow 处理（避免重复触发）
+    // 但需检查心跳超时：若 JS 长时间未发心跳，可能已死，由原生层接管
     if (appInForeground) {
-      // 标记已由 JS 层处理，切到后台后同一事件不重复触发
-      triggeredEventIds.add(event.eventId)
-      if (isNewReport) Log.i(TAG, "App 在前台，由 JS 层处理悬浮窗")
-      return
+      val heartbeatStale = if (lastForegroundHeartbeatMs == 0L) false
+        else System.currentTimeMillis() - lastForegroundHeartbeatMs > FOREGROUND_HEARTBEAT_TIMEOUT_MS
+      if (!heartbeatStale) {
+        // JS 活着，委托给 JS
+        triggeredEventIds.add(event.eventId)
+        if (isNewReport) Log.i(TAG, "App 在前台，由 JS 层处理悬浮窗")
+        return
+      }
+      // 心跳超时，JS 可能已死，原生层接管
+      Log.w(TAG, "前台心跳超时（${(System.currentTimeMillis() - lastForegroundHeartbeatMs) / 1000}s），JS 可能已死，原生层接管")
+      appInForeground = false
     }
 
     // 触发去重：同一 eventId 只触发一次警报（避免重复启动声音/震动/闪光灯）
@@ -1579,9 +1602,21 @@ class EewBackgroundService : Service() {
    */
   fun notifyAppInForeground() {
     appInForeground = true
+    lastForegroundHeartbeatMs = System.currentTimeMillis()
     Log.i(TAG, "App 回到前台，停止后台悬浮窗 tick")
     // 停止后台悬浮窗 tick（由 JS 层接管倒计时刷新）
     stopBackgroundFloatingWindowTick()
+  }
+
+  /**
+   * 由 RN 层调用：JS 层收到预警事件后发送心跳确认
+   *
+   * JS 层在 SourceManager.onEvent 回调中调用此方法，更新 [lastForegroundHeartbeatMs]。
+   * 原生层 [handleSourceData] 据此判断 JS 线程是否存活：若超过
+   * [FOREGROUND_HEARTBEAT_TIMEOUT_MS] 未收到心跳，认为 JS 已死，由原生层接管预警触发。
+   */
+  fun acknowledgeEewEvent() {
+    lastForegroundHeartbeatMs = System.currentTimeMillis()
   }
 
   /**

@@ -26,6 +26,7 @@ import {useConfig} from './useConfig';
 import {log} from '../utils/logger';
 import {getSourceName} from '../utils/sourceLabels';
 import {simulatedEventBus} from '../utils/simulatedEventBus';
+import {BackgroundServiceManager} from '../native/BackgroundServiceManager';
 
 /**
  * 获取数据源的 category（带兜底）
@@ -131,6 +132,8 @@ export function useEewStream(): UseEewStreamResult {
   const cleanupTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // 标记组件是否已卸载，避免卸载后更新 state
   const isMountedRef = useRef(true);
+  // 心跳节流时间戳：距上次调用不足 500ms 时跳过，避免高频报文下过度调用 RN 桥
+  const lastHeartbeatRef = useRef(0);
 
   /** 显示切换提示（自动清除） */
   const showSwitchMessage = useCallback((msg: string) => {
@@ -266,6 +269,15 @@ export function useEewStream(): UseEewStreamResult {
           // onEvent：合并事件到对应列表
           (event: EewEvent) => {
             log('STREAM', `${isEew ? 'eew' : 'eqlist'}事件 id=${event.id} mag=${event.magnitude}`);
+            // 收到 eew 事件时向原生层发送心跳确认（JS 存活信号）
+            // 节流：500ms 内只发一次，高频报文（一秒多报）下避免过度调用 RN 桥
+            if (isEew) {
+              const now = Date.now();
+              if (now - lastHeartbeatRef.current >= 500) {
+                lastHeartbeatRef.current = now;
+                BackgroundServiceManager.acknowledgeEewEvent();
+              }
+            }
             mergeEvent(setList, event, maxItems, isEew);
           },
           // onStatus：更新主源状态（仅优先级最高的源影响全局状态显示）

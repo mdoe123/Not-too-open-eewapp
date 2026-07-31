@@ -207,6 +207,17 @@ class BackgroundServiceModule(
   }
 
   /**
+   * JS 层收到预警事件后发送心跳确认
+   *
+   * JS 层在 SourceManager.onEvent 回调中调用此方法，更新 lastForegroundHeartbeatMs。
+   * 原生层据此判断 JS 是否存活：超过 FOREGROUND_HEARTBEAT_TIMEOUT_MS 未收到心跳则接管预警。
+   */
+  @ReactMethod
+  fun acknowledgeEewEvent() {
+    EewBackgroundService.instance?.acknowledgeEewEvent()
+  }
+
+  /**
    * 更新所有活跃 customSource 配置（由 RN 层调用，多源并行模式）
    *
    * 将 SourceConfig 数组序列化为 JSON 字符串写入 SharedPreferences（KEY_CUSTOM_SOURCES），

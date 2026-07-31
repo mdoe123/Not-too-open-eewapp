@@ -154,7 +154,7 @@ HomeScreen (useEffect)
   ├─ BackgroundServiceManager.updateLocation(location)      → BackgroundServiceModule.updateLocation() → SharedPreferences
   ├─ BackgroundServiceManager.updateCustomSources(sources)  → BackgroundServiceModule.updateCustomSourcesJson() → SharedPreferences → reloadCustomSources()
   ├─ BackgroundServiceManager.updateAllowHttp(allowHttp)     → BackgroundServiceModule.updateAllowHttp() → SharedPreferences → reloadCustomSources()
-  └─ AppState 'active' → BackgroundServiceManager.notifyAppInForeground() → EewBackgroundService.appInForeground = true
+  └─ AppState 'active' → BackgroundServiceManager.notifyAppInForeground() → EewBackgroundService.appInForeground = true + 更新 lastForegroundHeartbeatMs 心跳时间戳
 ```
 
 > customSource 同步（多源并行）：从 `config.sources` 中筛选所有 `enabled && type === 'customSource' && category === 'eew'` 的源（按 priority 升序），JSON 数组字符串写入 SharedPreferences 的 `customSources` key；原生层 `reloadCustomSources()` 停止所有旧连接后为每个源按 `protocol` 启动独立的 WS 或 HTTP 连接。
@@ -833,6 +833,12 @@ LockScreenAlertActivity: onCreate: mag=7.5 intensity=9.22 level=red ...
   - 前台收到新事件时，转发给 JS 但**不触发也不标记** `lastTriggeredEventId`，切到后台后仍可触发一次
   - 后台收到新事件时，检查触发条件并触发，成功后标记 `lastTriggeredEventId`
 - **前后台检测**：`ComponentCallbacks2.onTrimMemory(TRIM_MEMORY_UI_HIDDEN)` 检测 App 进入后台
+- **前台心跳超时机制**（防止 JS 线程死亡后 `appInForeground` 永久为 true 导致后台预警失灵）：
+  - **常量**：`FOREGROUND_HEARTBEAT_TIMEOUT_MS = 60_000L`（60 秒）
+  - **心跳字段**：`lastForegroundHeartbeatMs: Long`，在 `onStartCommand()` 中初始化为当前时间，避免服务启动时误判超时
+  - **心跳更新**：`notifyAppInForeground()` 被 JS 层调用时，设置 `appInForeground = true` 并更新 `lastForegroundHeartbeatMs = System.currentTimeMillis()`
+  - **心跳检查**：`handleSourceData()` 收到数据后、转发给 JS 层之前，检查心跳是否过期：若 `now - lastForegroundHeartbeatMs > FOREGROUND_HEARTBEAT_TIMEOUT_MS`，则认为 JS 线程已死亡，强制将 `appInForeground` 设为 `false`，后续预警由原生层接管触发
+  - **效果**：即使 JS 线程崩溃或 RN 桥断开导致心跳停止，60 秒后服务自动切回后台模式，悬浮窗/锁屏预警由原生层可靠触发，不依赖 JS 层
 - **事件转发**：通过 `DeviceEventEmitter` 发送 `onEewEvent` 和 `onWsStatus` 事件给 JS 层
 
 #### LockScreenAlertActivity（锁屏预警 Activity）
@@ -916,7 +922,7 @@ RN 层通过 `BackgroundServiceManager` 将配置同步到原生层：
 | `updateLocation(location)` | `BackgroundServiceModule.updateLocation()` | 写入 SharedPreferences（userLat, userLng） |
 | `updateCustomSources(sources)` | `BackgroundServiceModule.updateCustomSourcesJson()` | 写入/删除 SharedPreferences `customSources`（JSON 数组），触发 `reloadCustomSources()` 热更新所有连接 |
 | `updateAllowHttp(allowHttp)` | `BackgroundServiceModule.updateAllowHttp()` | 写入 SharedPreferences `allowHttp`，触发 `reloadCustomSources()` 热更新所有连接（重新检查 HTTP 协议） |
-| `notifyAppInForeground()` | `BackgroundServiceModule.notifyAppInForeground()` | 设置 `appInForeground=true`，避免后台重复触发 |
+| `notifyAppInForeground()` | `BackgroundServiceModule.notifyAppInForeground()` | 设置 `appInForeground=true` 并更新 `lastForegroundHeartbeatMs` 心跳时间戳，避免后台重复触发 |
 
 **设计要点**：配置直接写入 SharedPreferences，不依赖 Service 实例是否存活。即使 Service 未启动，配置也已持久化，下次 Service 启动时自动读取。
 
