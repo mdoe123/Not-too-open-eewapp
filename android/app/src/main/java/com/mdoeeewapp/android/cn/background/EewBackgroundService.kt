@@ -107,6 +107,9 @@ class EewBackgroundService : Service() {
     /** 最大同时显示的悬浮窗数量 */
     private const val MAX_DISPLAY_EVENTS = 3
 
+    /** 去重 key 集合容量上限（覆盖多源并行 + eqlist 列表场景） */
+    private const val MAX_DEDUP_KEYS = 200
+
     /** 启动幂等标志，防止重复触发 startForeground */
     private val started = AtomicBoolean(false)
 
@@ -156,8 +159,25 @@ class EewBackgroundService : Service() {
    */
   private val sourceConnections: MutableMap<String, SourceConnection> = mutableMapOf()
 
-  /** 上次去重的 eventId:reportId（避免重复触发同一报告） */
-  private var lastDedupKey: String? = null
+  /**
+   * 最近处理过的去重 key 集合（eventId:reportId 或 eventId:cancel）。
+   *
+   * 多源并行模式下，单值 lastDedupKey 会被不同源互相覆盖导致循环发通知：
+   * 源A处理→key=A，源B处理→key=B（B≠A 发通知），源A再次轮询→key=A（A≠B 又发通知）...
+   *
+   * 改为带容量上限的 LinkedHashSet，记住最近处理过的所有 key，避免多源间互相覆盖。
+   * 容量上限 MAX_DEDUP_KEYS，超出时移除最旧条目（FIFO）。
+   */
+  private val recentDedupKeys: LinkedHashSet<String> = object : LinkedHashSet<String>() {
+    override fun add(element: String): Boolean {
+      val added = super.add(element)
+      while (size > MAX_DEDUP_KEYS) {
+        val it = iterator()
+        if (it.hasNext()) { it.next(); it.remove() } else break
+      }
+      return added
+    }
+  }
 
   /**
    * 已触发过悬浮窗的事件 ID（仅 eventId，不包含 originTime）。
@@ -412,11 +432,12 @@ class EewBackgroundService : Service() {
     Log.i(TAG, "收到事件 eventId=${event.eventId} mag=${event.magnitude} cancel=${event.isCancel} appInForeground=$appInForeground originTime=${event.originTime} source=${config.name}")
 
     // 转发去重（取消报独立去重）：同一报告不重复转发给 JS 层
+    // 使用 LinkedHashSet 记住最近处理过的所有 key，避免多源并行时单值被互相覆盖导致循环发通知
     val dedupKey = if (event.isCancel) "${event.eventId}:cancel" else "${event.eventId}:${event.originTime}"
-    val isNewReport = dedupKey != lastDedupKey
-    Log.i(TAG, "去重检查: dedupKey=$dedupKey isNewReport=$isNewReport lastDedupKey=$lastDedupKey category=${config.category}")
+    val isNewReport = !recentDedupKeys.contains(dedupKey)
+    Log.i(TAG, "去重检查: dedupKey=$dedupKey isNewReport=$isNewReport recentSize=${recentDedupKeys.size} category=${config.category}")
     if (isNewReport) {
-      lastDedupKey = dedupKey
+      recentDedupKeys.add(dedupKey)
       // 转发给 JS 层（仅新报告转发）
       emitEewEvent(event, config)
       // 发送系统消息通知（不受阈值影响，eew+eqlist 均发送）
