@@ -51,6 +51,17 @@ export default function EqInfoCard({event, userLat, userLng, colors}: EqInfoCard
 
   const levelColor = getLevelColor(colors, cached.alertLevel);
 
+  // 测定类型标签文本：reportType='auto' → 自动测定，'reviewed' → 正式测定，其他值原样显示
+  // 注意：映射规则与原生层 EewBackgroundService.sendEventNotification 保持一致，
+  //       修改时需同步更新两处（JS/Kotlin 跨层无法共享常量）。
+  const reportTypeLabel = (() => {
+    if (!event.reportType) return null;
+    const t = event.reportType.toLowerCase();
+    if (t === 'auto') return '自动测定';
+    if (t === 'reviewed') return '正式测定';
+    return event.reportType;
+  })();
+
   return (
     <View style={[styles.card, {backgroundColor: colors.surface, borderColor: colors.border}]}>
       {/* 左侧级别竖条（颜色按震中预估烈度分档） */}
@@ -68,6 +79,13 @@ export default function EqInfoCard({event, userLat, userLng, colors}: EqInfoCard
                 {event.sourceName || getSourceAgency(event.source)}
               </Text>
             </View>
+            {reportTypeLabel && (
+              <View style={[styles.reportTypeBadge, {backgroundColor: colors.border}]}>
+                <Text style={[styles.agencyText, {color: colors.textSecondary}]}>
+                  {reportTypeLabel}
+                </Text>
+              </View>
+            )}
           </View>
           <View style={styles.intensityBadge}>
             <Text style={[styles.intensityLabel, {color: colors.textSecondary}]}>
@@ -148,6 +166,11 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   agencyBadge: {
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  reportTypeBadge: {
     paddingHorizontal: 6,
     paddingVertical: 2,
     borderRadius: 4,

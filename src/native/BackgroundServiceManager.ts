@@ -210,12 +210,13 @@ export const BackgroundServiceManager = {
   /**
    * 同步所有活跃 customSource 配置到原生层（多源并行模式）
    *
-   * 当 config.sources 变化时调用，将所有活跃 eew customSource 序列化为 JSON 数组
+   * 当 config.sources 变化时调用，将所有活跃 customSource 序列化为 JSON 数组
    * 写入 SharedPreferences，供后台服务锁屏时按用户配置并行接收多源预警数据。
    *
    * 数据源选择策略：
-   * - 调用方从 config.sources 中筛选 enabled && type==='customSource' && category==='eew'
-   *   的所有源，按 priority 升序传入
+   * - 调用方从 config.sources 中筛选 enabled && type==='customSource' 的所有源
+   *   （含 eew 预警源和 eqlist 速报源，由原生层按 category 分别处理通知/弹窗逻辑），
+   *   按 priority 升序传入
    * - 若无符合条件的源，传空数组清空原生层配置（后台服务不建立连接）
    *
    * 调用后原生层会自动重连：停止所有旧 WS/HTTP → 读取新配置数组 → 为每个源按 protocol 启动连接

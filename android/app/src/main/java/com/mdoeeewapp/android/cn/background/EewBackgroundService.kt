@@ -65,7 +65,13 @@ class EewBackgroundService : Service() {
     private const val FULL_SCREEN_INTENT_CHANNEL_ID = "eew_full_screen_alert"
 
     /** fullScreenIntent 通知 ID（与保活通知区分，避免互相覆盖） */
-    private const val FULL_SCREEN_INTENT_NOTIF_ID = 2
+  private const val FULL_SCREEN_INTENT_NOTIF_ID = 2
+
+  /** 消息通知渠道 ID（系统通知栏，eew+eqlist 事件消息提示） */
+  private const val MSG_CHANNEL_ID = "eew_message"
+  private const val MSG_CHANNEL_NAME = "地震消息通知"
+  /** 消息通知 ID（所有消息通知共用一个 ID，新通知覆盖旧通知） */
+  private const val MSG_NOTIF_ID = 3
 
     /** SharedPreferences 文件名 */
     private const val PREFS_NAME = "eew_alert_config"
@@ -350,6 +356,7 @@ class EewBackgroundService : Service() {
       isFinal = fmObj.optString("isFinal", "").ifEmpty { null },
       isCancel = fmObj.optString("isCancel", "").ifEmpty { null },
       reportNum = fmObj.optString("reportNum", "").ifEmpty { null },
+      reportType = fmObj.optString("reportType", "").ifEmpty { null },
     )
     // 必填字段校验
     if (mapping.eventId.isEmpty() || mapping.originTime.isEmpty() ||
@@ -367,6 +374,7 @@ class EewBackgroundService : Service() {
       pollIntervalMs = obj.optLong("pollIntervalMs", 30_000L),
       fieldMapping = mapping,
       priority = obj.optInt("priority", 0),
+      category = obj.optString("category", "eew"),
     )
   }
 
@@ -406,11 +414,15 @@ class EewBackgroundService : Service() {
     // 转发去重（取消报独立去重）：同一报告不重复转发给 JS 层
     val dedupKey = if (event.isCancel) "${event.eventId}:cancel" else "${event.eventId}:${event.originTime}"
     val isNewReport = dedupKey != lastDedupKey
-    Log.i(TAG, "去重检查: dedupKey=$dedupKey isNewReport=$isNewReport lastDedupKey=$lastDedupKey")
+    Log.i(TAG, "去重检查: dedupKey=$dedupKey isNewReport=$isNewReport lastDedupKey=$lastDedupKey category=${config.category}")
     if (isNewReport) {
       lastDedupKey = dedupKey
       // 转发给 JS 层（仅新报告转发）
       emitEewEvent(event, config)
+      // 发送系统消息通知（不受阈值影响，eew+eqlist 均发送）
+      if (!event.isCancel) {
+        sendEventNotification(event, config.name, config.category)
+      }
     }
 
     // 取消报：不触发悬浮窗（JS 层处理显示"地震预警取消"）
@@ -419,6 +431,12 @@ class EewBackgroundService : Service() {
       userDismissedEventIds.remove(event.eventId)
       triggeredEventIds.remove(event.eventId)
       if (isNewReport) Log.i(TAG, "取消报，不触发悬浮窗")
+      return
+    }
+
+    // eqlist 速报事件：只发通知，不触发悬浮窗/锁屏预警
+    if (config.category == "eqlist") {
+      if (isNewReport) Log.i(TAG, "eqlist 速报事件，仅通知不弹窗")
       return
     }
 
@@ -578,8 +596,19 @@ class EewBackgroundService : Service() {
 
     val lockScreenEnabled = prefs.getBoolean("lockScreenEnabled", true)
     val floatingWindowEnabled = prefs.getBoolean("floatingWindowEnabled", true)
-    if (!lockScreenEnabled || !floatingWindowEnabled) {
-      Log.i(TAG, "跳过触发: lockScreenEnabled=$lockScreenEnabled floatingWindowEnabled=$floatingWindowEnabled")
+    // 按屏幕状态分别检查：锁屏时需要 lockScreenEnabled，未锁屏时需要 floatingWindowEnabled
+    // 两者都关闭才跳过（避免用户关闭锁屏但保留悬浮窗时后台也不弹窗的 bug）
+    val screenLocked = isScreenLocked()
+    if (screenLocked && !lockScreenEnabled) {
+      Log.i(TAG, "跳过触发: 锁屏状态下 lockScreenEnabled=false")
+      return false
+    }
+    if (!screenLocked && !floatingWindowEnabled) {
+      Log.i(TAG, "跳过触发: 未锁屏状态下 floatingWindowEnabled=false")
+      return false
+    }
+    if (!lockScreenEnabled && !floatingWindowEnabled) {
+      Log.i(TAG, "跳过触发: lockScreenEnabled 和 floatingWindowEnabled 均为 false")
       return false
     }
 
@@ -618,7 +647,7 @@ class EewBackgroundService : Service() {
     // 根据屏幕状态选择 UI：
     // - 锁屏 → LockScreenAlertActivity（setShowWhenLocked，可点亮屏幕）
     // - 不锁屏（后台）→ 悬浮窗 FloatingWindowModule（TYPE_APPLICATION_OVERLAY）
-    if (isScreenLocked()) {
+    if (screenLocked) {
       Log.i(TAG, "屏幕已锁屏，启动 LockScreenAlertActivity")
       startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs, sourceName)
     } else {
@@ -1080,6 +1109,7 @@ class EewBackgroundService : Service() {
     if (event.reportNum != null && event.reportNum > 0) {
       content.putInt("reportNum", event.reportNum)
     }
+    event.reportType?.let { content.putString("reportType", it) }
     if (!sourceName.isNullOrEmpty()) {
       content.putString("sourceName", sourceName)
     }
@@ -1403,6 +1433,7 @@ class EewBackgroundService : Service() {
       map.putBoolean("isCancel", event.isCancel)
       map.putBoolean("isFinal", event.isFinal)
       event.reportNum?.let { map.putInt("reportNum", it) }
+      event.reportType?.let { map.putString("reportType", it) }
       val sName = config?.name
       if (!sName.isNullOrEmpty()) {
         map.putString("sourceName", sName)
@@ -1475,6 +1506,9 @@ class EewBackgroundService : Service() {
     }
     if (alertMap.hasKey("alertVolume")) {
       prefs.putInt("alertVolume", alertMap.getInt("alertVolume"))
+    }
+    if (alertMap.hasKey("notificationEnabled")) {
+      prefs.putBoolean("notificationEnabled", alertMap.getBoolean("notificationEnabled"))
     }
     prefs.apply()
     Log.i(TAG, "alert 配置已更新")
@@ -1665,6 +1699,19 @@ class EewBackgroundService : Service() {
     }
     val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
     manager.createNotificationChannel(channel)
+
+    // 消息通知渠道（系统通知栏，有声音和弹出）
+    val msgChannel = NotificationChannel(
+      MSG_CHANNEL_ID,
+      MSG_CHANNEL_NAME,
+      NotificationManager.IMPORTANCE_DEFAULT,
+    ).apply {
+      description = "地震事件消息通知（eew预警+eqlist速报）"
+      setShowBadge(true)
+      enableLights(true)
+      enableVibration(false) // 不额外振动，避免与预警振动重复
+    }
+    manager.createNotificationChannel(msgChannel)
   }
 
   /**
@@ -1679,6 +1726,79 @@ class EewBackgroundService : Service() {
       .setOngoing(true)
       .setSilent(true)
       .build()
+  }
+
+  /**
+   * 发送地震事件消息通知（系统通知栏）
+   *
+   * 不受阈值影响，eew 和 eqlist 事件均发送。
+   * 通知点击后打开 App 主页面。
+   *
+   * @param event 解析后的事件
+   * @param sourceName 数据源名称
+   * @param category 事件分类：'eew' 或 'eqlist'
+   */
+  private fun sendEventNotification(event: ParsedCencEvent, sourceName: String?, category: String) {
+    val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    if (!prefs.getBoolean("notificationEnabled", true)) {
+      return
+    }
+
+    val title = if (category == "eqlist") "地震速报" else "地震预警"
+    // 测定类型标签：与 JS 层 EqInfoCard.reportTypeLabel 保持一致，
+    // 修改时需同步更新两处（JS/Kotlin 跨层无法共享常量）。
+    val reportTypeLabel = event.reportType?.let { rt ->
+      when (rt.lowercase()) {
+        "auto" -> "自动测定"
+        "reviewed" -> "正式测定"
+        else -> rt
+      }
+    } ?: ""
+    val reportNumLabel = if (event.reportNum != null && event.reportNum > 0) "第${event.reportNum}报" else ""
+
+    // 构建副标题片段
+    val subtitleParts = mutableListOf<String>()
+    if (reportNumLabel.isNotEmpty()) subtitleParts.add(reportNumLabel)
+    if (reportTypeLabel.isNotEmpty()) subtitleParts.add(reportTypeLabel)
+    if (!sourceName.isNullOrEmpty()) subtitleParts.add(sourceName)
+    val subtitle = subtitleParts.joinToString(" · ")
+
+    val contentText = "M${event.magnitude} ${event.location}"
+    val style = NotificationCompat.InboxStyle()
+      .addLine(contentText)
+    if (subtitle.isNotEmpty()) {
+      style.addLine(subtitle)
+    }
+    // 计算震中距用于显示
+    val userLat = prefs.getFloat("userLat", 39.9f).toDouble()
+    val userLng = prefs.getFloat("userLng", 116.4f).toDouble()
+    val distance = EewAlertEngine.haversineDistance(event.lat, event.lng, userLat, userLng)
+    style.addLine("距您 ${Math.round(distance)}km · 深度 ${event.depth}km")
+
+    // 点击打开 App
+    val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+    val pendingIntent = if (launchIntent != null) {
+      PendingIntent.getActivity(
+        this, 0, launchIntent,
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+      )
+    } else null
+
+    val notification = NotificationCompat.Builder(this, MSG_CHANNEL_ID)
+      .setSmallIcon(com.mdoeeewapp.android.cn.R.mipmap.ic_launcher)
+      .setContentTitle(title)
+      .setContentText(contentText)
+      .setStyle(style)
+      .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+      .setAutoCancel(true)
+      .apply {
+        if (pendingIntent != null) setContentIntent(pendingIntent)
+      }
+      .build()
+
+    val notifManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+    notifManager.notify(MSG_NOTIF_ID, notification)
+    Log.i(TAG, "发送消息通知: $title M${event.magnitude} ${event.location} category=$category")
   }
 
   // ======================== 单源连接封装 ========================
@@ -1963,6 +2083,8 @@ private data class CustomSourceConfig(
   val fieldMapping: FieldMapping,
   /** 源优先级（用于事件 id 前缀，与 JS 层 customSource-${host}-${priority} 对齐） */
   val priority: Int = 0,
+  /** 数据源分类：'eew'（预警）或 'eqlist'（速报），影响通知和悬浮窗触发逻辑 */
+  val category: String = "eew",
 )
 
 /**

@@ -30,7 +30,7 @@ src/
 │   │   ├── ToggleRow.tsx           # 开关设置行
 │   │   └── CollapsibleSection.tsx  # 可折叠分组（眼睛图标）
 │   └── icons/
-│       └── SettingsIcons.tsx       # 设置页专用 SVG 图标（13 个）
+│       └── SettingsIcons.tsx       # 设置页专用 SVG 图标（14 个）
 ├── hooks/
 │   └── useConfig.ts                # 配置读写 Hook（AsyncStorage 持久化）
 └── theme/
@@ -113,6 +113,7 @@ src/
 
 - **铃声**（`soundEnabled`）
 - **振动**（`vibrationEnabled`）
+- **消息通知**（`notificationEnabled`，默认开启）：事件到达时发送系统通知栏消息，不受阈值影响
 - **免打扰时段**：开关 + 两个 `TextInput` 输入起止时间
   - 格式校验：正则 `/^([01]\d|2[0-3]):([0-5]\d)$/`
   - 失焦时校验，无效则回退到上次有效值并提示
@@ -158,7 +159,7 @@ src/
 
 ## 7. SVG 图标（SettingsIcons.tsx）
 
-`src/components/icons/SettingsIcons.tsx` 导出 14 个线条图标，统一规格 24×24、`stroke=currentColor`、`fill=none`、`strokeWidth=1.5`、圆角线帽：
+`src/components/icons/SettingsIcons.tsx` 导出 15 个线条图标，统一规格 24×24、`stroke=currentColor`、`fill=none`、`strokeWidth=1.5`、圆角线帽：
 
 | 图标 | 用途 |
 |------|------|
@@ -168,6 +169,7 @@ src/
 | `ChevronDownIcon` | 优先级下调 |
 | `BellIcon` | 铃声 |
 | `VibrateIcon` | 振动 |
+| `NotificationIcon` | 消息通知 |
 | `MoonIcon` | 免打扰 |
 | `ServerIcon` | 数据源 |
 | `BackgroundIcon` | 后台运行 |

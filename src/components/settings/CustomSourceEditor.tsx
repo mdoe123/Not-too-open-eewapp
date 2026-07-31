@@ -67,6 +67,7 @@ interface FormState {
   isFinal: string;
   isCancel: string;
   reportNum: string;
+  reportType: string;
 }
 
 /** 默认表单值 */
@@ -90,6 +91,7 @@ const EMPTY_FORM: FormState = {
   isFinal: '',
   isCancel: '',
   reportNum: '',
+  reportType: '',
 };
 
 /** 从 SourceConfig 初始化表单 */
@@ -118,6 +120,7 @@ function sourceToForm(src?: SourceConfig): FormState {
     isFinal: fm.isFinal ?? '',
     isCancel: fm.isCancel ?? '',
     reportNum: fm.reportNum ?? '',
+    reportType: fm.reportType ?? '',
   };
 }
 
@@ -161,6 +164,7 @@ function formToSource(form: FormState, priority: number): SourceConfig {
     isFinal: form.isFinal.trim() || undefined,
     isCancel: form.isCancel.trim() || undefined,
     reportNum: form.reportNum.trim() || undefined,
+    reportType: form.reportType.trim() || undefined,
   };
   return {
     type: 'customSource',
@@ -511,6 +515,16 @@ export const CustomSourceEditor = memo(function CustomSourceEditor({
                 value={form.reportNum}
                 onChangeText={v => update('reportNum', v)}
                 placeholder="$.reportNum?"
+                colors={colors}
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+
+              <FieldRow
+                label="测定类型（可选）"
+                value={form.reportType}
+                onChangeText={v => update('reportType', v)}
+                placeholder="$.type?"
                 colors={colors}
                 autoCapitalize="none"
                 autoCorrect={false}

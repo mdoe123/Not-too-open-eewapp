@@ -122,6 +122,30 @@ export function BellIcon({size = 24, color = '#000'}: IconProps) {
   );
 }
 
+/** 消息通知 - 报警方式 */
+export function NotificationIcon({size = 24, color = '#000'}: IconProps) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <Rect
+        x="4"
+        y="6"
+        width="16"
+        height="12"
+        rx="2"
+        stroke={color}
+        strokeWidth={STROKE_W}
+        strokeLinejoin={STROKE_JOIN}
+      />
+      <Path
+        d="M8 10H16M8 13H13"
+        stroke={color}
+        strokeWidth={STROKE_W}
+        strokeLinecap={STROKE_CAP}
+      />
+    </Svg>
+  );
+}
+
 /** 振动 - 报警方式 */
 export function VibrateIcon({size = 24, color = '#000'}: IconProps) {
   return (

@@ -55,7 +55,11 @@ __tests__/
 | `location` | `string` | 震中位置描述 |
 | `intensity?` | `number` | 预估烈度（可选） |
 | `isFinal?` | `boolean` | 是否最终确定结果（vs 初报） |
+| `isCancel?` | `boolean` | 是否取消报（JMA 数据源支持） |
 | `receivedAt` | `number` | App 接收时间（Unix 毫秒） |
+| `reportNum?` | `number` | 报数（第几报，如 CENC 的 ReportNum） |
+| `reportType?` | `string` | 测定类型（如 `auto`=自动测定、`reviewed`=正式测定）。JS 层 EqInfoCard 据此显示标签；原生层悬浮窗内容和系统消息通知副标题也使用此字段 |
+| `sourceName?` | `string` | 数据源显示名称 |
 
 ### 3.2 SourceType
 

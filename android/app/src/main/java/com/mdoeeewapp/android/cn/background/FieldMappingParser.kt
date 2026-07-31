@@ -411,4 +411,6 @@ data class FieldMapping(
   val isCancel: String? = null,
   /** 报数/第几报（可选，如 CENC 的 ReportNum 字段） */
   val reportNum: String? = null,
+  /** 测定类型（可选，如 CENC 的 type 字段，值为 'auto'/'reviewed'） */
+  val reportType: String? = null,
 )

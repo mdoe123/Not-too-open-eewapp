@@ -410,6 +410,7 @@ export class CustomSourceAdapter implements SourceAdapter {
     const isFinal = mapping.isFinal ? extractBoolean(raw, mapping.isFinal) : false;
     const isCancel = mapping.isCancel ? extractBoolean(raw, mapping.isCancel) : false;
     const reportNum = mapping.reportNum ? extractNumber(raw, mapping.reportNum) : null;
+    const reportType = mapping.reportType ? extractString(raw, mapping.reportType) : null;
 
     return {
       id: `${this.idPrefix}-${id}`,
@@ -425,6 +426,7 @@ export class CustomSourceAdapter implements SourceAdapter {
       isCancel,
       receivedAt: Date.now(),
       reportNum: reportNum ?? undefined,
+      reportType: reportType ?? undefined,
       sourceName: this.config.name,
     };
   }

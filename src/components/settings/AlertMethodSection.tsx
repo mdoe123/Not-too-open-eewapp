@@ -7,7 +7,7 @@ import {AppColors} from '../../theme/colors';
 import {SettingRow} from './SettingRow';
 import {ToggleRow} from './ToggleRow';
 import {SliderRow} from './SliderRow';
-import {BellIcon, VibrateIcon, FlashlightIcon, MoonIcon, VolumeIcon} from '../icons/SettingsIcons';
+import {BellIcon, VibrateIcon, FlashlightIcon, MoonIcon, VolumeIcon, NotificationIcon} from '../icons/SettingsIcons';
 
 export interface AlertMethodSectionProps {
   /** 当前报警配置 */
@@ -40,6 +40,14 @@ export function AlertMethodSection({
 
   return (
     <View style={styles.wrap}>
+      <ToggleRow
+        label="消息通知"
+        description="事件到达时发送系统通知栏消息（不受阈值影响）"
+        icon={<NotificationIcon size={20} color={colors.text} />}
+        value={alert.notificationEnabled}
+        onValueChange={v => updateAlert({notificationEnabled: v})}
+        colors={colors}
+      />
       <ToggleRow
         label="铃声"
         description="地震预警时播放铃声"

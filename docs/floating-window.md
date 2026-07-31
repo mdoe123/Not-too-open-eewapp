@@ -157,7 +157,7 @@ HomeScreen (useEffect)
   └─ AppState 'active' → BackgroundServiceManager.notifyAppInForeground() → EewBackgroundService.appInForeground = true + 更新 lastForegroundHeartbeatMs 心跳时间戳
 ```
 
-> customSource 同步（多源并行）：从 `config.sources` 中筛选所有 `enabled && type === 'customSource' && category === 'eew'` 的源（按 priority 升序），JSON 数组字符串写入 SharedPreferences 的 `customSources` key；原生层 `reloadCustomSources()` 停止所有旧连接后为每个源按 `protocol` 启动独立的 WS 或 HTTP 连接。
+> customSource 同步（多源并行）：从 `config.sources` 中筛选所有 `enabled && type === 'customSource'` 的源（含 `eew` 和 `eqlist` 两类，不再仅限 `eew` 源，按 priority 升序），JSON 数组字符串写入 SharedPreferences 的 `customSources` key；原生层 `reloadCustomSources()` 停止所有旧连接后为每个源按 `protocol` 启动独立的 WS 或 HTTP 连接。
 
 > allowHttp 同步：`config.allowHttp` 变化时通过 `BackgroundServiceManager.updateAllowHttp()` 同步到原生层 SharedPreferences，并触发 `reloadCustomSources()` 重连所有源（开关关闭时非 localhost 的 HTTP 源会被拒绝连接）。
 
@@ -170,6 +170,8 @@ HomeScreen (useEffect)
 6. S 波尚未到达（`remainSec > 0`）
 7. App 不在前台（`appInForeground == false`，避免与 JS 层重复触发）
 8. 非取消报（`isCancel == false`）
+
+> **前台悬浮窗阈值过滤**：前台触发路径（JS 层 `useFloatingWindow`）现在也按 `alert.minMagnitude` + `alert.lockScreenIntensity` 过滤事件，低于阈值的事件不弹悬浮窗（与后台/锁屏触发路径的阈值检查一致），避免低烈度事件打扰用户。
 
 ## useFloatingWindow Hook 状态机
 
@@ -369,6 +371,37 @@ stopAlertSound()
 
 - **开关**：启用/禁用自动调节音量功能（`autoVolumeEnabled`）
 - **音量滑块**：调节目标音量百分比，范围 0–100%（`alertVolume`）
+
+## 消息通知
+
+### 设计动机
+
+除了悬浮窗、声音、震动、闪光灯等强提醒外，App 新增了系统通知栏消息作为轻量级提醒渠道。无论事件是否达到悬浮窗触发阈值，只要用户开启消息通知，事件到达时即发送系统通知栏消息，确保用户不会错过任何地震事件。
+
+### 触发规则
+
+- **eew 事件**（预警数据源）：事件到达时发送系统通知栏消息
+- **eqlist 事件**（速报数据源）：事件到达时发送系统通知栏消息
+- **不受阈值影响**：消息通知不检查 `minMagnitude` / `lockScreenIntensity`，所有事件均发送通知
+- **开关控制**：由 `alert.notificationEnabled` 控制（默认开启），关闭后不发送任何通知
+
+### eqlist 事件处理
+
+eqlist（速报数据源）事件在原生层**只发通知，不弹悬浮窗**：
+
+- eqlist 事件不满足预警实时性要求（速报数据源为地震信息列表，非实时预警），因此不触发悬浮窗/锁屏预警
+- eqlist 事件仅通过系统通知栏消息告知用户，避免速报事件干扰预警悬浮窗显示
+- eew 事件（预警数据源）则按原有逻辑触发悬浮窗/锁屏预警，同时发送通知
+
+### 与其他警报的关系
+
+| 警报类型 | 触发条件 | 受阈值影响 | 开关字段 |
+|----------|----------|------------|----------|
+| 消息通知 | 事件到达 | 否 | `notificationEnabled` |
+| 悬浮窗 | 达到阈值 + 权限 | 是（minMagnitude + lockScreenIntensity） | `floatingWindowEnabled` |
+| 声音警报 | 悬浮窗显示 | 是 | `soundEnabled` |
+| 震动警报 | 悬浮窗显示 | 是 | `vibrationEnabled` |
+| 闪光灯警报 | 悬浮窗显示 + 烈度 ≥ 5 | 是 | `flashlightEnabled` |
 
 ## 关闭按钮联动停止
 
@@ -804,6 +837,14 @@ EewBackgroundService: 直接 startActivity 启动 LockScreenAlertActivity 成功
 EewBackgroundService: fullScreenIntent 通知已发送（增强）
 LockScreenAlertActivity: onCreate: mag=7.5 intensity=9.22 level=red ...
 ```
+
+### 修复：前台悬浮窗未按阈值过滤（阈值 bug）
+
+**根因**：
+前台触发路径（JS 层 `useFloatingWindow`）原先仅按 `alertLevel >= blue`（预估烈度 ≥ 1）判断是否弹悬浮窗，未检查用户配置的 `minMagnitude` 和 `lockScreenIntensity` 阈值。导致用户调高阈值后，低烈度事件仍会在前台弹出悬浮窗，与后台/锁屏触发路径的阈值检查不一致。
+
+**修复**：
+前台触发路径现在也按 `alert.minMagnitude` + `alert.lockScreenIntensity` 过滤事件，低于阈值的事件不弹悬浮窗，与后台/锁屏触发路径（`EewBackgroundService.tryTriggerFloatingWindow()`）的阈值检查保持一致。
 
 ## 锁屏预警实现（EewBackgroundService + LockScreenAlertActivity）
 

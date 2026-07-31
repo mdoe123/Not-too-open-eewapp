@@ -72,10 +72,22 @@ export default function HomeScreen({navigation}: HomeScreenProps) {
   });
 
   // 多事件并发支持：活跃事件列表 + 每个事件对应的预警级别
-  // - activeEvents：当前所有 eew 事件（按 originTime 降序），传给 useFloatingWindow 用于排序分组显示
+  // - activeEvents：eew 事件经阈值过滤后（minMagnitude + lockScreenIntensity），传给 useFloatingWindow
   // - alertLevels：每个事件 id 对应的预警级别，由震中距→烈度→级别映射得到
   //   （DB/T 113.1-2026 标准：silent/blue/yellow/orange/red）
-  const activeEvents = eewStream.events;
+  // 阈值过滤：低于 minMagnitude 或本地烈度低于 lockScreenIntensity 的事件不弹悬浮窗
+  const activeEvents = useMemo(() => {
+    return eewStream.events.filter(evt => {
+      if (evt.magnitude < alertConfig.minMagnitude) return false;
+      if (!userLocation) return true;
+      const dist = haversineDistance(evt.lat, evt.lng, userLocation.lat, userLocation.lng);
+      const intensity = calcCsis(evt.magnitude, evt.depth || 0, dist);
+      if (intensity < alertConfig.lockScreenIntensity) return false;
+      const level = computeAlertLevelByIntensity(intensity);
+      if (level === 'silent') return false;
+      return true;
+    });
+  }, [eewStream.events, alertConfig.minMagnitude, alertConfig.lockScreenIntensity, userLocation]);
   const alertLevels = useMemo(() => {
     const map: Record<string, AlertLevel> = {};
     if (!userLocation) return map;
@@ -136,20 +148,15 @@ export default function HomeScreen({navigation}: HomeScreenProps) {
     );
   }, [userLocation, locationConfig, isMock]);
 
-  // 同步所有活跃 customSource 到原生层（供 EewBackgroundService 锁屏预警接收数据）
-  // 多源并行模式：从 config.sources 中筛选所有 enabled && customSource && category=eew 的源，
+  // 同步所有活跃 customSource 到原生层（供 EewBackgroundService 接收 eew+eqlist 数据）
+  // 多源并行模式：从 config.sources 中筛选所有 enabled && customSource 源（含 eew 和 eqlist），
   // 按 priority 升序传入；原生层为每个源建立独立的 WS/HTTP 连接
   useEffect(() => {
     if (!config) return;
-    const eewCustomSources = config.sources
-      .filter(
-        s =>
-          s.enabled &&
-          s.type === 'customSource' &&
-          (s.category ?? 'eew') === 'eew',
-      )
+    const allCustomSources = config.sources
+      .filter(s => s.enabled && s.type === 'customSource')
       .sort((a, b) => a.priority - b.priority);
-    BackgroundServiceManager.updateCustomSources(eewCustomSources);
+    BackgroundServiceManager.updateCustomSources(allCustomSources);
   }, [config?.sources]);
 
   // 同步 allowHttp 开关到原生层（供 EewBackgroundService.SourceConnection 连接前检查）

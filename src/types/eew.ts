@@ -41,6 +41,12 @@ export interface EewEvent {
   receivedAt: number;
   /** 报数（第几报，若数据源提供。如 CENC 的 ReportNum 字段） */
   reportNum?: number;
+  /**
+   * 测定类型（若数据源提供）。
+   * 常见值：'auto'（自动测定）、'reviewed'（正式测定）。
+   * EqInfoCard 据此显示"自动测定"或"正式测定"标签。
+   */
+  reportType?: string;
   /** 数据源显示名称（从 SourceConfig.name 填充，如"中国地震台网"） */
   sourceName?: string;
 }

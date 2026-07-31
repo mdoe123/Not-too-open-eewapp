@@ -116,6 +116,24 @@ export interface FieldMapping {
   isCancel?: string;
   /** 报数/第几报（可选，如 CENC 的 ReportNum 字段） */
   reportNum?: string;
+  /**
+   * 测定类型（可选）。
+   * 配置时，从 API 响应提取测定类型字符串（如 CENC 的 type 字段，值为 'auto'/'reviewed'）。
+   * 常见值：'auto'（自动测定）、'reviewed'（正式测定）。
+   *
+   * 使用场景：
+   * - JS 层 EqInfoCard：在机构标签旁显示"自动测定"/"正式测定"小标签
+   * - 原生层 EewBackgroundService：
+   *   1. emitEewEvent 转发给 JS 层（前台悬浮窗内容）
+   *   2. buildFloatingWindowContent 写入后台悬浮窗字段
+   *   3. sendEventNotification 在系统消息通知副标题中显示
+   *
+   * 值映射规则（JS/Kotlin 双层一致实现，见 EqInfoCard.tsx 与 EewBackgroundService.sendEventNotification）：
+   * - 'auto' → 自动测定
+   * - 'reviewed' → 正式测定
+   * - 其他值 → 原样显示
+   */
+  reportType?: string;
 }
 
 /**
@@ -129,6 +147,8 @@ export interface AlertConfig {
   lockScreenIntensity: number;
 
   // ---- 报警方式 ----
+  /** 消息通知（系统通知栏，不受阈值影响，eew+eqlist 事件均触发） */
+  notificationEnabled: boolean;
   soundEnabled: boolean;
   vibrationEnabled: boolean;
   /** 闪光灯警报（橙红级烈度 ≥ 5 时闪烁，DB/T 113.1-2026 标准） */
@@ -241,8 +261,15 @@ export interface AppConfig {
  *        系统层 network_security_config 全局允许 cleartext，
  *        应用层通过此开关控制是否放行 HTTP endpoint（false 时仅允许 HTTPS + localhost）。
  *        迁移策略：新字段可选，旧配置通过 DEFAULT_CONFIG 合并自动补齐默认值。
+ * - v16: FieldMapping 新增可选 reportType 字段（测定类型映射）。
+ *        配置时从 API 响应提取测定类型字符串（如 CENC 的 type='auto'/'reviewed'），
+ *        EqInfoCard 据此显示"自动测定"或"正式测定"标签。
+ *        迁移策略：新字段可选，旧配置无需特殊处理。
+ * - v17: AlertConfig 新增 notificationEnabled（消息通知开关，默认 true）。
+ *        开启后 eew+eqlist 事件均发送系统通知栏消息，不受阈值影响。
+ *        迁移策略：新字段可选，旧配置通过 DEFAULT_CONFIG 合并自动补齐默认值。
  */
-export const CURRENT_CONFIG_VERSION = 15;
+export const CURRENT_CONFIG_VERSION = 17;
 
 /**
  * AsyncStorage 中存储免责声明确认标记的 key
@@ -277,6 +304,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   alert: {
     minMagnitude: 3.0,
     lockScreenIntensity: 4,
+    notificationEnabled: true,
     soundEnabled: true,
     vibrationEnabled: true,
     flashlightEnabled: true,

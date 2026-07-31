@@ -138,6 +138,8 @@ interface FieldMapping {
   isCancel?: string;
   /** 报告编号/第几报（可选）。CENC 格式通常为 $.ReportNum。配置后在悬浮窗和锁屏预警界面显示"第N报"，未配置时不显示 */
   reportNum?: string;
+  /** 测定类型（可选）。如 CENC 的 $.type，值为 'auto'（自动测定）或 'reviewed'（正式测定）。配置后在地震速报卡片显示测定类型标签 */
+  reportType?: string;
 }
 ```
 
@@ -146,6 +148,7 @@ interface FieldMapping {
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `reportNum` | `string`（路径表达式） | 否 | 报告编号（第几报）的路径表达式。CENC 格式通常配置为 `$.ReportNum`。配置后，悬浮窗信息行（"第N报 · 数据源名称 · 震中距 X km · 时间"）和锁屏预警信息行（"第N报  数据源名称  发震 HH:mm:ss  深度 Xkm  距离 Xkm"）会显示对应的报告编号；未配置时不显示"第N报"字段 |
+| `reportType` | `string`（路径表达式） | 否 | 测定类型的路径表达式。CENC 格式通常配置为 `$.type`，常见值：`auto`（自动测定）、`reviewed`（正式测定）。配置后，eqlist 速报卡片（EqInfoCard）在机构标签旁显示"自动测定"或"正式测定"标签；未配置时不显示该标签 |
 
 > **数据源名称（sourceName）说明**：数据源名称由 `SourceConfig.name` 字段自动填充（即用户在设置页配置数据源时填写的名称），**无需在 FieldMapping 中配置**。App 解析事件时会自动将当前数据源的 `name` 附加到事件上，用于悬浮窗和锁屏预警界面显示。
 
@@ -602,7 +605,7 @@ npx tsc --noEmit
 ### 11.1 数据源同步机制（多源并行模式）
 
 - **JS 层 → 原生层**：`HomeScreen` 通过 `BackgroundServiceManager.updateCustomSources(sources)` 将所有活跃 customSource 配置同步到原生层 `SharedPreferences`
-- **同步时机**：`config.sources` 变化时自动同步（取所有 `enabled && type === 'customSource' && category === 'eew'` 的源，按 priority 升序）
+- **同步时机**：`config.sources` 变化时自动同步（取所有 `enabled && type === 'customSource'` 的源，含 `eew` 和 `eqlist` 两类，不再仅限 `eew` 源，按 priority 升序）
 - **同步内容**：多源配置的 JSON 数组字符串（含每个源的 endpoint/protocol/authToken/pollIntervalMs/fieldMapping/priority）
 
 ### 11.2 原生层连接逻辑（多源并行）
