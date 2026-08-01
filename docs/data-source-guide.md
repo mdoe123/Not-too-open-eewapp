@@ -1,7 +1,7 @@
 # 数据源扩展指南
 
 本文档说明如何在地震预警 App 中新增一个数据源适配器（SourceAdapter）。新增数据源只需实现统一接口并注册到 `SourceManager`，无需改动上层 UI 与报警逻辑。
-
+(建议直接丢给ai生成)
 > 相关代码：`src/sources/SourceAdapter.ts`、`src/sources/SourceManager.ts`、`src/types/eew.ts`、`src/types/config.ts`
 > 数据层整体设计见 [data-layer.md](data-layer.md)。
 
