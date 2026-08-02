@@ -5,7 +5,9 @@ import android.content.res.AssetFileDescriptor
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaPlayer
+import android.media.SoundPool
 import android.os.Handler
+import android.util.Log
 import android.os.Looper
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
@@ -64,17 +66,29 @@ class SoundModule(
   @Volatile
   private var mainLooping = false
 
-  // ======================== 语音播放 ========================
+  // ======================== 语音播放（SoundPool 低延迟） ========================
 
-  /** 语音 MediaPlayer */
-  private var voicePlayer: MediaPlayer? = null
+  /** SoundPool 用于低延迟语音播放 */
+  private var soundPool: SoundPool? = null
+
+  /** 音频文件名 -> SoundPool soundId 映射 */
+  private val soundIds: MutableMap<String, Int> = mutableMapOf()
+
+  /** 音频文件名 -> 时长（毫秒），用于 postDelayed 调度下一段 */
+  private val soundDurations: MutableMap<String, Long> = mutableMapOf()
 
   /** 语音是否循环播放 */
   @Volatile
   private var voiceLooping = false
 
-  /** 当前语音播放队列（文件名列表，如 ["地震红色预警.mp3", "6.mp3", "4.mp3", "秒后抵达.mp3"]） */
-  private val voiceQueue: MutableList<String> = mutableListOf()
+  /**
+   * 当前语音阶段：
+   * - PHASE_LEVEL：播报级别（+ 归零/取消的额外语音）
+   * - PHASE_NUMBER：播报数字（实时获取 currentRemainSec）
+   */
+  private var voicePhase = 0
+  private val PHASE_LEVEL = 0
+  private val PHASE_NUMBER = 1
 
   /** 当前预警级别（red / orange / yellow / blue） */
   @Volatile
@@ -100,6 +114,59 @@ class SoundModule(
 
   init {
     ReactContextProvider.setSoundModule(this)
+    initSoundPool()
+  }
+
+  /**
+   * 初始化 SoundPool 并预加载所有语音音频文件
+   *
+   * SoundPool 相比 MediaPlayer 的优势：
+   * - 预加载后 play() 延迟 <10ms（MediaPlayer 每次创建+prepare 需 100-200ms）
+   * - 适合短音频（<5秒），数字/级别音频均 <1 秒
+   *
+   * 同时用 MediaPlayer 获取每个音频的精确时长，用于 postDelayed 调度下一段播放。
+   */
+  private fun initSoundPool() {
+    try {
+      val attrs = AudioAttributes.Builder()
+        .setUsage(AudioAttributes.USAGE_MEDIA)
+        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+        .build()
+      soundPool = SoundPool.Builder()
+        .setMaxStreams(2)
+        .setAudioAttributes(attrs)
+        .build()
+
+      // 所有需要预加载的音频文件
+      val files = listOf(
+        "0.mp3", "1.mp3", "2.mp3", "3.mp3", "4.mp3", "5.mp3",
+        "6.mp3", "7.mp3", "8.mp3", "9.mp3", "10.mp3",
+        "地震红色预警.mp3", "地震橙色预警.mp3", "地震黄色预警.mp3", "地震蓝色预警.mp3",
+        "地震预警取消.mp3", "横波已抵达.mp3", "秒后抵达.mp3"
+      )
+
+      for (file in files) {
+        try {
+          val afd = reactContext.assets.openFd("audio/$file")
+          val soundId = soundPool!!.load(afd, 1)
+          soundIds[file] = soundId
+
+          // 用 MediaPlayer 获取精确时长（用于 postDelayed 调度）
+          val mp = MediaPlayer()
+          mp.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+          mp.prepare()
+          soundDurations[file] = mp.duration.toLong()
+          mp.release()
+
+          afd.close()
+        } catch (e: Exception) {
+          emitError("initSoundPool", "加载 $file 失败: ${e.message}")
+        }
+      }
+      Log.i("SoundModule", "SoundPool 预加载完成: ${soundIds.size} 个音频")
+    } catch (e: Exception) {
+      emitError("initSoundPool", e.message ?: e::class.java.simpleName)
+    }
   }
 
   override fun getName(): String = NAME
@@ -107,6 +174,8 @@ class SoundModule(
   override fun invalidate() {
     stopInternal()
     restoreMediaVolumeInternal()
+    soundPool?.release()
+    soundPool = null
     ReactContextProvider.setSoundModule(null)
     super.invalidate()
   }
@@ -129,8 +198,7 @@ class SoundModule(
       currentRemainSec = remainSec
       currentIsCancel = isCancel
       currentArrived = arrived
-      // 清空语音队列，立即用新状态填充
-      synchronized(voiceQueue) { voiceQueue.clear() }
+      voicePhase = PHASE_LEVEL
 
       // 启动主音（如未启动）
       if (!mainLooping) {
@@ -142,7 +210,8 @@ class SoundModule(
       if (!voiceLooping) {
         stopVoiceInternal()
         voiceLooping = true
-        playNextVoice()
+        mainHandler.removeCallbacks(playNextVoiceRunnable)
+        mainHandler.post(playNextVoiceRunnable)
       }
     } catch (e: Exception) {
       emitError("startAlertWithVoice", e.message ?: e::class.java.simpleName)
@@ -152,8 +221,8 @@ class SoundModule(
   /**
    * 更新预警状态（每秒 tick 调用）
    *
-   * 不中断当前语音播放，等当前周期播完后取新状态。
-   * 但取消报状态变化时立即切换。
+   * 更新 currentRemainSec 等状态字段，下一阶段构建队列时取最新值。
+   * 取消报状态变化时立即切换。
    *
    * @param level 预警级别
    * @param remainSec 剩余秒数
@@ -170,10 +239,11 @@ class SoundModule(
 
     // 取消报状态变化时立即切换语音
     if (cancelChanged && voiceLooping) {
-      synchronized(voiceQueue) { voiceQueue.clear() }
+      voicePhase = PHASE_LEVEL
       stopVoiceInternal()
       voiceLooping = true
-      mainHandler.post { playNextVoice() }
+      mainHandler.removeCallbacks(playNextVoiceRunnable)
+      mainHandler.post(playNextVoiceRunnable)
     }
   }
 
@@ -245,49 +315,62 @@ class SoundModule(
     }
   }
 
-  // ======================== 语音播放实现 ========================
+  // ======================== 语音播放实现（SoundPool 低延迟） ========================
+
+  /** playNextVoice 的 Runnable 封装，便于 removeCallbacks */
+  private val playNextVoiceRunnable = Runnable { playNextVoice() }
 
   /**
-   * 根据当前状态构建语音播放队列
+   * 根据当前阶段和状态构建语音播放队列
    *
-   * - 取消报：["地震预警取消.mp3"]
-   * - 归零后：["级别.mp3", "横波已抵达.mp3"]
-   * - 正常倒计时：
-   *   - 整十数（10/20/30...）：["级别.mp3", 中文整十读法..., "秒后抵达.mp3"]
-   *     · 10 → "10.mp3"（十）
-   *     · 20 → "2.mp3" + "10.mp3"（二十）
-   *     · 60 → "6.mp3" + "10.mp3"（六十）
-   *   - 非整十数（如 64/23/15）：["级别.mp3", 数字逐位...]，不加"秒后抵达"
-   *     · 64 → "6.mp3" + "4.mp3"（六四）
-   * - remain=0 且未 arrived：["级别.mp3"]（边界情况）
+   * 分阶段构建（关键优化）：
+   * - PHASE_LEVEL：构建级别队列（级别 + 归零/取消语音）
+   * - PHASE_NUMBER：构建数字队列（实时获取 currentRemainSec）
+   *
+   * 这样数字在级别播完后才生成，用的是最新倒计时值，减少滞后。
+   *
+   * 数字读法：
+   * - 整十数（10/20/30...90）：中文整十读法 + "秒后抵达"
+   *   · 10 → "10.mp3"（十）；20 → "2.mp3"+"10.mp3"（二十）；60 → "6.mp3"+"10.mp3"（六十）
+   * - 非整十数（如 64/23/15）：数字逐位播报，不加"秒后抵达"
    */
-  private fun buildVoiceQueue(): List<String> {
+  private fun buildVoiceQueueForPhase(): List<String> {
+    // 取消报：只播"地震预警取消"
     if (currentIsCancel) {
+      voicePhase = PHASE_LEVEL  // 取消报固定在 LEVEL 阶段循环
       return listOf("地震预警取消.mp3")
     }
 
-    val queue = mutableListOf<String>()
+    if (voicePhase == PHASE_LEVEL) {
+      // 级别阶段：播级别（+ 归零后追加"横波已抵达"）
+      voicePhase = PHASE_NUMBER  // 切换到数字阶段
+      val queue = mutableListOf<String>()
+      val levelFile = when (currentLevel) {
+        "red" -> "地震红色预警.mp3"
+        "orange" -> "地震橙色预警.mp3"
+        "yellow" -> "地震黄色预警.mp3"
+        "blue" -> "地震蓝色预警.mp3"
+        else -> null
+      }
+      if (levelFile != null) queue.add(levelFile)
+      if (currentArrived) {
+        queue.add("横波已抵达.mp3")
+      }
+      return queue
+    } else {
+      // 数字阶段：实时获取 currentRemainSec 生成数字队列
+      voicePhase = PHASE_LEVEL  // 切换回级别阶段
+      if (currentArrived || currentRemainSec <= 0) {
+        // 归零或无倒计时：空队列，直接回到级别阶段
+        return emptyList()
+      }
 
-    // 级别语音
-    val levelFile = when (currentLevel) {
-      "red" -> "地震红色预警.mp3"
-      "orange" -> "地震橙色预警.mp3"
-      "yellow" -> "地震黄色预警.mp3"
-      "blue" -> "地震蓝色预警.mp3"
-      else -> null
-    }
-    if (levelFile != null) queue.add(levelFile)
-
-    if (currentArrived) {
-      // 归零后：横波已抵达
-      queue.add("横波已抵达.mp3")
-    } else if (currentRemainSec > 0) {
       val remain = currentRemainSec
+      val queue = mutableListOf<String>()
       val isWholeTen = remain % 10 == 0
 
       if (isWholeTen && remain < 100) {
         // 整十数（10-90）：中文整十读法 + "秒后抵达"
-        // 10 → "10.mp3"（十）；20 → "2.mp3"+"10.mp3"（二十）；60 → "6.mp3"+"10.mp3"（六十）
         if (remain == 10) {
           queue.add("10.mp3")
         } else {
@@ -301,27 +384,39 @@ class SoundModule(
           queue.add("$ch.mp3")
         }
       }
+      return queue
     }
-    // remain == 0 且未 arrived：仅播级别（边界情况）
-
-    return queue
   }
 
-  /** 播放下一段语音，播完后继续播放队列中的下一个 */
+  /** 临时队列：级别阶段或数字阶段构建的文件列表 */
+  private val voiceQueue: MutableList<String> = mutableListOf()
+
+  /**
+   * 播放下一段语音（SoundPool 低延迟播放）
+   *
+   * 流程：
+   * 1. 队列空时根据当前阶段构建（级别或数字）
+   * 2. 取出队首文件名，用 SoundPool.play() 播放（延迟 <10ms）
+   * 3. postDelayed(音频时长) 后播放下一个
+   *
+   * 相比 MediaPlayer 的优势：
+   * - 无需每次创建/prepare MediaPlayer（省 100-200ms）
+   * - 数字间隔从 ~200ms 降到 ~10ms
+   */
   private fun playNextVoice() {
     if (!voiceLooping) return
 
-    // 队列空时重新填充（取最新状态）
+    // 队列空时根据当前阶段构建
     synchronized(voiceQueue) {
       if (voiceQueue.isEmpty()) {
-        voiceQueue.addAll(buildVoiceQueue())
+        voiceQueue.addAll(buildVoiceQueueForPhase())
       }
     }
 
     if (voiceQueue.isEmpty()) {
-      // 无可播放的语音，延迟后重试
+      // 队列仍为空（如数字阶段无数字可播），立即回到级别阶段
       if (voiceLooping) {
-        mainHandler.postDelayed({ playNextVoice() }, VOICE_RETRY_DELAY_MS)
+        mainHandler.post(playNextVoiceRunnable)
       }
       return
     }
@@ -332,61 +427,28 @@ class SoundModule(
       fileName = voiceQueue.removeAt(0)
     }
 
+    val soundId = soundIds[fileName]
+    val duration = soundDurations[fileName] ?: 500L
+
+    if (soundId == null) {
+      emitError("playNextVoice", "音频未预加载: $fileName")
+      if (voiceLooping) {
+        mainHandler.postDelayed(playNextVoiceRunnable, VOICE_RETRY_DELAY_MS)
+      }
+      return
+    }
+
     try {
-      val afd: AssetFileDescriptor = reactContext.assets.openFd("audio/$fileName")
-      val mp = MediaPlayer()
-      mp.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
-      afd.close()
-
-      mp.setAudioAttributes(
-        AudioAttributes.Builder()
-          .setUsage(AudioAttributes.USAGE_MEDIA)
-          .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-          .build()
-      )
-
-      mp.setOnCompletionListener { player ->
-        try {
-          player.release()
-        } catch (_: Exception) {
-        }
-        synchronized(this) {
-          if (voicePlayer === player) {
-            voicePlayer = null
-          }
-        }
-        if (voiceLooping) {
-          mainHandler.post { playNextVoice() }
-        }
+      // SoundPool.play() 几乎无延迟
+      soundPool?.play(soundId, 1f, 1f, 1, 0, 1f)
+      // 按音频时长调度下一段
+      if (voiceLooping) {
+        mainHandler.postDelayed(playNextVoiceRunnable, duration)
       }
-
-      mp.setOnErrorListener { player, what, extra ->
-        try {
-          player.release()
-        } catch (_: Exception) {
-        }
-        synchronized(this) {
-          if (voicePlayer === player) {
-            voicePlayer = null
-          }
-        }
-        emitError("playNextVoice", "MediaPlayer error: what=$what extra=$extra file=$fileName")
-        if (voiceLooping) {
-          mainHandler.postDelayed({ playNextVoice() }, VOICE_RETRY_DELAY_MS)
-        }
-        true
-      }
-
-      mp.prepare()
-      synchronized(this) {
-        voicePlayer = mp
-      }
-      mp.start()
     } catch (e: Exception) {
       emitError("playNextVoice", "${e.message ?: e::class.java.simpleName} (file=$fileName)")
-      // 出错时跳过此文件，延迟后继续
       if (voiceLooping) {
-        mainHandler.postDelayed({ playNextVoice() }, VOICE_RETRY_DELAY_MS)
+        mainHandler.postDelayed(playNextVoiceRunnable, VOICE_RETRY_DELAY_MS)
       }
     }
   }
@@ -418,16 +480,8 @@ class SoundModule(
 
   /** 停止语音播放 */
   private fun stopVoiceInternal() {
-    synchronized(this) {
-      voicePlayer?.let { mp ->
-        try {
-          if (mp.isPlaying) mp.stop()
-          mp.release()
-        } catch (_: Exception) {
-        }
-        voicePlayer = null
-      }
-    }
+    voiceLooping = false
+    mainHandler.removeCallbacks(playNextVoiceRunnable)
     synchronized(voiceQueue) {
       voiceQueue.clear()
     }
