@@ -176,22 +176,20 @@ export function useEewStream(): UseEewStreamResult {
         // 检查是否已存在同源同事件（按 id 更新）
         const idxById = prev.findIndex(e => e.id === event.id);
         if (idxById >= 0) {
-          // 同 id 报告：保留震级较高的（用户决策：同 id 不直接覆盖）
-          const old = prev[idxById];
-          if (event.magnitude > old.magnitude) {
-            const updated = [...prev];
-            updated[idxById] = event;
-            return updated;
-          }
-          // 新报告震级 ≤ 旧报告，保留旧报告
-          return prev;
+          // 同 id 报告：始终用最新报告覆盖（DB/T 113.1-2026：预警按最新报告更新）
+          // 新报告是更精确的修订值，即使震级降低也应更新
+          const updated = [...prev];
+          updated[idxById] = event;
+          return updated;
         }
 
-        // 检查跨源同事件（按 dedupKey 去重，保留先到达的）
+        // 检查跨源同事件（按 dedupKey 去重，用最新报告覆盖）
         const idxByKey = prev.findIndex(e => dedupKey(e) === key);
         if (idxByKey >= 0) {
-          // 已存在同一事件，保留先到达的（不覆盖）
-          return prev;
+          // 跨源同事件：用最新报告覆盖（DB/T 113.1-2026：预警按最新报告更新）
+          const updated = [...prev];
+          updated[idxByKey] = event;
+          return updated;
         }
 
         // 新事件，插入并按 originTime 降序排序后截断
