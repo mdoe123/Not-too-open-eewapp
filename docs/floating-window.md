@@ -18,17 +18,17 @@
 - `isScreenLocked() == false` → `FloatingWindowModule`（TYPE_APPLICATION_OVERLAY，叠加在其他 App 之上）
 
 悬浮窗/锁屏预警显示成功后同时触发：
-- **声音警报**（受 `soundEnabled` 控制，循环播放直到倒计时归零后 -60 秒）
+- **声音警报**（受 `soundEnabled` 控制，DB/T 113.1-2026：警报主音 + 语音提示叠加合成，循环播放直到倒计时归零后 -60 秒）
 - **震动警报**（受 `vibrationEnabled` 控制，循环震动直到倒计时归零后 -60 秒）
 - **闪光灯警报**（受 `flashlightEnabled` 控制，循环闪烁直到倒计时归零后 -60 秒，仅橙红级烈度 ≥ 5 触发）
 
 > 注：前台触发路径由 JS 层 `useFloatingWindow` 联动声音/震动/闪光灯；后台悬浮窗触发路径由 `EewBackgroundService` 通过 `ReactContextProvider` 直接调用原生模块联动；锁屏触发路径由 `LockScreenAlertActivity` 通过 `ReactContextProvider` 直接调用原生模块联动（均无需经过 RN 桥，避免后台/锁屏时 JS 暂停）。
 
-**倒计时与警报规则**：
-- `remainSec > 0`：正常倒计时显示，警报持续
-- `remainSec <= 0`：文字显示"地震波已到达"，**警报继续响**（不停止）
+**倒计时与警报规则**（DB/T 113.1-2026 6.1.3 / 6.1.4）：
+- `remainSec > 0`：正常倒计时显示，警报持续；语音播报 `[级别] + [倒计时数字逐位] + ["秒后抵达"]`（如 64 秒播"六""四""秒后抵达"）
+- `remainSec <= 0`：文字显示"地震波已到达"，**警报继续响**（不停止）；语音仅播报 `[级别] + ["横波已抵达"]`，持续 60 秒后结束
 - `remainSec <= -60`：停止声音/震动/闪光灯，但 UI 保持显示，等用户手动关闭
-- 取消报（`isCancel=true`）显示"地震预警取消"，3 秒后自动隐藏，且不触发声音/震动/闪光灯
+- 取消报（`isCancel=true`）显示"地震预警取消"，**循环播报语音"地震预警取消"**，60 秒后自动隐藏（`CANCEL_HIDE_DELAY_MS = 60000`）
 
 用户点击✕关闭按钮后，同一事件不再自动弹出（直到新事件到来）。
 
@@ -46,7 +46,8 @@ HomeScreen
        │    ├─ updateContent(c)    更新内容（每秒 tick）
        │    └─ hide()              隐藏悬浮窗
        ├─ SoundManager（声音警报）
-       │    └─ playAlertSound()    循环播放 5 频率叠加警报主音
+       │    ├─ startAlertWithVoice()  启动主音 + 语音混音循环播放
+       │    └─ updateAlertState()     每秒 tick 更新语音状态（倒计时/级别/取消/抵达）
        ├─ VibratorManager（震动警报）
        │    └─ startVibrating(1000) 循环震动间隔 1000ms
        ├─ FlashlightManager（闪光灯警报）
@@ -181,7 +182,7 @@ HomeScreen (useEffect)
 
 ```
 [空闲] ──event 非空且 alertLevel >= blue──> [检查权限]
-[空闲] ──event.isCancel=true──> [取消报分支] ──> [显示"地震预警取消" + 3s 后 hide]
+[空闲] ──event.isCancel=true──> [取消报分支] ──> [显示"地震预警取消" + 循环播报语音 + 60s 后 hide]
 [检查权限] ──granted=true──> [show()] ──成功──> [可见 + 启动 tick + 触发声音/震动/闪光灯]
 [检查权限] ──granted=false──> [隐藏]
 [可见 + tick 运行] ──event 更新──> [updateContent（不重启 tick，不重复触发声音/震动/闪光灯）]
@@ -586,9 +587,9 @@ if (idxById >= 0) {
 当数据源推送 `isCancel=true` 的事件时（JMA 数据源支持），悬浮窗走单独分支：
 
 1. **不检查倒计时**：即使 S 波已到达也显示
-2. **不触发声音/闪光灯**：取消报是解除警报，不应惊吓用户
+2. **循环播报语音"地震预警取消"**：DB/T 113.1-2026 6.1.4 要求收到取消消息后循环播报"地震预警取消"
 3. **显示"地震预警取消"**：由原生层 `formatCountdown` 根据 `isCancel=true` 映射
-4. **3 秒后自动隐藏**：`CANCEL_HIDE_DELAY_MS = 3000`
+4. **60 秒后自动隐藏**：`CANCEL_HIDE_DELAY_MS = 60000`（循环播报期间持续显示，等用户手动关闭或 60 秒超时）
 
 ```typescript
 if (event.isCancel === true) {
@@ -600,7 +601,7 @@ if (event.isCancel === true) {
           isVisibleRef.current = true;
           cancelHideTimeoutRef.current = setTimeout(() => {
             hideFloatingWindow();
-          }, CANCEL_HIDE_DELAY_MS);  // 3000ms
+          }, CANCEL_HIDE_DELAY_MS);  // 60000ms
         });
     });
   return;  // 不走普通报分支
@@ -648,7 +649,7 @@ if (event.isCancel === true) {
 | `showFloatingWindow` 入口 | `showFloatingWindow { hasEvent, hasLocation, isVisible, isCancel }` | 每次调用入口 |
 | 取消报分支 | `取消报，显示"地震预警取消"` | isCancel=true 走单独分支 |
 | 取消报 show 成功 | `取消报 show 成功 { requestId }` | 取消报悬浮窗显示成功 |
-| 取消报超时隐藏 | `取消报显示超时，隐藏` | 3 秒后自动隐藏 |
+| 取消报超时隐藏 | `取消报显示超时，隐藏` | 60 秒后自动隐藏 |
 | 不可见分支-过期检查 | `事件已过期(S波到达)，不显示 { remain }` | S 波已到达，不显示悬浮窗 |
 | `isVisibleRef=true` 分支 | `updateContent (已可见) { mag, countdown }` | 已可见时更新内容 |
 | `hasPermission` 返回 | `hasPermission { granted }` | 权限检查结果 |

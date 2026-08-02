@@ -47,7 +47,8 @@ const COUNTDOWN_INTERVAL_MS = 1000;
 const ALERT_CONTINUE_AFTER_ARRIVAL_SEC = -60;
 /** 新事件（未显示过的）S 波到达超过此秒数不显示（解决重启 App 误触发） */
 const MAX_PAST_ARRIVAL_FOR_NEW_EVENT_SEC = -60;
-const CANCEL_HIDE_DELAY_MS = 3000;
+// DB/T 113.1-2026 6.1.4：收到取消报后循环播报"地震预警取消"，60 秒后自动隐藏
+const CANCEL_HIDE_DELAY_MS = 60000;
 const FLASHLIGHT_INTENSITY_THRESHOLD = 5;
 const FLASHLIGHT_BLINK_INTERVAL_MS = 1000;
 const VIBRATE_MS = 2000;
@@ -279,16 +280,28 @@ export function useFloatingWindow(
     if (soundEnabled && autoVolumeEnabled) {
       SoundManager.saveAndSetMediaVolume(alertVolume).catch(() => {});
     }
+    // 注意：必须从 selectDisplayEvents 结果取 top，不能用 activeEventsRef[0]（输入顺序不一定按级别排序）
+    const displayList = selectDisplayEvents(activeEventsRef.current);
+    const top = displayList[0];
     if (soundEnabled) {
-      SoundManager.playAlertSound().catch(() => {});
+      // DB/T 113.1-2026：主音 + 语音叠加合成，循环播报
+      if (top) {
+        const remainSec = Math.ceil((top.arrivalMs - Date.now()) / 1000);
+        const isCancel = top.event.isCancel === true;
+        SoundManager.startAlertWithVoice(
+          top.alertLevel,
+          remainSec,
+          isCancel,
+          top.arrived,
+        ).catch(() => {});
+      } else {
+        SoundManager.playAlertSound().catch(() => {});
+      }
     }
     if (vibrationEnabled) {
       VibratorManager.startVibratingCycle(VIBRATE_MS, SILENT_MS).catch(() => {});
     }
     // 闪光灯仅最高优先级事件烈度 ≥ 5 时触发
-    // 注意：必须从 selectDisplayEvents 结果取 top，不能用 activeEventsRef[0]（输入顺序不一定按级别排序）
-    const displayList = selectDisplayEvents(activeEventsRef.current);
-    const top = displayList[0];
     if (flashlightEnabled && top && top.intensity >= FLASHLIGHT_INTENSITY_THRESHOLD) {
       FlashlightManager.startBlinking(FLASHLIGHT_BLINK_INTERVAL_MS).catch(() => {});
     }
@@ -346,6 +359,18 @@ export function useFloatingWindow(
       if (displayList.length > 0) {
         const contents = displayList.map(buildContent);
         FloatingWindowManager.setEvents(contents).catch(() => {});
+        // 每秒更新声音状态（倒计时动态更新、级别变化、抵达/取消切换）
+        if (soundEnabled && alertsStartedRef.current) {
+          const top = displayList[0];
+          const remainSec = Math.ceil((top.arrivalMs - Date.now()) / 1000);
+          const isCancel = top.event.isCancel === true;
+          SoundManager.updateAlertState(
+            top.alertLevel,
+            remainSec,
+            isCancel,
+            top.arrived,
+          ).catch(() => {});
+        }
       } else {
         // 无可显示事件
         FloatingWindowManager.hide().catch(() => {});
@@ -417,7 +442,7 @@ export function useFloatingWindow(
         log('FLOAT', 'setEvents 失败', {});
       });
 
-      // 处理取消报：3 秒后自动隐藏
+      // 处理取消报：60 秒后自动隐藏（循环播报"地震预警取消"期间持续显示）
       displayList.forEach(ae => {
         if (ae.event.isCancel === true && !cancelTimeoutsRef.current.has(ae.event.id)) {
           const t = setTimeout(() => {

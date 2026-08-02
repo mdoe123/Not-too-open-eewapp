@@ -555,6 +555,7 @@ class EewBackgroundService : Service() {
         arrivalMs = arrivalMs,
         reportNum = event.reportNum,
         sourceName = sourceName,
+        isCancel = event.isCancel,
       )
       LockScreenAlertActivity.instance?.addEvent(eventData)
       Log.i(TAG, "更新锁屏事件: eventId=${event.eventId} mag=${event.magnitude} intensity=$intensity level=$alertLevel")
@@ -730,6 +731,7 @@ class EewBackgroundService : Service() {
         arrivalMs = arrivalMs,
         reportNum = event.reportNum,
         sourceName = sourceName,
+        isCancel = event.isCancel,
       )
 
       // === 多事件模式 ===
@@ -774,6 +776,7 @@ class EewBackgroundService : Service() {
         if (!sourceName.isNullOrEmpty()) {
           putExtra(LockScreenAlertActivity.EXTRA_SOURCE_NAME, sourceName)
         }
+        putExtra(LockScreenAlertActivity.EXTRA_IS_CANCEL, event.isCancel)
         putExtra(LockScreenAlertActivity.EXTRA_SOUND_ENABLED, soundEnabled)
         putExtra(LockScreenAlertActivity.EXTRA_VIBRATION_ENABLED, vibrationEnabled)
         putExtra(LockScreenAlertActivity.EXTRA_FLASHLIGHT_ENABLED, flashlightEnabled)
@@ -914,7 +917,7 @@ class EewBackgroundService : Service() {
       // 触发声音/震动/闪光灯警报（合并一个，仅最高优先级事件决定闪光灯）
       val topEvent = selectBackgroundDisplayEvents().firstOrNull()
       if (topEvent != null && !bgFloatingAlertsStopped) {
-        triggerAlertsFromBackground(topEvent.intensity)
+        triggerAlertsFromBackground(topEvent)
       }
     } catch (e: Exception) {
       Log.e(TAG, "显示悬浮窗失败: ${e.message}，回退到 LockScreenAlertActivity")
@@ -1081,6 +1084,26 @@ class EewBackgroundService : Service() {
         // 刷新所有悬浮窗内容
         refreshBackgroundFloatingWindows()
 
+        // 每秒更新声音状态（倒计时动态更新、级别变化、抵达/取消切换）
+        if (!bgFloatingAlertsStopped) {
+          val topForSound = selectBackgroundDisplayEvents().firstOrNull()
+          if (topForSound != null) {
+            val soundEnabled = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+              .getBoolean("soundEnabled", true)
+            if (soundEnabled) {
+              val remainSec = ((topForSound.arrivalMs - now) / 1000.0).toInt()
+              val isCancel = topForSound.event.isCancel
+              try {
+                ReactContextProvider.soundModule?.updateAlertState(
+                  topForSound.alertLevel, remainSec, isCancel, topForSound.arrived
+                )
+              } catch (e: Exception) {
+                Log.w(TAG, "后台声音状态更新失败: ${e.message}")
+              }
+            }
+          }
+        }
+
         // 继续下一秒 tick
         bgFloatingTickHandler?.postDelayed(this, 1000L)
       }
@@ -1142,12 +1165,12 @@ class EewBackgroundService : Service() {
   /**
    * 触发声音/震动/闪光灯警报（后台悬浮窗模式）
    *
+   * DB/T 113.1-2026：主音 + 语音叠加合成，循环播报。
    * 通过 ReactContextProvider 获取原生模块实例，直接调用（不经过 RN 桥）。
-   * 警报配置从 SharedPreferences 读取。
    *
-   * @param intensity 预估烈度（用于判断闪光灯触发阈值）
+   * @param topEvent 顶级事件（用于获取级别/倒计时/取消/抵达状态）
    */
-  private fun triggerAlertsFromBackground(intensity: Double) {
+  private fun triggerAlertsFromBackground(topEvent: BackgroundEvent) {
     val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     val soundEnabled = prefs.getBoolean("soundEnabled", true)
     val vibrationEnabled = prefs.getBoolean("vibrationEnabled", true)
@@ -1157,12 +1180,15 @@ class EewBackgroundService : Service() {
 
     if (soundEnabled) {
       try {
-        // 自动调节媒体音量：在播放声音前保存并设置目标音量
         if (autoVolumeEnabled) {
           ReactContextProvider.soundModule?.saveAndSetMediaVolume(alertVolume)
         }
-        ReactContextProvider.soundModule?.playAlertSound()
-        Log.i(TAG, "后台声音警报已启动")
+        val remainSec = ((topEvent.arrivalMs - System.currentTimeMillis()) / 1000.0).toInt()
+        val isCancel = topEvent.event.isCancel
+        ReactContextProvider.soundModule?.startAlertWithVoice(
+          topEvent.alertLevel, remainSec, isCancel, topEvent.arrived
+        )
+        Log.i(TAG, "后台声音警报已启动 (level=${topEvent.alertLevel} remain=${remainSec}s cancel=$isCancel arrived=${topEvent.arrived})")
       } catch (e: Exception) {
         Log.w(TAG, "后台声音警报启动失败: ${e.message}")
       }
@@ -1176,10 +1202,10 @@ class EewBackgroundService : Service() {
       }
     }
     // 闪光灯仅在烈度 >= 5 时触发（与 LockScreenAlertActivity 一致）
-    if (flashlightEnabled && intensity >= 5.0) {
+    if (flashlightEnabled && topEvent.intensity >= 5.0) {
       try {
         ReactContextProvider.flashlightModule?.startBlinking(1000)
-        Log.i(TAG, "后台闪光灯警报已启动 (intensity=$intensity)")
+        Log.i(TAG, "后台闪光灯警报已启动 (intensity=${topEvent.intensity})")
       } catch (e: Exception) {
         Log.w(TAG, "后台闪光灯警报启动失败: ${e.message}")
       }

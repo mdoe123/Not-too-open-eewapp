@@ -117,6 +117,7 @@ class LockScreenAlertActivity : Activity() {
     const val EXTRA_ARRIVAL_MS = "arrivalMs"
     const val EXTRA_REPORT_NUM = "reportNum"
     const val EXTRA_SOURCE_NAME = "sourceName"
+    const val EXTRA_IS_CANCEL = "isCancel"
 
     /**
      * 当前活跃的 Activity 实例（供 EewBackgroundService 调用 addEvent）
@@ -158,6 +159,7 @@ class LockScreenAlertActivity : Activity() {
     var alertsStopped: Boolean = false,
     val reportNum: Int? = null,
     val sourceName: String? = null,
+    val isCancel: Boolean = false,
   )
 
   /** 警报配置（从首个 Intent extras 读取，后续事件沿用） */
@@ -282,6 +284,7 @@ class LockScreenAlertActivity : Activity() {
       arrivalMs = intent.getLongExtra(EXTRA_ARRIVAL_MS, 0L),
       reportNum = if (reportNum > 0) reportNum else null,
       sourceName = sourceName,
+      isCancel = intent.getBooleanExtra(EXTRA_IS_CANCEL, false),
     )
   }
 
@@ -701,6 +704,12 @@ class LockScreenAlertActivity : Activity() {
 
   /**
    * 更新所有事件卡片的倒计时显示（每秒 tick 调用）
+   *
+   * 同时调用 SoundModule.updateAlertState 同步语音状态：
+   * - 倒计时数字逐秒更新
+   * - 级别变化（如蓝色预警升级为红色预警）
+   * - 取消报状态切换
+   * - 抵达状态切换
    */
   private fun updateAllCountdowns() {
     val now = System.currentTimeMillis()
@@ -731,17 +740,39 @@ class LockScreenAlertActivity : Activity() {
       Log.i(TAG, "所有事件警报持续到期，停止声音/震动/闪光灯")
       stopAlerts()
     }
+
+    // 每秒更新声音状态（倒计时动态更新、级别变化、抵达/取消切换）
+    if (soundEnabled && alertsStarted && !alertsStopped) {
+      val topForSound = selectDisplayEvents().firstOrNull()
+      if (topForSound != null) {
+        val remainSec = ((topForSound.arrivalMs - now) / 1000.0).toInt()
+        try {
+          ReactContextProvider.soundModule?.updateAlertState(
+            topForSound.alertLevel,
+            remainSec,
+            topForSound.isCancel,
+            topForSound.arrived,
+          )
+        } catch (e: Exception) {
+          Log.w(TAG, "声音状态更新失败: ${e.message}")
+        }
+      }
+    }
   }
 
   // ======================== 警报联动 ========================
 
   /**
    * 启动声音/震动/闪光灯警报（合并一个，仅首次启动）
+   *
+   * DB/T 113.1-2026：主音 + 语音叠加合成，循环播报。
+   * 取顶级事件的状态（级别、倒计时、是否取消、是否抵达）启动带语音的警报。
    */
   private fun startAlerts() {
     if (alertsStarted) return
     alertsStarted = true
     try {
+      val topEvent = selectDisplayEvents().firstOrNull()
       if (soundEnabled) {
         val soundModule = ReactContextProvider.soundModule
         if (soundModule != null) {
@@ -749,8 +780,19 @@ class LockScreenAlertActivity : Activity() {
           if (autoVolumeEnabled) {
             soundModule.saveAndSetMediaVolume(alertVolume)
           }
-          soundModule.playAlertSound()
-          Log.i(TAG, "声音警报已启动")
+          if (topEvent != null) {
+            val remainSec = ((topEvent.arrivalMs - System.currentTimeMillis()) / 1000.0).toInt()
+            soundModule.startAlertWithVoice(
+              topEvent.alertLevel,
+              remainSec,
+              topEvent.isCancel,
+              topEvent.arrived,
+            )
+            Log.i(TAG, "声音警报已启动 (level=${topEvent.alertLevel} remain=${remainSec}s cancel=${topEvent.isCancel} arrived=${topEvent.arrived})")
+          } else {
+            soundModule.playAlertSound()
+            Log.i(TAG, "声音警报已启动（无顶级事件，仅主音）")
+          }
         } else {
           Log.w(TAG, "SoundModule 未注册，跳过声音警报")
         }
@@ -767,7 +809,6 @@ class LockScreenAlertActivity : Activity() {
       }
 
       // 闪光灯：取最高级别事件的烈度判断
-      val topEvent = selectDisplayEvents().firstOrNull()
       if (flashlightEnabled && topEvent != null && topEvent.intensity >= FLASHLIGHT_INTENSITY_THRESHOLD) {
         val flashlightModule = ReactContextProvider.flashlightModule
         if (flashlightModule != null) {
