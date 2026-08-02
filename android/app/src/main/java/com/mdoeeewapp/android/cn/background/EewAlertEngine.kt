@@ -86,7 +86,10 @@ object EewAlertEngine {
     val ceaCsis = 1.297 * m - 4.368 * log10(safeHypo + 8) + 5.363
     val iclCsis = 1.363 * m - 1.494 * ln(safeHypo) + 2.941
 
-    return (ceaCsis + iclCsis) / 2
+    val avg = (ceaCsis + iclCsis) / 2
+    // 舍入到 1 位小数，与 UI 显示一致，避免浮点误差导致级别判断错误
+    // （如 6.9999... 应为 7.0 触发红色预警）
+    return Math.round(avg * 10) / 10.0
   }
 
   /**

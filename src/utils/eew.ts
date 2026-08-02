@@ -117,7 +117,9 @@ export const calcCsis = (m: number, dep: number, dis: number): number => {
   const iclCsis = 1.363 * m - 1.494 * Math.log(hypoDis) + 2.941;
 
   const avg = (ceaCsis + iclCsis) / 2;
-  return avg;
+  // 舍入到 1 位小数，与 UI 显示一致，避免浮点误差导致级别判断错误
+  // （如 6.9999... 应为 7.0 触发红色预警）
+  return Math.round(avg * 10) / 10;
 };
 
 /**
