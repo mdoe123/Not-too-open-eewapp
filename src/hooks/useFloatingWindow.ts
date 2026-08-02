@@ -4,23 +4,23 @@
 // 1. 接收事件列表，按预警级别排序，选出顶级 + 并列（最多 3 个）
 // 2. 调用 FloatingWindowManager.setEvents 批量显示
 // 3. 每秒 tick 更新所有显示中事件的倒计时
-// 4. 倒计时归零的事件 UI 保持显示，警报继续响到 -30 秒
+// 4. 倒计时归零的事件 UI 保持显示，警报继续响到 -60 秒
 // 5. 用户点击✕关闭某个事件 → 只关闭该事件，其他继续显示
 // 6. 所有事件都关闭后停止声音/震动/闪光灯
 //
 // 排序与分组规则（用户决策）：
-// - 候选条件：未被用户关闭 + remain > -30（倒计时归零后 30 秒内仍算活跃，独占显示）
+// - 候选条件：未被用户关闭 + remain > -60（倒计时归零后 60 秒内仍算活跃，独占显示）
 // - 按预警级别降序排序（red > orange > yellow > blue），同级别按烈度降序
 // - 顶级事件：候选中级别最高的那一个，显示在最上
 // - 并列事件：与顶级"同级别"（差 0 档）的其他事件，最多 2 个，显示在下方
-// - 差 ≥ 1 档的事件不显示，等顶级事件 remain <= -30 后才让下一级显示
-// - 即：大震倒计时归零后 30 秒内仍独占显示，30 秒后才让小震显示（如果小震还有倒计时）
+// - 差 ≥ 1 档的事件不显示，等顶级事件 remain <= -60 后才让下一级显示
+// - 即：大震倒计时归零后 60 秒内仍独占显示，60 秒后才让小震显示（如果小震还有倒计时）
 // - 用户手动关闭顶级事件后，立即显示下一级事件
 //
 // 警报规则：
 // - 合并为一次循环（声音/震动/闪光灯不叠加）
 // - 由最高优先级事件决定是否触发
-// - 所有显示中事件都归零 + 30 秒后停止
+// - 所有显示中事件都归零 + 60 秒后停止
 
 import {useCallback, useEffect, useRef, useState} from 'react';
 import {AppState, AppStateStatus, DeviceEventEmitter} from 'react-native';
@@ -44,7 +44,7 @@ const ALERT_LEVEL_ORDER: Record<AlertLevel, number> = {
 
 const MIN_SHOW_LEVEL: AlertLevel = 'blue';
 const COUNTDOWN_INTERVAL_MS = 1000;
-const ALERT_CONTINUE_AFTER_ARRIVAL_SEC = -30;
+const ALERT_CONTINUE_AFTER_ARRIVAL_SEC = -60;
 /** 新事件（未显示过的）S 波到达超过此秒数不显示（解决重启 App 误触发） */
 const MAX_PAST_ARRIVAL_FOR_NEW_EVENT_SEC = -60;
 const CANCEL_HIDE_DELAY_MS = 3000;
@@ -70,7 +70,7 @@ interface ActiveEvent {
   userDismissed: boolean;
   /** 倒计时是否已归零 */
   arrived: boolean;
-  /** 该事件的警报是否已停止（归零后 -30 秒） */
+  /** 该事件的警报是否已停止（归零后 -60 秒） */
   alertsStopped: boolean;
 }
 
@@ -142,19 +142,19 @@ function buildActiveEvents(
  * 排序与分组：选出要显示的事件（最多 MAX_DISPLAY_EVENTS 个）
  *
  * 规则（用户决策）：
- * 1. 候选过滤：用户已关闭的不显示；非取消报需 remain > -30（倒计时归零后 30 秒内仍算活跃，让大震独占显示）
+ * 1. 候选过滤：用户已关闭的不显示；非取消报需 remain > -60（倒计时归零后 60 秒内仍算活跃，让大震独占显示）
  * 2. 排序：预警级别降序，同级别按烈度降序
  * 3. 分组：顶级 1 个 + 并列（与顶级同级别）最多 2 个
- * 4. 差 ≥ 1 档的事件被顶级"压制"，等顶级 remain <= -30 后才会成为新顶级显示
+ * 4. 差 ≥ 1 档的事件被顶级"压制"，等顶级 remain <= -60 后才会成为新顶级显示
  * 5. 用户手动关闭顶级 → 顶级被过滤，下一级立即显示
  */
 function selectDisplayEvents(activeEvents: ActiveEvent[]): ActiveEvent[] {
-  // 过滤：用户已关闭的、倒计时归零超过 30 秒的（取消报除外）
+  // 过滤：用户已关闭的、倒计时归零超过 60 秒的（取消报除外）
   const candidates = activeEvents.filter(ae => {
     if (ae.userDismissed) return false;
     if (ae.event.isCancel === true) return true; // 取消报不过滤
     const remain = Math.ceil((ae.arrivalMs - Date.now()) / 1000);
-    // 已显示过的事件（arrived 已标记）：remain > -30 仍算活跃（大震独占显示）
+    // 已显示过的事件（arrived 已标记）：remain > -60 仍算活跃（大震独占显示）
     // 新事件（未显示过）：remain > -60 才显示（S 波到达超过 60 秒的旧事件不显示，解决重启误触发）
     const threshold = ae.arrived
       ? ALERT_CONTINUE_AFTER_ARRIVAL_SEC
@@ -326,7 +326,7 @@ export function useFloatingWindow(
           log('FLOAT', `事件 ${ae.event.id} 地震波已到达`, {});
         }
 
-        // 检查警报是否应停止（所有事件都到 -30 秒）
+        // 检查警报是否应停止（所有事件都到 -60 秒）
         if (!ae.alertsStopped && remain <= ALERT_CONTINUE_AFTER_ARRIVAL_SEC) {
           ae.alertsStopped = true;
           log('FLOAT', `事件 ${ae.event.id} 警报停止`, {});

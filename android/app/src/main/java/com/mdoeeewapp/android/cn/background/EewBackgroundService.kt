@@ -93,7 +93,7 @@ class EewBackgroundService : Service() {
     const val ACTION_TEST_ALERT = "com.mdoeeewapp.android.cn.TEST_ALERT"
 
     /** 倒计时归零后警报继续的秒数（与 JS 层 ALERT_CONTINUE_AFTER_ARRIVAL_SEC 一致） */
-    private const val ALERT_CONTINUE_AFTER_ARRIVAL_SEC = -30
+    private const val ALERT_CONTINUE_AFTER_ARRIVAL_SEC = -60
 
     /** 新事件 S 波到达超过此秒数不处理（解决重启 App 误触发旧事件） */
     private const val MAX_PAST_ARRIVAL_FOR_NEW_EVENT_SEC = -60
@@ -926,17 +926,17 @@ class EewBackgroundService : Service() {
    * 从后台事件队列中选出要显示的事件（按预警级别降序，同级别的并列，最多 3 个）
    *
    * 规则（与 JS 层 selectDisplayEvents 一致，用户决策）：
-   * 1. 候选过滤：用户已关闭的不显示；非取消报需 remainSec > -30（倒计时归零后 30 秒内仍算活跃，让大震独占显示）
+   * 1. 候选过滤：用户已关闭的不显示；非取消报需 remainSec > -60（倒计时归零后 60 秒内仍算活跃，让大震独占显示）
    * 2. 排序：预警级别降序，同级别按烈度降序
    * 3. 分组：顶级 1 个 + 并列（与顶级同级别）最多 2 个
-   * 4. 差 ≥ 1 档的事件被顶级"压制"，等顶级 remainSec <= -30 后才会成为新顶级显示
+   * 4. 差 ≥ 1 档的事件被顶级"压制"，等顶级 remainSec <= -60 后才会成为新顶级显示
    * 5. 用户手动关闭顶级 → 顶级被过滤，下一级立即显示
    */
   private fun selectBackgroundDisplayEvents(): List<BackgroundEvent> {
     val candidates = backgroundEvents.values.filter { bgEvent ->
       val remainSec = ((bgEvent.arrivalMs - System.currentTimeMillis()) / 1000.0).toInt()
-      // remainSec > -30：倒计时归零后 30 秒内仍算活跃，让大震独占显示
-      // 这样小震在此时不会成为候选，直到大震 remainSec <= -30 被过滤掉
+      // remainSec > -60：倒计时归零后 60 秒内仍算活跃，让大震独占显示
+      // 这样小震在此时不会成为候选，直到大震 remainSec <= -60 被过滤掉
       remainSec > ALERT_CONTINUE_AFTER_ARRIVAL_SEC || bgEvent.event.isCancel
     }.toMutableList()
 
@@ -993,7 +993,7 @@ class EewBackgroundService : Service() {
   private var bgFloatingTickRunnable: Runnable? = null
   /** 后台悬浮窗倒计时是否已归零 */
   private var bgFloatingArrived = false
-  /** 后台悬浮窗警报是否已停止（到达后继续响 -30 秒后停止） */
+  /** 后台悬浮窗警报是否已停止（到达后继续响 -60 秒后停止） */
   private var bgFloatingAlertsStopped = false
 
   /**

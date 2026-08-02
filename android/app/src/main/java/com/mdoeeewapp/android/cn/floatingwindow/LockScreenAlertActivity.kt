@@ -75,13 +75,13 @@ class LockScreenAlertActivity : Activity() {
     private const val FLASHLIGHT_INTENSITY_THRESHOLD = 5.0
 
     /**
-     * 地震波到达后警报继续持续的秒数（到 -30 秒停止）
+     * 地震波到达后警报继续持续的秒数（到 -60 秒停止）
      *
      * 规则：倒计时归零（remainSec <= 0）时文字显示"地震波已到达"，
-     * 但声音/震动/闪光灯继续响到 remainSec <= -30 才停止。
+     * 但声音/震动/闪光灯继续响到 remainSec <= -60 才停止。
      * 响完不关闭 Activity，等用户手动关闭。
      */
-    private const val ALERT_CONTINUE_AFTER_ARRIVAL_SEC = -30
+    private const val ALERT_CONTINUE_AFTER_ARRIVAL_SEC = -60
 
     /** 震动振动时长（毫秒），与 DB/T 113.1-2026 警报主音同步 */
     private const val VIBRATE_MS = 2000
@@ -205,7 +205,7 @@ class LockScreenAlertActivity : Activity() {
   @Volatile
   private var alertsStarted = false
 
-  /** 警报是否已停止（所有事件到达后 -30 秒后停止） */
+  /** 警报是否已停止（所有事件到达后 -60 秒后停止） */
   @Volatile
   private var alertsStopped = false
 
@@ -330,7 +330,7 @@ class LockScreenAlertActivity : Activity() {
    * 选择要显示的事件（按预警级别排序，顶级 + 并列同级别，最多 MAX_DISPLAY_EVENTS 个）
    *
    * 规则与 EewBackgroundService.selectBackgroundDisplayEvents 一致：
-   * - 候选过滤：remainSec > -30（倒计时归零后 30 秒内仍算活跃）
+   * - 候选过滤：remainSec > -60（倒计时归零后 60 秒内仍算活跃）
    * - 排序：预警级别降序，同级别按烈度降序
    * - 分组：顶级 1 个 + 并列（与顶级同级别）最多 2 个
    * - 差 ≥ 1 档的事件被顶级压制
@@ -725,7 +725,7 @@ class LockScreenAlertActivity : Activity() {
       }
     }
 
-    // 所有事件都到达且超过 -30 秒 → 停止警报
+    // 所有事件都到达且超过 -60 秒 → 停止警报
     if (!alertsStopped && allStopped && events.isNotEmpty()) {
       alertsStopped = true
       Log.i(TAG, "所有事件警报持续到期，停止声音/震动/闪光灯")
