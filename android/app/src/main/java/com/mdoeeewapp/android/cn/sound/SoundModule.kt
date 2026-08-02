@@ -252,7 +252,13 @@ class SoundModule(
    *
    * - 取消报：["地震预警取消.mp3"]
    * - 归零后：["级别.mp3", "横波已抵达.mp3"]
-   * - 正常倒计时：["级别.mp3", 数字逐位..., "秒后抵达.mp3"]
+   * - 正常倒计时：
+   *   - 整十数（10/20/30...）：["级别.mp3", 中文整十读法..., "秒后抵达.mp3"]
+   *     · 10 → "10.mp3"（十）
+   *     · 20 → "2.mp3" + "10.mp3"（二十）
+   *     · 60 → "6.mp3" + "10.mp3"（六十）
+   *   - 非整十数（如 64/23/15）：["级别.mp3", 数字逐位...]，不加"秒后抵达"
+   *     · 64 → "6.mp3" + "4.mp3"（六四）
    * - remain=0 且未 arrived：["级别.mp3"]（边界情况）
    */
   private fun buildVoiceQueue(): List<String> {
@@ -276,12 +282,25 @@ class SoundModule(
       // 归零后：横波已抵达
       queue.add("横波已抵达.mp3")
     } else if (currentRemainSec > 0) {
-      // 正常倒计时：数字逐位 + 秒后抵达
       val remain = currentRemainSec
-      remain.toString().forEach { ch ->
-        queue.add("$ch.mp3")
+      val isWholeTen = remain % 10 == 0
+
+      if (isWholeTen && remain < 100) {
+        // 整十数（10-90）：中文整十读法 + "秒后抵达"
+        // 10 → "10.mp3"（十）；20 → "2.mp3"+"10.mp3"（二十）；60 → "6.mp3"+"10.mp3"（六十）
+        if (remain == 10) {
+          queue.add("10.mp3")
+        } else {
+          queue.add("${remain / 10}.mp3")
+          queue.add("10.mp3")
+        }
+        queue.add("秒后抵达.mp3")
+      } else {
+        // 非整十数（如 64/23/15）或 100+：数字逐位播报，不加"秒后抵达"
+        remain.toString().forEach { ch ->
+          queue.add("$ch.mp3")
+        }
       }
-      queue.add("秒后抵达.mp3")
     }
     // remain == 0 且未 arrived：仅播级别（边界情况）
 
