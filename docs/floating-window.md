@@ -1046,7 +1046,10 @@ RN 层通过 `BackgroundServiceManager` 将配置同步到原生层：
 数据源（WS/HTTP）收到事件
   ├─ parseWithMapping(raw, fieldMapping) 按 FieldMapping 解析
   ├─ 转发给 JS 层（DeviceEventEmitter.emit('onEewEvent', ...)）
-  ├─ 取消报？ → 跳过悬浮窗（由 JS 层处理显示"地震预警取消"）
+  ├─ 取消报？ → handleCancelEvent：只更新已显示的 UI，不主动弹窗
+  │    ├─ 锁屏 Activity 已显示此事件 → addEvent(isCancel=true)，重启警报循环播报"地震预警取消"
+  │    ├─ 后台悬浮窗已显示此事件 → 更新 backgroundEvents，重启警报循环播报"地震预警取消"
+  │    └─ 事件未在显示中 → 静默处理（不弹窗）
   ├─ App 在前台？ → 跳过悬浮窗（由 JS 层 useFloatingWindow 处理）
   └─ App 在后台 → 检查触发条件 → startLockScreenActivity() → LockScreenAlertActivity
 ```

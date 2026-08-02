@@ -300,6 +300,15 @@ class LockScreenAlertActivity : Activity() {
     mainHandler.post { addEventInternal(event) }
   }
 
+  /**
+   * 检查事件是否已在显示中（供 EewBackgroundService 取消报判断使用）
+   *
+   * 取消报只更新已显示的事件，不主动弹出新悬浮窗。
+   */
+  fun containsEvent(eventId: String): Boolean {
+    return events.containsKey(eventId)
+  }
+
   private val mainHandler = Handler(Looper.getMainLooper())
 
   /**
@@ -308,11 +317,20 @@ class LockScreenAlertActivity : Activity() {
    * 1. 加入 events 列表（同 ID 则更新数据，保留 arrived/alertsStopped 状态）
    * 2. 重新排序、选择要显示的事件（顶级 + 并列）
    * 3. 重建 UI 卡片
+   *
+   * 取消报特殊处理（DB/T 113.1-2026 6.1.4）：
+   * - 取消报只更新已显示的事件，不主动添加新事件（取消报不应弹窗）
+   * - 如果警报已停止（所有事件到 -60 秒），收到取消报时重启警报循环播报"地震预警取消"
    */
   private fun addEventInternal(event: LockScreenEvent) {
     // 用户已手动关闭此事件 → 不再重新添加
     if (dismissedEventIds.contains(event.eventId)) {
       Log.i(TAG, "事件 ${event.eventId} 已被用户关闭，跳过添加")
+      return
+    }
+    // 取消报只更新已存在的事件，不主动添加新事件（取消报不应弹窗）
+    if (event.isCancel && !events.containsKey(event.eventId)) {
+      Log.i(TAG, "取消报：事件 ${event.eventId} 未在显示中，跳过")
       return
     }
     val existing = events[event.eventId]
@@ -321,10 +339,17 @@ class LockScreenAlertActivity : Activity() {
       event.arrived = existing.arrived
       event.alertsStopped = existing.alertsStopped
       events[event.eventId] = event
-      Log.i(TAG, "更新事件: eventId=${event.eventId} mag=${event.magnitude}→${event.magnitude} level=${event.alertLevel} 总数=${events.size}")
+      Log.i(TAG, "更新事件: eventId=${event.eventId} mag=${event.magnitude}→${event.magnitude} level=${event.alertLevel} cancel=${event.isCancel} 总数=${events.size}")
     } else {
       events[event.eventId] = event
       Log.i(TAG, "添加事件: eventId=${event.eventId} mag=${event.magnitude} level=${event.alertLevel} 总数=${events.size}")
+    }
+    // 取消报：如果警报已停止，重新启动（循环播报"地震预警取消"）
+    if (event.isCancel && alertsStopped) {
+      Log.i(TAG, "取消报：警报已停止，重新启动循环播报")
+      alertsStarted = false
+      alertsStopped = false
+      startAlerts()
     }
     refreshDisplay()
   }

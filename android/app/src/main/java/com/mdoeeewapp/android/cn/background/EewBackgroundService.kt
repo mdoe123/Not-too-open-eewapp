@@ -448,12 +448,10 @@ class EewBackgroundService : Service() {
       }
     }
 
-    // 取消报：不触发悬浮窗（JS 层处理显示"地震预警取消"）
+    // 取消报：更新已显示的 UI，不主动弹窗（DB/T 113.1-2026 6.1.4）
+    // 收到取消报后循环播报"地震预警取消"语音，持续 60 秒后自动隐藏
     if (event.isCancel) {
-      // 清理已关闭记录（事件已取消，后续无需再屏蔽）
-      userDismissedEventIds.remove(event.eventId)
-      triggeredEventIds.remove(event.eventId)
-      if (isNewReport) Log.i(TAG, "取消报，不触发悬浮窗")
+      handleCancelEvent(event, config.name)
       return
     }
 
@@ -509,6 +507,81 @@ class EewBackgroundService : Service() {
     if (tryTriggerFloatingWindow(event, config.name)) {
       triggeredEventIds.add(event.eventId)
     }
+  }
+
+  /**
+   * 处理取消报（DB/T 113.1-2026 6.1.4）
+   *
+   * 取消报只更新已显示的 UI（锁屏 Activity / 后台悬浮窗），不主动弹出新悬浮窗。
+   * 收到取消报后循环播报"地震预警取消"语音，持续 60 秒后自动隐藏。
+   *
+   * - 锁屏 Activity 在运行且已显示此事件 → 更新锁屏 UI 为取消状态
+   * - 后台悬浮窗在显示此事件 → 更新后台悬浮窗为取消状态
+   * - 事件未在显示中 → 不弹窗（静默处理）
+   *
+   * @param event 解析后的取消报事件
+   * @param sourceName 数据源名称
+   */
+  private fun handleCancelEvent(event: ParsedCencEvent, sourceName: String?) {
+    // 清理已关闭记录（事件已取消，后续无需再屏蔽）
+    userDismissedEventIds.remove(event.eventId)
+    triggeredEventIds.remove(event.eventId)
+
+    val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    val userLat = prefs.getFloat("userLat", 39.9f).toDouble()
+    val userLng = prefs.getFloat("userLng", 116.4f).toDouble()
+    val distance = EewAlertEngine.haversineDistance(event.lat, event.lng, userLat, userLng)
+    val intensity = EewAlertEngine.calcCsis(event.magnitude, event.depth, distance)
+    val alertLevel = EewAlertEngine.computeAlertLevelByIntensity(intensity)
+    val arrivalMs = EewAlertEngine.computeSWaveArrivalMs(
+      event.originTime, event.lat, event.lng, userLat, userLng
+    )
+
+    // 锁屏 Activity 在运行且已显示此事件 → 更新锁屏
+    if (LockScreenAlertActivity.isRunning() &&
+        LockScreenAlertActivity.instance?.containsEvent(event.eventId) == true) {
+      val eventData = LockScreenAlertActivity.LockScreenEvent(
+        eventId = event.eventId,
+        magnitude = event.magnitude,
+        depth = event.depth,
+        intensity = intensity,
+        distance = distance,
+        location = event.location,
+        alertLevel = alertLevel,
+        originTime = event.originTime,
+        arrivalMs = arrivalMs,
+        reportNum = event.reportNum,
+        sourceName = sourceName,
+        isCancel = true,
+      )
+      LockScreenAlertActivity.instance?.addEvent(eventData)
+      Log.i(TAG, "取消报：更新锁屏事件为取消状态: eventId=${event.eventId}")
+      return
+    }
+
+    // 后台悬浮窗在显示此事件 → 更新后台悬浮窗
+    if (backgroundEvents.containsKey(event.eventId)) {
+      val bgEvent = BackgroundEvent(event, intensity, distance, alertLevel, arrivalMs, sourceName)
+      val old = backgroundEvents[event.eventId]
+      if (old != null) {
+        bgEvent.arrived = old.arrived
+      }
+      bgEvent.cancelAt = System.currentTimeMillis()  // 记录取消报时间，用于 60 秒计时
+      bgEvent.alertsStopped = false  // 重置警报停止状态，让 tick 重新计数 60 秒
+      backgroundEvents[event.eventId] = bgEvent
+
+      // 警报已停止 → 重新启动（循环播报"地震预警取消"）
+      if (bgFloatingAlertsStopped) {
+        bgFloatingAlertsStopped = false
+        triggerAlertsFromBackground(bgEvent)
+      }
+      refreshBackgroundFloatingWindows()
+      Log.i(TAG, "取消报：更新后台悬浮窗事件为取消状态: eventId=${event.eventId}")
+      return
+    }
+
+    // 事件未在显示中 → 不弹窗
+    Log.i(TAG, "取消报：事件 ${event.eventId} 未在显示中，不弹窗")
   }
 
   /**
@@ -929,18 +1002,26 @@ class EewBackgroundService : Service() {
    * 从后台事件队列中选出要显示的事件（按预警级别降序，同级别的并列，最多 3 个）
    *
    * 规则（与 JS 层 selectDisplayEvents 一致，用户决策）：
-   * 1. 候选过滤：用户已关闭的不显示；非取消报需 remainSec > -60（倒计时归零后 60 秒内仍算活跃，让大震独占显示）
+   * 1. 候选过滤：
+   *    - 非取消报需 remainSec > -60（倒计时归零后 60 秒内仍算活跃，让大震独占显示）
+   *    - 取消报需收到后 60 秒内（DB/T 113.1-2026 6.1.4：循环播报 60 秒）
    * 2. 排序：预警级别降序，同级别按烈度降序
    * 3. 分组：顶级 1 个 + 并列（与顶级同级别）最多 2 个
    * 4. 差 ≥ 1 档的事件被顶级"压制"，等顶级 remainSec <= -60 后才会成为新顶级显示
    * 5. 用户手动关闭顶级 → 顶级被过滤，下一级立即显示
    */
   private fun selectBackgroundDisplayEvents(): List<BackgroundEvent> {
+    val now = System.currentTimeMillis()
     val candidates = backgroundEvents.values.filter { bgEvent ->
-      val remainSec = ((bgEvent.arrivalMs - System.currentTimeMillis()) / 1000.0).toInt()
-      // remainSec > -60：倒计时归零后 60 秒内仍算活跃，让大震独占显示
-      // 这样小震在此时不会成为候选，直到大震 remainSec <= -60 被过滤掉
-      remainSec > ALERT_CONTINUE_AFTER_ARRIVAL_SEC || bgEvent.event.isCancel
+      if (bgEvent.event.isCancel) {
+        // 取消报：收到后 60 秒内仍显示
+        bgEvent.cancelAt > 0 && now - bgEvent.cancelAt < 60_000L
+      } else {
+        // remainSec > -60：倒计时归零后 60 秒内仍算活跃，让大震独占显示
+        // 这样小震在此时不会成为候选，直到大震 remainSec <= -60 被过滤掉
+        val remainSec = ((bgEvent.arrivalMs - now) / 1000.0).toInt()
+        remainSec > ALERT_CONTINUE_AFTER_ARRIVAL_SEC
+      }
     }.toMutableList()
 
     if (candidates.isEmpty()) return emptyList()
@@ -1015,6 +1096,8 @@ class EewBackgroundService : Service() {
     val sourceName: String? = null,
     var arrived: Boolean = false,
     var alertsStopped: Boolean = false,
+    /** 收到取消报的时间戳（0 表示非取消报），用于取消报 60 秒计时 */
+    var cancelAt: Long = 0L,
   )
   private val backgroundEvents: MutableMap<String, BackgroundEvent> = LinkedHashMap()
 
@@ -1059,16 +1142,25 @@ class EewBackgroundService : Service() {
         for (bgEvent in backgroundEvents.values) {
           val remainSec = ((bgEvent.arrivalMs - now) / 1000.0).toInt()
 
-          // 标记归零
-          if (!bgEvent.arrived && remainSec <= 0) {
+          // 标记归零（取消报不标记 arrived，走独立计时）
+          if (!bgEvent.arrived && !bgEvent.event.isCancel && remainSec <= 0) {
             bgEvent.arrived = true
             Log.i(TAG, "后台事件 ${bgEvent.event.eventId} 地震波已到达")
           }
 
           // 检查警报是否应停止
-          if (!bgEvent.alertsStopped && remainSec <= ALERT_CONTINUE_AFTER_ARRIVAL_SEC) {
-            bgEvent.alertsStopped = true
-            Log.i(TAG, "后台事件 ${bgEvent.event.eventId} 警报停止")
+          if (!bgEvent.alertsStopped) {
+            val shouldStop = if (bgEvent.event.isCancel) {
+              // 取消报：收到后 60 秒停止（DB/T 113.1-2026 6.1.4）
+              bgEvent.cancelAt > 0 && now - bgEvent.cancelAt >= 60_000L
+            } else {
+              // 非取消报：倒计时到 -60 秒停止
+              remainSec <= ALERT_CONTINUE_AFTER_ARRIVAL_SEC
+            }
+            if (shouldStop) {
+              bgEvent.alertsStopped = true
+              Log.i(TAG, "后台事件 ${bgEvent.event.eventId} 警报停止 (cancel=${bgEvent.event.isCancel})")
+            }
           }
           if (!bgEvent.alertsStopped) {
             allAlertsShouldStop = false
