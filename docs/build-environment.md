@@ -169,45 +169,66 @@ yarn android
 
 ### 短路径构建（必读）
 
-**必须从短路径 `D:\eew\android` 构建_release APK，不能从原始路径 `D:\xiangmu\eewapp\android-eew-app\android` 构建**。
+**必须从短路径构建 release APK，不能从原始路径 `D:\xiangmu\eewapp\android-eew-app\android` 构建**。
 
-`D:\eew` 是指向 `D:\xiangmu\eewapp\android-eew-app` 的 NTFS Junction，用于绕过 Windows MAX_PATH（260 字符）限制：
-
-```powershell
-# 正确：从短路径构建（release）
-cd D:\eew\android
-.\gradlew.bat assembleRelease --no-daemon
-
-# 错误：从原始路径构建会失败
-cd D:\xiangmu\eewapp\android-eew-app\android
-.\gradlew.bat assembleRelease --no-daemon  # CMake ninja 会因路径过长 mkdir 失败
-```
-
-**失败现象**：从原始路径构建时，CMake ninja 在编译 `react-native-gesture-handler` 的 codegen 产物时报错：
+原因：Windows MAX_PATH（260 字符）限制。从原始路径构建时，CMake ninja 在编译
+`react-native-gesture-handler` 的 codegen 产物时报错：
 
 ```
-ninja: error: mkdir(rngesturehandler_codegen_autolinked_build/CMakeFiles/...
+ninja: error: Stat(rngesturehandler_codegen_autolinked_build/CMakeFiles/...
   react_codegen_rngesturehandler_codegen.dir/D_/xiangmu/eewapp/android-eew-app/
-  node_modules/react-native-gesture-handler/shared/shadowNodes/react/renderer):
-  No such file or directory
+  node_modules/react-native-gesture-handler/shared/shadowNodes/...): Filename longer than 260 characters
 ```
 
-这是因为 codegen 生成的 CMake 目标路径超过 260 字符，ninja 无法创建目录。
+codegen 生成的 CMake 对象文件路径超过 260 字符，ninja 无法创建。
+（debug 构建目录名 `Debug` 比 `RelWithDebInfo` 短 5 个字符，刚好压线能过，所以只有 release 失败。）
 
-**清理 CMake 缓存**：若曾从原始路径构建失败，需清理缓存后再从短路径构建：
+**推荐方案：robocopy 真实复制到短路径构建（v1.0.4 实测通过）**
 
 ```powershell
-Remove-Item -Recurse -Force "D:\eew\android\app\.cxx" -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force "D:\eew\android\app\build" -ErrorAction SilentlyContinue
+# 1. 复制项目到 C:\eewapp（排除缓存与构建产物，约 3GB、1 分钟）
+robocopy D:\xiangmu\eewapp\android-eew-app C:\eewapp /E /MT:16 /R:1 /W:1 `
+  /XD .cxx .gradle `
+  /XF NTOEEW-*.apk build.log test.log
+
+# 2. 从短路径构建 release
+$env:JAVA_HOME="C:\Program Files\Zulu\zulu-17"
+cd C:\eewapp\android
+.\gradlew.bat assembleRelease --console=plain
+
+# 3. 产物在 C:\eewapp\android\app\build\outputs\apk\release\
+#    复制回仓库根目录并按规范命名
+Copy-Item C:\eewapp\android\app\build\outputs\apk\release\app-arm64-v8a-release.apk `
+  D:\xiangmu\eewapp\android-eew-app\NTOEEW-v1.0.X-arm64-v8a-release.apk
+
+# 4. 构建完成后可删除临时目录（约 6GB）
+Remove-Item -Recurse -Force C:\eewapp
 ```
+
+**为什么不建议用 NTFS Junction（mklink /J）**：junction 指向同一物理目录，
+node_modules 内的 gradle-plugin 构建产物会被 IDE/监视进程句柄锁定，
+`Unable to delete directory ... Failed to delete some children` 导致构建失败，
+且停守护进程也无法解锁（曾用 `D:\eew` junction 验证失败）。
+
+**疑难排查**：
+- `Cannot create directory '.gradle\9.3.1\fileHashes'` / `拒绝访问`：
+  通常是上次失败构建的 Gradle 守护进程残留锁，`.\gradlew.bat --stop` 后重试；
+  若 `.gradle` 空目录仍删不掉（被监视句柄占用），改名即可解锁：
+  `Rename-Item C:\eewapp\android\.gradle _dead` 然后直接重新构建。
+- 首次全新构建约 5-8 分钟（含 C++ 编译）。
+
+**版本号与产物命名**：发版前同步修改 `package.json` 的 `version` 和
+`android/app/build.gradle` 的 `versionCode`（+1）/`versionName`，产物命名
+`NTOEEW-v{版本}-{abi}-release.apk`。可用 aapt 校验：
+`aapt dump badging xxx.apk | Select-String package:`
 
 ### 构建产物
 
-Release 构建生成两个 ABI 独立 APK：
+Release 构建生成两个 ABI 独立 APK（位于短路径构建目录下）：
 
 ```
-D:\eew\android\app\build\outputs\apk\release\
-├── app-arm64-v8a-release.apk      # 64 位 ARM（现代设备，~26MB）
+<短路径>\android\app\build\outputs\apk\release\
+├── app-arm64-v8a-release.apk      # 64 位 ARM（现代设备，~25MB）
 └── app-armeabi-v7a-release.apk    # 32 位 ARM（老旧设备，~20MB）
 ```
 
@@ -215,7 +236,7 @@ D:\eew\android\app\build\outputs\apk\release\
 
 ```powershell
 $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
-& $adb install -r "D:\eew\android\app\build\outputs\apk\release\app-arm64-v8a-release.apk"
+& $adb install -r "D:\xiangmu\eewapp\android-eew-app\NTOEEW-v1.0.4-arm64-v8a-release.apk"
 ```
 
 > `adb` 不在系统 PATH 中，需用完整路径或先 `cd` 到 platform-tools 目录。
