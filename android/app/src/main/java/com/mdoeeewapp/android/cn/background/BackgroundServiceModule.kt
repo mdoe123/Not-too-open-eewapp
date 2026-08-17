@@ -48,7 +48,9 @@ class BackgroundServiceModule(
    */
   @ReactMethod
   fun start() {
+    // 显式标记：用户正常打开 App 启动（非开机广播），服务首启按"前台"处理
     val intent = Intent(reactContext, EewBackgroundService::class.java)
+      .putExtra(EewBackgroundService.EXTRA_FROM_BOOT, false)
     // minSdkVersion = 26，直接使用 startForegroundService
     reactContext.startForegroundService(intent)
   }
@@ -146,7 +148,7 @@ class BackgroundServiceModule(
    * 直接写入 SharedPreferences，不依赖 Service 实例是否存活。
    * 后台服务在计算震中距/烈度时从 SharedPreferences 读取最新坐标。
    *
-   * @param locationMap 包含字段：userLat, userLng
+   * @param locationMap 包含字段：userLat, userLng, mode（"gps"/"manual"，可选）
    */
   @ReactMethod
   fun updateLocation(locationMap: ReadableMap) {
@@ -162,10 +164,44 @@ class BackgroundServiceModule(
         lng = locationMap.getDouble("userLng")
         prefs.putFloat("userLng", lng.toFloat())
       }
+      if (locationMap.hasKey("mode")) {
+        prefs.putString("locationMode", locationMap.getString("mode"))
+      }
+      // 写入坐标更新时间戳，供后台服务判断位置是否陈旧
+      prefs.putLong("userLocTimestamp", System.currentTimeMillis())
       prefs.apply()
-      Log.i(TAG, "位置配置已写入 SharedPreferences: lat=$lat, lng=$lng")
+      Log.i(TAG, "位置配置已写入 SharedPreferences: lat=$lat, lng=$lng mode=${locationMap.getString("mode")}")
     } catch (e: Exception) {
       Log.e(TAG, "updateLocation 失败: ${e.message}")
+    }
+  }
+
+  /**
+   * 主动触发一次原生定位刷新（由 RN 层调用）
+   *
+   * 使用 Android LocationManager 获取定位，成功后把最新坐标写回 SharedPreferences，
+   * 供后台服务在自启动后使用新鲜坐标。仅 GPS 模式生效，手动模式忽略。
+   */
+  @ReactMethod
+  fun refreshLocation() {
+    try {
+      val prefs = reactContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+      // 手动模式不参与原生定位刷新
+      if (prefs.getString("locationMode", "") != "gps") {
+        Log.d(TAG, "refreshLocation: 非 GPS 模式，忽略")
+        return
+      }
+      val provider = LocationProvider(reactContext)
+      provider.getCurrentLocation { lat, lng ->
+        reactContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+          .putFloat("userLat", lat.toFloat())
+          .putFloat("userLng", lng.toFloat())
+          .putLong("userLocTimestamp", System.currentTimeMillis())
+          .apply()
+        Log.i(TAG, "refreshLocation 成功写回坐标: lat=$lat, lng=$lng")
+      }
+    } catch (e: Exception) {
+      Log.e(TAG, "refreshLocation 失败: ${e.message}")
     }
   }
 

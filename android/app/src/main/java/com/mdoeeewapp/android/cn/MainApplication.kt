@@ -8,6 +8,7 @@ import com.mdoeeewapp.android.cn.flashlight.FlashlightPackage
 import com.mdoeeewapp.android.cn.sound.SoundPackage
 import com.mdoeeewapp.android.cn.vibrator.VibratorPackage
 import com.mdoeeewapp.android.cn.permission.PermissionPackage
+import com.mdoeeewapp.android.cn.restart.AppRestartPackage
 import com.facebook.react.PackageList
 import com.facebook.react.ReactApplication
 import com.facebook.react.ReactHost
@@ -30,6 +31,7 @@ class MainApplication : Application(), ReactApplication {
           add(SoundPackage())
           add(VibratorPackage())
           add(PermissionPackage())
+          add(AppRestartPackage())
         },
     )
   }

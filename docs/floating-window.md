@@ -169,6 +169,19 @@ HomeScreen (useEffect)
 
 > allowHttp 同步：`config.allowHttp` 变化时通过 `BackgroundServiceManager.updateAllowHttp()` 同步到原生层 SharedPreferences，并触发 `reloadCustomSources()` 重连所有源（开关关闭时非 localhost 的 HTTP 源会被拒绝连接）。
 
+### 数据源启用态变更 → 需重启生效 + 应用自重启
+
+> **背景**：`useConfig` 各页面状态彼此独立（无全局共享 Provider），设置页改动的数据源不会实时同步到 `HomeScreen` 的 `config` / `useEewStream` / 后台服务。若在设置页启用数据源直接返回首页，数据源**不会**实时启用，需完全重启软件（HomeScreen 重新从 AsyncStorage 读取配置并重连）。
+
+为此引入「提醒 + 自动重启」机制（连接级配置需重启，属于已知限制）：
+
+- 判定采用「挂载快照 + 离开对比」：进入设置页待配置加载完成（`ready`）后，对所有**启用源**拍一次「连接级签名」快照（`endpoint/protocol/pollIntervalMs/category/priority/fieldMapping/authToken/wsAuthMessage` 序列化）。`SettingsScreen` 监听 `navigation` 的 `beforeRemove` 事件，离开时对比当前签名与快照，不同才弹窗。该方案可正确覆盖：启用/关闭源、增删源、编辑 endpoint/协议/字段映射/鉴权/轮询间隔/优先级、重置配置；开关切回原状则不误报。
+- 用户点「立即重启」→ 先调用 `useConfig.flush()`（绕过 300ms debounce 立即把最新配置落盘到 AsyncStorage，`configRef` 经 useLayoutEffect 同步保证读到最新值），再调用 `AppRestartManager.restart()`。
+- `AppRestartModule`（原生）以 `NEW_TASK | CLEAR_TASK` 重新拉起 MainActivity，延迟约 250ms 后 `Runtime.exit(0)` 结束进程，触发完整重载（JS 重新挂载 HomeScreen + 原生模块重初始化）；重启后 HomeScreen 读到最新配置并触发 `updateCustomSources` → 原生 `reloadCustomSources()` 重连数据源。
+- 点「稍后」则 `navigation.dispatch(e.data.action)` 放行离开，需用户手动重开软件后生效。
+
+**已知边界**（记录备查）：改动后若从「关于/模拟预警」页直接 Home 键退出（设置页未 pop），`beforeRemove` 不触发、无提示；极短窗口（<300ms）内「稍后」离开可能因 debounce 定时器被卸载清除而丢失写入（既有 P1-18 模式固有）；重启后 `authToken` 不持久化（安全设计 `stripApiKeys`），需重新输入鉴权信息。
+
 **触发条件**（必须全部满足，在 `EewBackgroundService.tryTriggerFloatingWindow()` 中检查）：
 1. **屏幕开关检查（按屏幕状态分别判断）**：
    - 屏幕已锁屏时：要求 `alert.lockScreenEnabled == true`（否则跳过，不触发锁屏预警）

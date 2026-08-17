@@ -37,7 +37,10 @@ class BootReceiver : BroadcastReceiver() {
 
     // 启动后台保活服务（EewBackgroundService）
     // 注意：minSdkVersion = 26（Android O），可直接使用 startForegroundService
+    // 附加 EXTRA_FROM_BOOT 标记，让服务首启以"非前台"运行（App 未打开、无 JS 线程），
+    // 由原生层直接接管预警触发，避免误判 JS 存活导致开机场景事件被丢弃。
     val serviceIntent = Intent(context, EewBackgroundService::class.java)
+      .putExtra(EewBackgroundService.EXTRA_FROM_BOOT, true)
     context.startForegroundService(serviceIntent)
     // 不启动主界面 Activity（静默启动）
   }

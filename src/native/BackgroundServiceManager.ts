@@ -19,7 +19,7 @@ interface BackgroundServiceModuleType {
   /** 更新 alert 配置到原生层（SharedPreferences） */
   updateConfig(alertConfig: AlertConfig): void;
   /** 更新用户位置到原生层（SharedPreferences） */
-  updateLocation(location: {userLat: number; userLng: number}): void;
+  updateLocation(location: {userLat: number; userLng: number; mode: string}): void;
   /** 通知后台服务 App 已回到前台（AppState active 时调用） */
   notifyAppInForeground(): void;
   /** 通知后台服务 App 已进入后台（AppState background/inactive 时调用） */
@@ -48,6 +48,13 @@ interface BackgroundServiceModuleType {
    * 开关变化后会触发后台服务重连所有数据源。
    */
   updateAllowHttp(allowHttp: boolean): void;
+  /**
+   * 主动触发一次原生定位刷新（供 JS 进入前台时同步最新位置）
+   *
+   * 原生层使用 Android LocationManager 获取定位，成功后写回 SharedPreferences。
+   * 仅 GPS 模式下生效；手动模式下忽略。
+   */
+  refreshLocation(): void;
   /**
    * 触发测试预警（绕过 WebSocket + 前后台检查，直接走悬浮窗触发路径）
    * @param magnitude 震级
@@ -136,7 +143,7 @@ export const BackgroundServiceManager = {
    *
    * @param location 用户当前位置坐标（userLat, userLng）
    */
-  updateLocation(location: {userLat: number; userLng: number}): void {
+  updateLocation(location: {userLat: number; userLng: number; mode: string}): void {
     if (Platform.OS !== 'android') return;
     try {
       BackgroundServiceModule?.updateLocation(location);
@@ -253,6 +260,21 @@ export const BackgroundServiceManager = {
   },
 
   /**
+   * 主动触发一次原生定位刷新
+   *
+   * 供 JS 在 App 回到前台（AppState active）时调用，让原生层用最新 GPS 坐标刷新缓存，
+   * 避免自启动后后台使用陈旧坐标。
+   */
+  refreshLocation(): void {
+    if (Platform.OS !== 'android') return;
+    try {
+      BackgroundServiceModule?.refreshLocation();
+    } catch {
+      // 忽略同步异常
+    }
+  },
+
+  /**
    * 触发锁屏预警测试
    *
    * 绕过 WebSocket + 前后台检查，直接走原生层悬浮窗触发路径。
@@ -305,9 +327,17 @@ export const BackgroundServiceManager = {
 export function buildLocationUpdate(
   locationConfig: LocationConfig,
   userLocation: {lat: number; lng: number},
-): {userLat: number; userLng: number} {
+): {userLat: number; userLng: number; mode: string} {
   if (locationConfig.mode === 'manual') {
-    return {userLat: locationConfig.manualLat, userLng: locationConfig.manualLng};
+    return {
+      userLat: locationConfig.manualLat,
+      userLng: locationConfig.manualLng,
+      mode: 'manual',
+    };
   }
-  return {userLat: userLocation.lat, userLng: userLocation.lng};
+  return {
+    userLat: userLocation.lat,
+    userLng: userLocation.lng,
+    mode: 'gps',
+  };
 }

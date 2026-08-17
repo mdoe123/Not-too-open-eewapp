@@ -3,7 +3,7 @@
 // 使用 useConfig 持久化到 AsyncStorage，黑白简约风格，支持亮暗模式
 // 四组配置使用 CollapsibleSection 包裹，眼睛图标展开/收起；模拟预警为独立导航卡片
 
-import React, {useCallback} from 'react';
+import React, {useCallback, useEffect, useRef} from 'react';
 import {
   StyleSheet,
   View,
@@ -24,7 +24,36 @@ import {LocationSection} from '../components/settings/LocationSection';
 import {DebugSection} from '../components/settings/DebugSection';
 import {CollapsibleSection} from '../components/settings/CollapsibleSection';
 import {ResetIcon, ChevronRightIcon} from '../components/icons/SettingsIcons';
+import {AppRestartManager} from '../native/AppRestartManager';
 import type {SettingsScreenProps} from '../navigation/types';
+import type {SourceConfig} from '../types';
+
+/**
+ * 生成单个数据源的「连接级签名」
+ *
+ * 覆盖所有需重启才能生效的连接级字段：
+ * endpoint/protocol/pollIntervalMs/category/priority/fieldMapping/鉴权信息。
+ * 首页/流/后台服务运行时不会感知这些字段的变化，重启后才会按新值重连。
+ */
+function connectionSignature(s: SourceConfig): string {
+  return JSON.stringify([
+    (s.endpoint ?? '').toLowerCase(),
+    s.protocol,
+    s.pollIntervalMs,
+    s.category,
+    s.priority,
+    s.fieldMapping,
+    s.authToken,
+    s.wsAuthMessage,
+  ]);
+}
+
+/** 计算所有启用源的连接级签名集合（未启用的源不参与连接，不纳入） */
+function connectionSignatures(sources: SourceConfig[]): Set<string> {
+  return new Set(
+    sources.filter(s => s.enabled).map(connectionSignature),
+  );
+}
 
 /**
  * 设置页面
@@ -33,7 +62,18 @@ import type {SettingsScreenProps} from '../navigation/types';
 export default function SettingsScreen({navigation}: SettingsScreenProps) {
   const isDark = useColorScheme() === 'dark';
   const colors = getColors(isDark);
-  const {config, updateAlert, updateSources, updateLocation, updateDebug, updateNetwork, resetConfig} = useConfig();
+  const {config, ready, updateAlert, updateSources, updateLocation, updateDebug, updateNetwork, resetConfig, flush} = useConfig();
+
+  // 进入设置页时的「连接级签名」快照（null = 配置尚未加载完成，基准未建立）
+  // 加载完成（ready）后只快照一次；离开页面时与当前签名对比，不同才提示重启
+  const initialSignaturesRef = useRef<Set<string> | null>(null);
+
+  // 建立快照基准：等配置从 AsyncStorage 加载完成后再拍，避免拍到默认值造成误报
+  useEffect(() => {
+    if (ready && initialSignaturesRef.current === null) {
+      initialSignaturesRef.current = connectionSignatures(config.sources);
+    }
+  }, [ready, config.sources]);
 
   /** 重置配置（Alert 二次确认，避免误触） */
   const handleReset = useCallback(() => {
@@ -73,6 +113,48 @@ export default function SettingsScreen({navigation}: SettingsScreenProps) {
     (allowHttp: boolean) => updateNetwork({allowHttp}),
     [updateNetwork],
   );
+
+  // 离开设置页时，对比「连接级签名」快照：有变化则弹窗提醒重启
+  // 覆盖：启用/关闭源、增删源、编辑 endpoint/协议/映射/鉴权/轮询间隔/优先级、重置配置
+  // 用 beforeRemove 拦截返回/导航离开，避免在开关切换时频繁打扰用户
+  useEffect(() => {
+    const unsubscribe = navigation.addListener('beforeRemove', e => {
+      const initial = initialSignaturesRef.current;
+      // 基准未建立（配置未加载完）或签名无变化 → 正常离开
+      if (initial === null) {
+        return;
+      }
+      const current = connectionSignatures(config.sources);
+      const unchanged =
+        initial.size === current.size &&
+        Array.from(initial).every(key => current.has(key));
+      if (unchanged) {
+        return;
+      }
+      e.preventDefault();
+      Alert.alert(
+        '重启软件生效',
+        '已更改数据源配置，需重启软件后才能开始/停止接收这些源的数据。',
+        [
+          {
+            text: '稍后',
+            style: 'cancel',
+            onPress: () => navigation.dispatch(e.data.action),
+          },
+          {
+            text: '立即重启',
+            onPress: async () => {
+              // 先确保最新配置已落盘（绕过 debounce），再触发自重启
+              await flush();
+              AppRestartManager.restart();
+            },
+          },
+        ],
+        {cancelable: true},
+      );
+    });
+    return unsubscribe;
+  }, [navigation, flush, config.sources]);
 
   return (
     <SafeAreaView

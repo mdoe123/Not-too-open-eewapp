@@ -101,17 +101,30 @@ class EewBackgroundService : Service() {
     /** 前台心跳超时（毫秒），超过此时间未收到 JS 心跳则认为 JS 线程已死 */
     private const val FOREGROUND_HEARTBEAT_TIMEOUT_MS = 3_000L
 
+    /** Intent extra：服务由开机广播拉起（BootReceiver），启动时 App 未打开、无 JS 线程 */
+    const val EXTRA_FROM_BOOT = "from_boot"
+
     /** 并列事件与顶级事件的最大级别差（0 = 同级别才算并列，差 ≥ 1 档算大小关系） */
     private const val PEER_LEVEL_MAX_DIFF = 0
 
     /** 最大同时显示的悬浮窗数量 */
     private const val MAX_DISPLAY_EVENTS = 3
 
+    /**
+     * 后台定位轮询间隔（毫秒）：15 分钟
+     *
+     * 仅 GPS 模式生效，用于对抗后台/自启动时位置坐标陈旧，保持后台计算震中距/烈度使用近期的用户位置。
+     */
+    private const val LOCATION_REFRESH_INTERVAL_MS = 15 * 60 * 1000L
+
     /** 去重 key 集合容量上限（覆盖多源并行 + eqlist 列表场景） */
     private const val MAX_DEDUP_KEYS = 200
 
     /** 启动幂等标志，防止重复触发 startForeground */
     private val started = AtomicBoolean(false)
+
+    /** 前台状态是否已完成首次初始化（依据启动来源：开机广播 / 系统 START_STICKY / 用户正常打开 App） */
+    private val foregroundInited = AtomicBoolean(false)
 
     /**
      * 当前 App 是否在前台
@@ -141,6 +154,12 @@ class EewBackgroundService : Service() {
 
   /** 主线程 Handler */
   private val mainHandler = Handler(Looper.getMainLooper())
+
+  /** 原生定位封装（后台 15 分钟轮询 + 预警触发后异步刷新） */
+  private val locationProvider = LocationProvider(this)
+
+  /** 后台定位轮询任务（复用 mainHandler，仅 GPS 模式生效） */
+  private var locationRefreshRunnable: Runnable? = null
 
   /** OkHttpClient（懒加载，第一次连接时初始化，所有源共享） */
   private var httpClient: OkHttpClient? = null
@@ -229,10 +248,19 @@ class EewBackgroundService : Service() {
         // 忽略重复 startForeground 异常
       }
     }
-    // 初始化前台心跳时间戳（避免刚启动时因心跳为 0 被误判为超时）
-    lastForegroundHeartbeatMs = System.currentTimeMillis()
+    // 首次启动时根据启动来源初始化前台状态
+    if (foregroundInited.compareAndSet(false, true)) {
+      // intent == null：系统 START_STICKY 重建（进程刚重启、通常无 UI），视同非前台
+      // BootReceiver 从开机广播拉起：App 未打开、无 JS 线程，视同非前台，由原生层接管
+      val fromBoot = intent?.getBooleanExtra(EXTRA_FROM_BOOT, false) == true
+      appInForeground = !fromBoot && intent != null
+      lastForegroundHeartbeatMs = if (appInForeground) System.currentTimeMillis() else 0L
+      Log.i(TAG, "前台状态初始化: appInForeground=$appInForeground fromBoot=$fromBoot")
+    }
     // 读取 customSource 配置列表并启动所有连接
     reloadCustomSources()
+    // 启动后台定位轮询（仅 GPS 模式生效，对抗后台/自启动时位置陈旧）
+    startLocationPolling()
     return START_STICKY
   }
 
@@ -242,6 +270,7 @@ class EewBackgroundService : Service() {
 
   override fun onDestroy() {
     Log.i(TAG, "EewBackgroundService onDestroy")
+    stopLocationPolling()
     stopConnection()
     stopBackgroundFloatingWindowTick()
     stopAlertsFromBackground()
@@ -506,6 +535,8 @@ class EewBackgroundService : Service() {
     Log.i(TAG, "App 在后台，开始检查触发条件: appInForeground=$appInForeground eventId=${event.eventId}")
     if (tryTriggerFloatingWindow(event, config.name)) {
       triggeredEventIds.add(event.eventId)
+      // 已用缓存坐标触发（低延迟），触发成功后异步刷新定位并用最新坐标更新已显示预警（仅 GPS 模式）
+      refreshLocationAndUpdateEvent(event, config.name)
     }
   }
 
@@ -662,6 +693,67 @@ class EewBackgroundService : Service() {
     // → 添加到后台悬浮窗队列并显示
     Log.i(TAG, "事件 ${event.eventId} 未在任何显示中，添加到后台悬浮窗: intensity=$intensity level=$alertLevel")
     showFloatingWindowFromBackground(event, intensity, distance, alertLevel, arrivalMs, sourceName)
+  }
+
+  // ======================== 后台定位刷新 ========================
+
+  /** 写回用户位置到 SharedPreferences 并刷新时间戳 */
+  private fun writeUserLocation(lat: Double, lng: Double) {
+    getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+      .putFloat("userLat", lat.toFloat())
+      .putFloat("userLng", lng.toFloat())
+      .putLong("userLocTimestamp", System.currentTimeMillis())
+      .apply()
+  }
+
+  /**
+   * 启动后台定位轮询（每 15 分钟，仅 GPS 模式生效；手动模式不参与）
+   *
+   * 用于对抗自启动/后台时位置坐标陈旧，保持后台计算震中距/烈度使用近期的用户位置。
+   */
+  private fun startLocationPolling() {
+    if (locationRefreshRunnable != null) return
+    val runnable = object : Runnable {
+      override fun run() {
+        try {
+          val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+          if (prefs.getString("locationMode", "") == "gps") {
+            locationProvider.getCurrentLocation { lat, lng ->
+              writeUserLocation(lat, lng)
+              Log.i(TAG, "后台定位轮询刷新坐标: lat=$lat, lng=$lng")
+            }
+          }
+        } catch (e: Exception) {
+          Log.w(TAG, "后台定位轮询异常: ${e.message}")
+        }
+        mainHandler.postDelayed(this, LOCATION_REFRESH_INTERVAL_MS)
+      }
+    }
+    locationRefreshRunnable = runnable
+    mainHandler.postDelayed(runnable, LOCATION_REFRESH_INTERVAL_MS)
+    Log.i(TAG, "后台定位轮询已启动（每 15 分钟，仅 GPS 模式）")
+  }
+
+  /** 停止后台定位轮询 */
+  private fun stopLocationPolling() {
+    locationRefreshRunnable?.let { mainHandler.removeCallbacks(it) }
+    locationRefreshRunnable = null
+  }
+
+  /**
+   * 已用缓存坐标触发预警后，异步刷新定位并用最新坐标更新已显示预警（仅 GPS 模式）
+   *
+   * 保证预警低延迟（先用缓存触发），随后用新鲜坐标重算震中距/烈度并刷新已显示 UI。
+   * 手动模式下跳过（手动坐标固定、无需刷新）。
+   */
+  private fun refreshLocationAndUpdateEvent(event: ParsedCencEvent, sourceName: String?) {
+    val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    if (prefs.getString("locationMode", "") != "gps") return
+    locationProvider.getCurrentLocation { lat, lng ->
+      writeUserLocation(lat, lng)
+      Log.i(TAG, "预警触发后定位刷新成功: lat=$lat, lng=$lng eventId=${event.eventId}")
+      updateDisplayedEvent(event, sourceName)
+    }
   }
 
   /**

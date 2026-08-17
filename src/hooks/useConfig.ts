@@ -10,7 +10,7 @@
 // - 不在 setConfig updater 内执行 AsyncStorage.setItem 副作用（反模式）
 // - 用 useEffect 监听 config 变化，debounce 300ms 后写入，避免高频写入竞态
 // - 多次快速更新只产生一次写入，写入的是最新值
-import {useCallback, useEffect, useRef, useState} from 'react';
+import {useCallback, useEffect, useLayoutEffect, useRef, useState} from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   AlertConfig,
@@ -183,6 +183,8 @@ export interface UseConfigResult {
   updateNetwork: (partial: Partial<Pick<AppConfig, 'allowHttp'>>) => void;
   /** 重置为默认配置 */
   resetConfig: () => void;
+  /** 立即将当前配置写入 AsyncStorage（绕过 debounce），返回写入完成 */
+  flush: () => Promise<void>;
 }
 
 /**
@@ -198,6 +200,13 @@ export function useConfig(): UseConfigResult {
   const [ready, setReady] = useState(false);
   // 标记是否已加载完成，避免加载期间的 config 变化触发写入
   const loadedRef = useRef(false);
+  // 始终指向最新 config 的引用，供 flush() 在异步回调（如 Alert onPress）中读取当前值
+  const configRef = useRef<AppConfig>(DEFAULT_CONFIG);
+
+  // 同步最新 config 到 configRef（layout 阶段执行，flush 在异步回调中立即可读最新值）
+  useLayoutEffect(() => {
+    configRef.current = config;
+  }, [config]);
 
   // 初次加载：读取并合并配置
   useEffect(() => {
@@ -288,5 +297,20 @@ export function useConfig(): UseConfigResult {
     setConfig({...DEFAULT_CONFIG});
   }, []);
 
-  return {config, ready, updateAlert, updateSources, updateLocation, updateDebug, updateNetwork, resetConfig};
+  /**
+   * 立即将最新配置写入 AsyncStorage（绕过 300ms debounce），返回写入完成
+   *
+   * 用于「重启生效」类场景：调用应用自重启前先 flush，确保重启后
+   * HomeScreen 从 AsyncStorage 读到的配置已包含本次改动，避免重启丢失。
+   */
+  const flush = useCallback(async () => {
+    try {
+      const safe = stripApiKeys(configRef.current);
+      await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(safe));
+    } catch {
+      // 写入失败忽略：下次 debounce 写入或重启后的读操作会兜底
+    }
+  }, []);
+
+  return {config, ready, updateAlert, updateSources, updateLocation, updateDebug, updateNetwork, resetConfig, flush};
 }

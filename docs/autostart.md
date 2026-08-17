@@ -48,9 +48,18 @@ src/
 
 收到广播后：
 1. 验证 action 为上述任一广播。
-2. 调用 `context.startForegroundService(Intent(this, EewBackgroundService::class.java))`。
+2. 调用 `context.startForegroundService(Intent(this, EewBackgroundService::class.java))`，并在 Intent 上附加 `EewBackgroundService.EXTRA_FROM_BOOT=true`。
 3. 不启动 MainActivity（静默启动）。
 4. 输出 `Log.i("BootReceiver", "Boot completed, starting service")`。
+
+> **前台状态初始化**：开机自启时 App 未打开、无 RN JS 线程。`EewBackgroundService.onStartCommand`
+> 首次启动会依据启动来源初始化前台状态：
+> - 开机广播拉起（`EXTRA_FROM_BOOT=true`）→ `appInForeground=false`，事件由原生层直接接管触发锁屏/悬浮窗；
+> - 用户正常打开 App（`start()`，显式 `EXTRA_FROM_BOOT=false`）→ `appInForeground=true`，事件交由 JS 层处理；
+> - 系统 `START_STICKY` 重建（`intent == null`）→ 视同非前台，由原生层接管。
+>
+> 该初始化仅在服务进程首次启动时执行一次，之后的 `notifyAppInForeground` / `notifyAppInBackground` /
+> `onTrimMemory` / 锁屏广播仍按既有逻辑动态更新前后台状态。
 
 ### 3.2 EewBackgroundService（后台保活 + 锁屏预警）
 

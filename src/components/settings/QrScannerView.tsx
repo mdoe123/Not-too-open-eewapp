@@ -25,6 +25,23 @@ import {
   SourceShareChunk,
 } from '../../sources/custom/sourceShare';
 
+/** 校验分块结构是否合法（防止畸形码导致累积卡死） */
+function isValidChunk(value: unknown): value is SourceShareChunk {
+  if (typeof value !== 'object' || value === null) return false;
+  const c = value as Record<string, unknown>;
+  return (
+    c.format === CHUNKED_PACK_FORMAT &&
+    c.version === 1 &&
+    Number.isInteger(c.chunkIndex) &&
+    (c.chunkIndex as number) >= 0 &&
+    Number.isInteger(c.totalChunks) &&
+    (c.totalChunks as number) >= 1 &&
+    typeof c.totalBytes === 'number' &&
+    typeof c.payload === 'string' &&
+    typeof c.chunkHash === 'string'
+  );
+}
+
 export interface QrScannerViewProps {
   /** 单码模式：扫到非 chunk 格式时调用 */
   onScan: (value: string) => void;
@@ -56,12 +73,45 @@ export const QrScannerView = memo(function QrScannerView({
   const device = useCameraDevice('back');
   const [permissionRequested, setPermissionRequested] = useState(false);
   const [progress, setProgress] = useState<ScanProgress | null>(null);
+  // 瞬态提示（如无效帧），2.5s 自动清除，不中断累积进度
+  const [scanNotice, setScanNotice] = useState<string | null>(null);
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // 已收集的 chunks：chunkIndex → chunk
   const collectedChunksRef = useRef<Map<number, SourceShareChunk>>(new Map());
 
   // 防抖：上次扫码内容和时间
   const lastScanRef = useRef<{value: string; time: number}>({value: '', time: 0});
+
+  // 卸载时清理瞬态提示定时器，避免泄漏
+  useEffect(() => {
+    return () => {
+      if (noticeTimerRef.current) {
+        clearTimeout(noticeTimerRef.current);
+        noticeTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  /** 显示瞬态提示（2.5s 自动清除） */
+  const showNotice = (msg: string) => {
+    setScanNotice(msg);
+    if (noticeTimerRef.current) {
+      clearTimeout(noticeTimerRef.current);
+    }
+    noticeTimerRef.current = setTimeout(() => setScanNotice(null), 2500);
+  };
+
+  /** 清空已累积的分块，重新开始扫描 */
+  const handleReset = () => {
+    collectedChunksRef.current.clear();
+    setProgress(null);
+    setScanNotice(null);
+    if (noticeTimerRef.current) {
+      clearTimeout(noticeTimerRef.current);
+      noticeTimerRef.current = null;
+    }
+  };
 
   // 首次挂载请求权限
   useEffect(() => {
@@ -90,11 +140,16 @@ export const QrScannerView = memo(function QrScannerView({
       try {
         const parsed = JSON.parse(code.value);
         if (parsed?.format === CHUNKED_PACK_FORMAT) {
-          // 分块模式：累积
+          // 分块模式：先校验结构，畸形帧不累积并瞬态提示，避免卡死
+          if (!isValidChunk(parsed)) {
+            showNotice('无效的二维码，请对准有效的分块二维码');
+            return;
+          }
           collectedChunksRef.current.set(parsed.chunkIndex, parsed as SourceShareChunk);
           const collected = collectedChunksRef.current.size;
           const total = parsed.totalChunks as number;
           setProgress({collected, total});
+          setScanNotice(null);
 
           if (collected === total) {
             // 收齐全部 chunks，组装还原
@@ -104,8 +159,12 @@ export const QrScannerView = memo(function QrScannerView({
               // 重置状态
               collectedChunksRef.current.clear();
               setProgress(null);
+              setScanNotice(null);
               onChunksComplete(result.json);
             } else {
+              // 组装失败：清空累积状态，便于重新扫描
+              collectedChunksRef.current.clear();
+              setProgress(null);
               onError?.(result.error);
             }
           }
@@ -243,9 +302,20 @@ export const QrScannerView = memo(function QrScannerView({
             <Text style={styles.hintTextOverlay}>
               请继续扫描剩余二维码
             </Text>
+            <Pressable
+              onPress={handleReset}
+              style={({pressed}) => [
+                styles.resetBtn,
+                {opacity: pressed ? 0.7 : 1},
+              ]}>
+              <Text style={styles.resetBtnText}>重新开始</Text>
+            </Pressable>
           </>
         ) : (
           <Text style={styles.hintTextOverlay}>将二维码对准框内</Text>
+        )}
+        {scanNotice && (
+          <Text style={styles.noticeText}>{scanNotice}</Text>
         )}
       </View>
     </View>
@@ -403,5 +473,30 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     color: 'rgba(255, 255, 255, 0.8)',
     textAlign: 'center',
+  },
+  // 重新开始按钮（居中全宽，便于点按）
+  resetBtn: {
+    alignSelf: 'stretch',
+    height: 40,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.7)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 12,
+    backgroundColor: 'rgba(255, 255, 255, 0.12)',
+  },
+  resetBtnText: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: '#FFFFFF',
+  },
+  // 瞬态提示（如无效帧警告）
+  noticeText: {
+    fontSize: 13,
+    lineHeight: 18,
+    color: '#FFD54F',
+    textAlign: 'center',
+    marginTop: 10,
   },
 });
