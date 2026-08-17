@@ -167,10 +167,16 @@ class BackgroundServiceModule(
       if (locationMap.hasKey("mode")) {
         prefs.putString("locationMode", locationMap.getString("mode"))
       }
+      // 后台定位刷新开关（仅 GPS 模式生效，默认开启）
+      var bgRefresh = true
+      if (locationMap.hasKey("backgroundRefreshEnabled")) {
+        bgRefresh = locationMap.getBoolean("backgroundRefreshEnabled")
+      }
+      prefs.putBoolean("backgroundRefreshEnabled", bgRefresh)
       // 写入坐标更新时间戳，供后台服务判断位置是否陈旧
       prefs.putLong("userLocTimestamp", System.currentTimeMillis())
       prefs.apply()
-      Log.i(TAG, "位置配置已写入 SharedPreferences: lat=$lat, lng=$lng mode=${locationMap.getString("mode")}")
+      Log.i(TAG, "位置配置已写入 SharedPreferences: lat=$lat, lng=$lng mode=${locationMap.getString("mode")} bgRefresh=$bgRefresh")
     } catch (e: Exception) {
       Log.e(TAG, "updateLocation 失败: ${e.message}")
     }
@@ -186,9 +192,13 @@ class BackgroundServiceModule(
   fun refreshLocation() {
     try {
       val prefs = reactContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-      // 手动模式不参与原生定位刷新
+      // 手动模式或后台定位刷新开关关闭时不参与原生定位刷新
       if (prefs.getString("locationMode", "") != "gps") {
         Log.d(TAG, "refreshLocation: 非 GPS 模式，忽略")
+        return
+      }
+      if (!prefs.getBoolean("backgroundRefreshEnabled", true)) {
+        Log.d(TAG, "refreshLocation: 后台定位刷新开关关闭，忽略")
         return
       }
       val provider = LocationProvider(reactContext)

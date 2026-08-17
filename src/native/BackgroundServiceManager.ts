@@ -19,7 +19,12 @@ interface BackgroundServiceModuleType {
   /** 更新 alert 配置到原生层（SharedPreferences） */
   updateConfig(alertConfig: AlertConfig): void;
   /** 更新用户位置到原生层（SharedPreferences） */
-  updateLocation(location: {userLat: number; userLng: number; mode: string}): void;
+  updateLocation(location: {
+    userLat: number;
+    userLng: number;
+    mode: string;
+    backgroundRefreshEnabled: boolean;
+  }): void;
   /** 通知后台服务 App 已回到前台（AppState active 时调用） */
   notifyAppInForeground(): void;
   /** 通知后台服务 App 已进入后台（AppState background/inactive 时调用） */
@@ -143,7 +148,12 @@ export const BackgroundServiceManager = {
    *
    * @param location 用户当前位置坐标（userLat, userLng）
    */
-  updateLocation(location: {userLat: number; userLng: number; mode: string}): void {
+  updateLocation(location: {
+    userLat: number;
+    userLng: number;
+    mode: string;
+    backgroundRefreshEnabled: boolean;
+  }): void {
     if (Platform.OS !== 'android') return;
     try {
       BackgroundServiceModule?.updateLocation(location);
@@ -327,17 +337,24 @@ export const BackgroundServiceManager = {
 export function buildLocationUpdate(
   locationConfig: LocationConfig,
   userLocation: {lat: number; lng: number},
-): {userLat: number; userLng: number; mode: string} {
+): {
+  userLat: number;
+  userLng: number;
+  mode: string;
+  backgroundRefreshEnabled: boolean;
+} {
   if (locationConfig.mode === 'manual') {
     return {
       userLat: locationConfig.manualLat,
       userLng: locationConfig.manualLng,
       mode: 'manual',
+      backgroundRefreshEnabled: locationConfig.backgroundRefreshEnabled ?? true,
     };
   }
   return {
     userLat: userLocation.lat,
     userLng: userLocation.lng,
     mode: 'gps',
+    backgroundRefreshEnabled: locationConfig.backgroundRefreshEnabled ?? true,
   };
 }

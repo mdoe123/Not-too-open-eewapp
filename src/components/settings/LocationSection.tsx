@@ -42,6 +42,16 @@ export function LocationSection({
         onValueChange={v => updateLocation({mode: v ? 'manual' : 'gps'})}
         colors={colors}
       />
+      {!isManual ? (
+        <ToggleRow
+          label="后台定位刷新"
+          description="开启后，后台服务每 15 分钟主动获取一次定位，并在预警触发后用最新位置更新烈度/距离，避免后台坐标陈旧"
+          icon={<LocationIcon size={20} color={colors.text} />}
+          value={location.backgroundRefreshEnabled}
+          onValueChange={v => updateLocation({backgroundRefreshEnabled: v})}
+          colors={colors}
+        />
+      ) : null}
       {isManual ? (
         <View style={[styles.coordRow, {backgroundColor: colors.surface}]}>
           <Text style={[styles.coordLabel, {color: colors.textSecondary}]}>

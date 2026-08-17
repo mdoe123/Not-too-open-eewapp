@@ -28,7 +28,7 @@
 
 - GPS 模式下 `isMock=true`（尚未拿到真实定位）时**不同步**到原生层，避免用默认北京坐标污染后台计算。
 - 同步通过 `BackgroundServiceManager.updateLocation(buildLocationUpdate(...))`，负载含
-  `userLat / userLng / mode`（`"gps"`/`"manual"`）。
+  `userLat / userLng / mode`（`"gps"`/`"manual"`）/ `backgroundRefreshEnabled`。
 
 ## 3. 原生层定位（LocationProvider.kt）
 
@@ -45,31 +45,35 @@
 目标：对抗"自启动/后台时只吃缓存坐标导致位置陈旧"的问题。前台账 + 原生层无实时定位，
 本机制在原生层主动维持坐标新鲜度。
 
-### 4.1 15 分钟主动轮询（仅 GPS 模式）
+**开关**：设置 → 位置设置 → 「后台定位刷新」（`LocationConfig.backgroundRefreshEnabled`，
+默认开启，**仅 GPS 模式显示并生效**）。手动模式不显示该开关。
+
+### 4.1 15 分钟主动轮询（仅 GPS 模式 + 开关开启）
 
 - 常量 `LOCATION_REFRESH_INTERVAL_MS = 15 * 60 * 1000L`（15 分钟）。
 - `onStartCommand` 启动 `startLocationPolling()`，`onDestroy` 调 `stopLocationPolling()`。
-- 轮询前读 SharedPreferences `locationMode`：仅 `"gps"` 才调用 `LocationProvider` 刷新；
-  手动模式不参与，避免后台 GPS 覆盖用户手动坐标。
+- 轮询前读 SharedPreferences `locationMode` 与 `backgroundRefreshEnabled`：
+  仅 `"gps"` 且开关开启时调用 `LocationProvider` 刷新；手动模式/开关关闭不主动定位。
 - 成功刷新后写回 `userLat / userLng / userLocTimestamp`。
 - 失败静默等下一轮（fail-open）。
 
 ### 4.2 收到预警时"先缓存触发 + 后刷新更新"
 
 - `tryTriggerFloatingWindow` 仍用缓存坐标**立即**判定/触发（保证低延迟，路径不变）。
-- 触发成功后调用 `refreshLocationAndUpdateEvent(event, sourceName)`（仅 GPS 模式）：
+- 触发成功后调用 `refreshLocationAndUpdateEvent(event, sourceName)`（仅 GPS 模式 + 开关开启）：
   异步一次定位 → 写回新坐标 → 调 `updateDisplayedEvent` 用新坐标重算震中距/烈度并刷新已显示 UI。
-- 手动模式跳过此步骤。
+- 手动模式或开关关闭跳过此步骤。
 
 ### 4.3 SharedPreferences 新增字段
 
 | Key | 类型 | 含义 |
 |-----|------|------|
 | `locationMode` | String | `"gps"` / `"manual"`，决定后台是否主动定位 |
+| `backgroundRefreshEnabled` | Boolean | 后台定位刷新开关（默认 true，仅 GPS 生效） |
 | `userLocTimestamp` | Long | 最近一次坐标写入时间戳（毫秒） |
 
-`BackgroundServiceModule.updateLocation` 同步写入三者。
-新增 `BackgroundServiceModule.refreshLocation()`（RN 可调用，进入前台时主动刷新一次，仅 GPS 生效）。
+`BackgroundServiceModule.updateLocation` 同步写入三者；`refreshLocation()` 同样检查
+`locationMode == gps` 且开关开启才生效。
 
 ## 5. 陈旧阈值（Assumption）
 

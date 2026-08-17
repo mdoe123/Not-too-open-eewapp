@@ -717,7 +717,9 @@ class EewBackgroundService : Service() {
       override fun run() {
         try {
           val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-          if (prefs.getString("locationMode", "") == "gps") {
+          // 仅 GPS 模式且开关开启时主动定位刷新
+          if (prefs.getString("locationMode", "") == "gps" &&
+              prefs.getBoolean("backgroundRefreshEnabled", true)) {
             locationProvider.getCurrentLocation { lat, lng ->
               writeUserLocation(lat, lng)
               Log.i(TAG, "后台定位轮询刷新坐标: lat=$lat, lng=$lng")
@@ -749,6 +751,7 @@ class EewBackgroundService : Service() {
   private fun refreshLocationAndUpdateEvent(event: ParsedCencEvent, sourceName: String?) {
     val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     if (prefs.getString("locationMode", "") != "gps") return
+    if (!prefs.getBoolean("backgroundRefreshEnabled", true)) return
     locationProvider.getCurrentLocation { lat, lng ->
       writeUserLocation(lat, lng)
       Log.i(TAG, "预警触发后定位刷新成功: lat=$lat, lng=$lng eventId=${event.eventId}")

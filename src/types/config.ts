@@ -209,6 +209,14 @@ export interface LocationConfig {
   manualLat: number;
   /** 手动经度（mode='manual' 时生效，范围 -180~180） */
   manualLng: number;
+  /**
+   * 后台定位刷新开关（仅 GPS 模式生效，默认 true）
+   *
+   * 开启后，后台服务每 15 分钟主动获取一次定位并刷新缓存坐标，
+   * 并在触发预警后用最新坐标更新已显示预警；关闭则不主动定位。
+   * 用于对抗自启动/后台时位置坐标陈旧。
+   */
+  backgroundRefreshEnabled: boolean;
 }
 
 /**
@@ -305,8 +313,12 @@ export interface AppConfig {
  *          记录间隔自动计算超时阈值（max(30s, 间隔×2)，上限 300s，首次默认 60s），
  *          超时主动关闭并触发指数退避重连
  *        迁移策略：新字段可选，旧配置无需特殊处理（不配置即不发送/使用默认关键词）。
+ * - v19: LocationConfig 新增 backgroundRefreshEnabled（后台定位刷新开关，默认 true）。
+ *        开启后，仅 GPS 模式下后台服务每 15 分钟主动获取一次定位并刷新缓存坐标，
+ *        并在触发预警后用最新坐标更新已显示预警；关闭则不主动定位。
+ *        迁移策略：新字段可选，旧配置通过 DEFAULT_CONFIG 合并自动补齐默认值。
  */
-export const CURRENT_CONFIG_VERSION = 18;
+export const CURRENT_CONFIG_VERSION = 19;
 
 /**
  * AsyncStorage 中存储免责声明确认标记的 key
@@ -357,6 +369,7 @@ export const DEFAULT_CONFIG: AppConfig = {
     mode: 'gps',
     manualLat: 39.9,
     manualLng: 116.4,
+    backgroundRefreshEnabled: true,
   },
   // 调试配置默认关闭，需在设置页手动启用
   debug: {
