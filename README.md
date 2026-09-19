@@ -7,7 +7,9 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-6.x-3178C6.svg)](https://www.typescriptlang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Android-3DDC84.svg)](https://developer.android.com/)
 
-地震预警（Earthquake Early Warning, EEW）Android 应用，基于 React Native + TypeScript 构建。支持自定义数据源接入、实时预警联动（悬浮窗/锁屏全屏报警/声音/震动/闪光灯）、后台保活服务、开机自启动等能力。
+NTOEEW (Not Too Open EEW App) -不太开源的EEWAPP - Android 应用，基于 React Native + TypeScript 构建。支持自定义数据源接入、实时预警联动（悬浮窗/锁屏全屏报警/声音/震动/闪光灯）、后台保活服务、开机自启动等能力。
+
+至于为什么起这个名字，那是因为 AI 写的代码没有什么可读性；它是个"不太开源"的地震预警 App。
 
 ## 功能特性
 
