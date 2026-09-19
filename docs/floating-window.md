@@ -899,6 +899,26 @@ LockScreenAlertActivity: onCreate: mag=7.5 intensity=9.22 level=red ...
 **修复**：
 前台触发路径现在也按 `alert.minMagnitude` + `alert.lockScreenIntensity` 过滤事件，低于阈值的事件不弹悬浮窗，与后台/锁屏触发路径（`EewBackgroundService.tryTriggerFloatingWindow()`）的阈值检查保持一致。
 
+### 修复：后台 updateDisplayedEvent 绕过烈度阈值（同 ID 重复触发误弹窗）
+
+**根因**：
+`EewBackgroundService.updateDisplayedEvent()` 末分支"事件既不在锁屏 Activity 也不在后台悬浮窗"时直接调用 `showFloatingWindowFromBackground()`，**未检查 `minMagnitude` / `lockScreenIntensity` / silent 阈值**。触发链路：
+
+1. App 前台收到事件 → `handleSourceData` 无条件将 eventId 加入 `triggeredEventIds`，委托 JS 层处理（JS 层已按阈值过滤，低烈度如 -3.8 度不显示）；
+2. 切后台/锁屏后同 ID 事件再次到达 → `triggeredEventIds.contains` 命中 → 走 `updateDisplayedEvent`；
+3. 末分支无阈值判断直接弹悬浮窗 → 低烈度事件在后台被误弹出。
+
+**修复**：
+`updateDisplayedEvent` 末分支改为调用 `tryTriggerFloatingWindow(event, sourceName)`，复用完整触发条件检查（lockScreenEnabled / floatingWindowEnabled / minMagnitude / lockScreenIntensity / silent），通过后才按屏幕状态启动锁屏 Activity 或后台悬浮窗。低烈度（如 -3.8 度 < 阈值 3）事件不再误弹；真实高烈度预警在切后台后仍正常接管显示。
+
+### 修复：原生转发事件 id 前缀与 JS 层对齐（补 priority 段）
+
+**根因**：
+原生 `emitEewEvent` 的事件 id 前缀为 `customSource-{host}`，**缺少 priority 段**；JS 层 `CustomSourceAdapter` 为 `customSource-{host}-{priority}`。两者不一致，同 host 不同 priority 的多源若 JS 层消费原生转发事件将生成相同 id，触发 mergeEvent"同 ID 覆盖"互相覆盖。
+
+**修复**：
+原生 `emitEewEvent` 的 id 前缀改为 `customSource-{host}-{priority}`，与 JS 层 `CustomSourceAdapter.idPrefix` 完全对齐，消除多源事件 id 冲突隐患。
+
 ## 锁屏预警实现（EewBackgroundService + LockScreenAlertActivity）
 
 ### 设计动机

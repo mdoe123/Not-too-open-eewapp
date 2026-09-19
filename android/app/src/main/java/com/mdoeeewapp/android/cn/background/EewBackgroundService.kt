@@ -690,9 +690,12 @@ class EewBackgroundService : Service() {
     }
 
     // 既不在锁屏也不在后台悬浮窗（如 App 从前台切到后台后首次收到同 ID 新报告）
-    // → 添加到后台悬浮窗队列并显示
-    Log.i(TAG, "事件 ${event.eventId} 未在任何显示中，添加到后台悬浮窗: intensity=$intensity level=$alertLevel")
-    showFloatingWindowFromBackground(event, intensity, distance, alertLevel, arrivalMs, sourceName)
+    // → 重新走完整触发条件检查（minMagnitude / 烈度阈值 / silent / 开关），
+    //   通过后再按屏幕状态启动锁屏 Activity 或后台悬浮窗。
+    //   不能直接 showFloatingWindowFromBackground：否则前台被打标但烈度不足的事件
+    //   （JS 层已按其阈值过滤）会在切后台后绕过阈值被误弹窗（如 -3.8 度低烈度）。
+    Log.i(TAG, "事件 ${event.eventId} 未在任何显示中，重新走触发条件检查: intensity=$intensity level=$alertLevel")
+    tryTriggerFloatingWindow(event, sourceName)
   }
 
   // ======================== 后台定位刷新 ========================
@@ -1658,7 +1661,9 @@ class EewBackgroundService : Service() {
     try {
       val ctx = currentReactContext ?: return
       val map = WritableNativeMap()
-      val idPrefix = "customSource-${extractHost(config?.endpoint ?: "")}"
+      // id 前缀与 JS 层 CustomSourceAdapter.idPrefix 对齐：customSource-{host}-{priority}
+      // （priority 段避免同 host 不同 priority 的多源事件 id 互相覆盖）
+      val idPrefix = "customSource-${extractHost(config?.endpoint ?: "")}-${config?.priority ?: 0}"
       map.putString("id", "$idPrefix-${event.eventId}")
       map.putString("source", "customSource")
       map.putDouble("originTime", event.originTime.toDouble())
