@@ -182,17 +182,19 @@ HomeScreen (useEffect)
 
 **已知边界**（记录备查）：改动后若从「关于/模拟预警」页直接 Home 键退出（设置页未 pop），`beforeRemove` 不触发、无提示；极短窗口（<300ms）内「稍后」离开可能因 debounce 定时器被卸载清除而丢失写入（既有 P1-18 模式固有）；重启后 `authToken` 不持久化（安全设计 `stripApiKeys`），需重新输入鉴权信息。
 
-**触发条件**（必须全部满足，在 `EewBackgroundService.tryTriggerFloatingWindow()` 中检查）：
-1. **屏幕开关检查（按屏幕状态分别判断）**：
+**触发条件**（必须全部满足，统一在 `EewBackgroundService.evaluateTriggerGate()` 中检查，所有触发路径共用）：
+1. **用户位置已同步**（SharedPreferences 存在 `userLat` key；否则视为未定位，不触发，避免用默认北京坐标算烈度）
+2. **屏幕开关检查（按屏幕状态分别判断）**：
    - 屏幕已锁屏时：要求 `alert.lockScreenEnabled == true`（否则跳过，不触发锁屏预警）
    - 屏幕未锁屏时：要求 `alert.floatingWindowEnabled == true`（否则跳过，不触发后台悬浮窗）
    - 两者均关闭时，无论是否锁屏都不触发
-2. 事件震级 `>= alert.minMagnitude`
-3. 计算预估烈度 `>= alert.lockScreenIntensity`
-4. 预警级别 `!= silent`
-5. S 波尚未到达（`remainSec > 0`）
-6. App 不在前台（`appInForeground == false`，避免与 JS 层重复触发）
-7. 非取消报（`isCancel == false`）
+3. 事件震级 `>= alert.minMagnitude`
+4. 计算预估烈度 `>= alert.lockScreenIntensity`
+5. 预警级别 `!= silent`
+
+> **统一门槛 `evaluateTriggerGate`（关键）**：`tryTriggerFloatingWindow`、`handleSourceData` 前台分支、`updateDisplayedEvent` 三条路径**均调用同一函数**，不存在任何绕过阈值的分支。任何新增触发路径都必须经此门槛。
+
+> **门槛之外的前置条件**（在 `handleSourceData` 入口检查，早于门槛）：S 波已到达超过 60 秒的**新**事件丢弃；App 在前台且 JS 心跳存活时委托 JS 层处理；取消报只更新已显示 UI、不弹窗。
 
 > **按屏幕状态分别检查开关的修复**：早期版本要求 `lockScreenEnabled` 和 `floatingWindowEnabled` 同时开启才触发，导致用户关闭锁屏但保留悬浮窗时后台不弹窗。现改为按屏幕状态分别检查对应开关，两者独立控制各自的触发路径。
 
@@ -910,6 +912,30 @@ LockScreenAlertActivity: onCreate: mag=7.5 intensity=9.22 level=red ...
 
 **修复**：
 `updateDisplayedEvent` 末分支改为调用 `tryTriggerFloatingWindow(event, sourceName)`，复用完整触发条件检查（lockScreenEnabled / floatingWindowEnabled / minMagnitude / lockScreenIntensity / silent），通过后才按屏幕状态启动锁屏 Activity 或后台悬浮窗。低烈度（如 -3.8 度 < 阈值 3）事件不再误弹；真实高烈度预警在切后台后仍正常接管显示。
+
+### 修复：后台锁屏误触发 —— updateDisplayedEvent 前两分支绕过阈值 + 入口污染
+
+**根因**（同一类问题的残留分支，`504ddb0` 只修了末分支）：
+`EewBackgroundService.updateDisplayedEvent()` 前两个分支**未做任何阈值检查**，配合入口污染可绕过全部阈值：
+
+1. 分支 1（`LockScreenAlertActivity.isRunning()`）：Activity 运行中收到**任意**“已触发”事件即无条件 `addEvent`，低烈度事件也会被加入锁屏显示；
+2. 分支 2（`isScreenLocked()`）：屏幕已锁屏即无条件 `startLockScreenActivity`，震级/烈度/silent/开关全不校验；
+3. 入口污染（`handleSourceData` 前台分支）：App 前台时对**任何**事件无条件 `triggeredEventIds.add()`，不做阈值判断。
+
+**误触发链路**：前台收到低烈度事件 E（JS 已按其阈值过滤、未弹窗）→ 被写入 `triggeredEventIds` → 锁屏后 HTTP 轮询（默认 30s）重投同一 E（`recentDedupKeys` 只拦 emit/通知，不拦触发逻辑）→ `triggeredEventIds` 命中 → `updateDisplayedEvent` → 分支 2 无条件启动锁屏 Activity → **误弹窗**。
+
+**修复**：
+1. 抽出统一门槛 `evaluateTriggerGate(event, prefs)`（检查 位置已同步 → 屏幕开关 → minMagnitude → lockScreenIntensity → silent），`tryTriggerFloatingWindow` 与其复用；
+2. 前台分支仅在**通过门槛**时才 `triggeredEventIds.add()`，低阈值事件不再污染触发集合（P0-A）；
+3. `updateDisplayedEvent` 分支 1 增加 `containsEvent` 条件（仅更新已在锁屏显示的事件），分支 2 改为 `tryTriggerFloatingWindow`（走完整门槛）（P0-B / P0-C）。
+
+**顺带修复的相关风险**：
+- **心跳初值**：`lastForegroundHeartbeatMs == 0L`（JS 从未建立心跳）视为失效，原生层接管，避免误判 JS 存活导致漏预警；
+- **无悬浮窗权限回退**：`showFloatingWindowFromBackground()` 在模块未初始化 / 无 `SYSTEM_ALERT_WINDOW` 权限 / `try` 块内抛异常时**一律不回退** `startLockScreenActivity`（该回退会绕过 `lockScreenEnabled` 且在未锁屏时语义错误），改为跳过并清理已入队事件（与 JS 层「无权限则不显示」一致）；
+- **位置未同步**：位置从未同步时门槛直接判不通过，避免用默认北京坐标（39.9/116.4）算出错误烈度；
+- **category 缺失**：`parseSourceConfigFromJson` 仅显式 `category='eew'` 才走预警弹窗路径，缺失/未知一律按 `eqlist`（仅通知不弹窗），避免速报源误触发。
+
+> `isFinal` 仍不参与触发判定 —— 其语义为「正式测定」而非「事件终止」，JS 层同样不据此过滤，保持现状。
 
 ### 修复：原生转发事件 id 前缀与 JS 层对齐（补 priority 段）
 

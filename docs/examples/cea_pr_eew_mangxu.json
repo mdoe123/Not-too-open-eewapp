@@ -15,7 +15,7 @@
       "pollIntervalMs": 2000,
       "note": "mangxu的CEA-PR（中国地震台网省级）地震预警。HTTP 2s 轮询。源",
       "fieldMapping": {
-        "listPath": "$.earthquakes",
+        "listPath": "$",
         "eventId": "$.id",
         "originTime": "$.cea_data.event_time",
         "magnitude": "$.magnitude",

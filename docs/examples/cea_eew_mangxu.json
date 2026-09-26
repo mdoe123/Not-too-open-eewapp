@@ -1,18 +1,19 @@
 {
   "format": "eew-app-source-pack",
   "version": 1,
-  "exportedAt": 1785300000000,
-  "exportedBy": "mangxuCEA-PR(WS)",
+  "exportedAt": 1789862038000,
+  "exportedBy": "mangxuCEA(HTTP)",
   "sources": [
     {
       "type": "customSource",
-      "name": "mangxuCEA-PR(WS)",
+      "name": "mangxuCEA(HTTP)",
       "enabled": false,
-      "priority": 105,
+      "priority": 101,
       "category": "eew",
-      "protocol": "ws",
-      "endpoint": "wss://ws.mangxufurry.cc.cd/ws/agency/cea_pr",
-      "note": "mangxu的CEA-PR（中国地震台网省级）地震预警 - WebSocket 实时推流 源",
+      "protocol": "http",
+      "endpoint": "https://ws.mangxufurry.cc.cd/agency/cea/json",
+      "pollIntervalMs": 2000,
+      "note": "mangxu的CEA（中国地震台网）地震预警。HTTP 2s 轮询。源",
       "fieldMapping": {
         "listPath": "$",
         "eventId": "$.id",

@@ -183,10 +183,10 @@ ninja: error: Stat(rngesturehandler_codegen_autolinked_build/CMakeFiles/...
 codegen 生成的 CMake 对象文件路径超过 260 字符，ninja 无法创建。
 （debug 构建目录名 `Debug` 比 `RelWithDebInfo` 短 5 个字符，刚好压线能过，所以只有 release 失败。）
 
-**推荐方案：robocopy 真实复制到短路径构建（v1.0.4 实测通过）**
+**推荐方案：robocopy 真实复制到短路径构建（v1.0.4/v1.0.5/v1.0.6 实测通过）**
 
 ```powershell
-# 1. 复制项目到 C:\eewapp（排除缓存与构建产物，约 3GB、1 分钟）
+# 1. 复制项目到 C:\eewapp（排除缓存与构建产物）
 robocopy D:\xiangmu\eewapp\android-eew-app C:\eewapp /E /MT:16 /R:1 /W:1 `
   /XD .cxx .gradle `
   /XF NTOEEW-*.apk build.log test.log
@@ -199,16 +199,44 @@ cd C:\eewapp\android
 # 3. 产物在 C:\eewapp\android\app\build\outputs\apk\release\
 #    复制回仓库根目录并按规范命名
 Copy-Item C:\eewapp\android\app\build\outputs\apk\release\app-arm64-v8a-release.apk `
-  D:\xiangmu\eewapp\android-eew-app\NTOEEW-v1.0.X-arm64-v8a-release.apk
+  D:\xiangmu\eewapp\android-eew-app\NTOEEW-v1.0.6-arm64-v8a-release.apk
+Copy-Item C:\eewapp\android\app\build\outputs\apk\release\app-armeabi-v7a-release.apk `
+  D:\xiangmu\eewapp\android-eew-app\NTOEEW-v1.0.6-armeabi-v7a-release.apk
 
 # 4. 构建完成后可删除临时目录（约 6GB）
 Remove-Item -Recurse -Force C:\eewapp
 ```
 
-**为什么不建议用 NTFS Junction（mklink /J）**：junction 指向同一物理目录，
+> 注：v1.0.5 发布后 `C:\eewapp` 临时目录已删除（2026-09-20，约 7.2GB）；
+> v1.0.6 发布（2026-09-26，BUILD SUCCESSFUL in 8m 8s）时重新 robocopy 复制并构建，
+> 构建完成后同样可删除该临时目录。下次发布按上述步骤重新 robocopy 复制即可。
+> 删除时先 `gradlew --stop` 停止 gradle daemon，再用
+> `node -e "require('fs').rmSync('C:/eewapp',{recursive:true,force:true})"`
+> 执行（PowerShell `Remove-Item` 在 C 盘该路径可能受权限/占用限制，node 外部进程更可靠）。
+
+**robocopy 参数警告（v1.0.5 实测踩坑）**：
+
+1. **禁止用 `/XD build`**：robocopy 的 `/XD` 匹配**任意层级**的同名目录，
+   `node_modules` 下所有名为 `build` 的包目录（如 `@react-native-community/cli/build`）
+   会被一并排除，导致 `settings.gradle` 的 autolink 命令找不到 `cli/build/bin.js` 而失败。
+   只能排除 `.cxx .gradle` 这类确无用的目录。
+
+2. **若曾在 subst 盘符（如 `S:`）下构建过**：`android/build/generated/autolinking/autolinking.json`
+   缓存会残留 `S:\node_modules\...` 路径。由于 lockFiles（yarn.lock/package.json）哈希未变，
+   gradle 会**直接复用该缓存**，报
+   `Configuring project ':react-native-vision-camera' ... projectDirectory 'S:\node_modules\...' does not exist`。
+   修复：删除缓存后重新构建（PowerShell `Remove-Item` 可能被沙箱拦截，可用 node 删除）：
+   ```powershell
+   node -e "require('fs').rmSync('C:/eewapp/android/build/generated/autolinking',{recursive:true,force:true})"
+   ```
+
+**为什么不建议用 NTFS Junction（mklink /J）或 subst 盘符**：junction 指向同一物理目录，
 node_modules 内的 gradle-plugin 构建产物会被 IDE/监视进程句柄锁定，
 `Unable to delete directory ... Failed to delete some children` 导致构建失败，
 且停守护进程也无法解锁（曾用 `D:\eew` junction 验证失败）。
+subst 盘符（v1.0.5 实测）会导致 Metro bundle 失败：
+`Failed to get the SHA-1 for: D:\...\require.js` —— Node 对 subst 盘做 realpath 时返回真实路径，
+与 Metro 的 projectRoot（subst 路径）不一致，文件不在 watch 图内无法计算哈希。
 
 **疑难排查**：
 - `Cannot create directory '.gradle\9.3.1\fileHashes'` / `拒绝访问`：
@@ -236,7 +264,7 @@ Release 构建生成两个 ABI 独立 APK（位于短路径构建目录下）：
 
 ```powershell
 $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
-& $adb install -r "D:\xiangmu\eewapp\android-eew-app\NTOEEW-v1.0.4-arm64-v8a-release.apk"
+& $adb install -r "D:\xiangmu\eewapp\android-eew-app\NTOEEW-v1.0.6-arm64-v8a-release.apk"
 ```
 
 > `adb` 不在系统 PATH 中，需用完整路径或先 `cd` 到 platform-tools 目录。

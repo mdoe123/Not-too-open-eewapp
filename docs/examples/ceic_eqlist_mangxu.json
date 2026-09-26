@@ -15,7 +15,7 @@
       "pollIntervalMs": 30000,
       "note": "mangxu的CEIC（中国地震台网）地震速报。HTTP 30s 轮询。源",
       "fieldMapping": {
-        "listPath": "$.earthquakes",
+        "listPath": "$",
         "eventId": "$.id",
         "originTime": "$.ceic_raw.time",
         "magnitude": "$.magnitude",

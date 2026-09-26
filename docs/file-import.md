@@ -278,6 +278,9 @@ export const FileSourceImportManager = {
 |---------|--------|----------|------|------|
 | [cenc_eew.json](examples/cenc_eew.json) | eew | `https://api.wolfx.jp/cenc_eew.json` | HTTP 2s 轮询 | 中国地震台网中心地震预警（wolfx 转发） |
 | [cenc_eqlist.json](examples/cenc_eqlist.json) | eqlist | `https://api.wolfx.jp/cenc_eqlist.json` | HTTP 30s 轮询 | 中国地震台网中心速报列表（wolfx 转发） |
+| [cea_eew_mangxu.json](examples/cea_eew_mangxu.json) | eew | `https://ws.mangxufurry.cc.cd/agency/cea/json` | HTTP 2s 轮询 | mangxu CEA（中国地震台网）地震预警 |
+
+> mangxu 数据源另见 `docs/examples/` 目录下 `cea_pr_eew_mangxu.json`（省级 CEA-PR 预警）、`cea_pr_eew_ws_mangxu.json`（省级 CEA-PR WS）、`ceic_eqlist_mangxu.json` / `ceic_eqlist_ws_mangxu.json`（CEIC 速报）。注：以上 mangxu 接口均返回根数组（顶层即事件列表），`listPath` 一律为 `$`。
 
 ### 12.1 使用方式
 

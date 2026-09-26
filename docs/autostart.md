@@ -84,7 +84,7 @@ src/
 - **前后台检测**：`ComponentCallbacks2.onTrimMemory(TRIM_MEMORY_UI_HIDDEN)` 检测 App 进入后台
 - **事件转发**：通过 `DeviceEventEmitter` 发送 `onEewEvent` 和 `onWsStatus` 事件给 JS 层
 - **配置存储**：从 `SharedPreferences`（`eew_alert_config` 文件）读取 alert 配置、用户位置和 customSources（多源 JSON 数组）
-- **触发条件检查**：`tryTriggerFloatingWindow(event, sourceName)` 检查 lockScreenEnabled、floatingWindowEnabled、minMagnitude、lockScreenIntensity、预警级别、S 波到达、App 前后台状态
+- **触发条件检查**：统一门槛 `EewBackgroundService.evaluateTriggerGate(event, prefs)` 检查 用户位置已同步、lockScreenEnabled/floatingWindowEnabled（按屏幕状态）、minMagnitude、lockScreenIntensity、预警级别；`tryTriggerFloatingWindow`、前台分支、`updateDisplayedEvent` 所有触发路径共用该门槛。S 波到达、App 前后台、取消报在 `handleSourceData` 入口检查
 - **锁屏显示**：启动 `LockScreenAlertActivity`（配置 `setShowWhenLocked(true)`），显示在锁屏界面之上，自带倒计时 tick
 
 **配置同步方法**（供 BackgroundServiceModule 调用）：

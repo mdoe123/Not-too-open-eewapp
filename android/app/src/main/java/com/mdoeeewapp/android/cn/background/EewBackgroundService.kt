@@ -10,6 +10,7 @@ import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.app.KeyguardManager
 import android.os.Build
@@ -425,7 +426,9 @@ class EewBackgroundService : Service() {
       pollIntervalMs = obj.optLong("pollIntervalMs", 30_000L),
       fieldMapping = mapping,
       priority = obj.optInt("priority", 0),
-      category = obj.optString("category", "eew"),
+      // S-4：仅显式 category='eew' 才走预警弹窗路径；缺失/未知/eqlist 一律按 eqlist
+      //（仅发通知，不弹窗），避免缺字段的速报源误触发锁屏/悬浮窗预警。
+      category = if (obj.optString("category", "").lowercase() == "eew") "eew" else "eqlist",
     )
   }
 
@@ -508,18 +511,26 @@ class EewBackgroundService : Service() {
     }
 
     // 如果 App 在前台，由 JS 层 useFloatingWindow 处理（避免重复触发）
-    // 但需检查心跳超时：若 JS 长时间未发心跳，可能已死，由原生层接管
+    // 但需检查心跳超时：若 JS 长时间未发心跳（或从未建立），可能已死，由原生层接管
     if (appInForeground) {
-      val heartbeatStale = if (lastForegroundHeartbeatMs == 0L) false
-        else System.currentTimeMillis() - lastForegroundHeartbeatMs > FOREGROUND_HEARTBEAT_TIMEOUT_MS
+      // S-1：心跳初值 0（从未建立）也视为失效，避免误判 JS 存活
+      val heartbeatStale = lastForegroundHeartbeatMs == 0L ||
+        System.currentTimeMillis() - lastForegroundHeartbeatMs > FOREGROUND_HEARTBEAT_TIMEOUT_MS
       if (!heartbeatStale) {
-        // JS 活着，委托给 JS
-        triggeredEventIds.add(event.eventId)
-        if (isNewReport) Log.i(TAG, "App 在前台，由 JS 层处理悬浮窗")
+        // JS 活着，委托给 JS。
+        // 仅当事件通过统一门槛时才标记已触发，否则低阈值事件会污染 triggeredEventIds，
+        // 后续被误判为“已触发”走 updateDisplayedEvent 分支绕过阈值（P0-A）。
+        val gate = evaluateTriggerGate(event, getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE))
+        if (gate.passed) {
+          triggeredEventIds.add(event.eventId)
+          if (isNewReport) Log.i(TAG, "App 在前台，由 JS 层处理悬浮窗")
+        } else if (isNewReport) {
+          Log.i(TAG, "App 在前台但事件未通过门槛（${gate.reason}），不标记触发")
+        }
         return
       }
-      // 心跳超时，JS 可能已死，原生层接管
-      Log.w(TAG, "前台心跳超时（${(System.currentTimeMillis() - lastForegroundHeartbeatMs) / 1000}s），JS 可能已死，原生层接管")
+      // 心跳超时或未建立，JS 可能已死，原生层接管
+      Log.w(TAG, "前台心跳超时或未建立（lastHeartbeat=$lastForegroundHeartbeatMs），JS 可能已死，原生层接管")
       appInForeground = false
     }
 
@@ -645,8 +656,11 @@ class EewBackgroundService : Service() {
       event.originTime, event.lat, event.lng, userLat, userLng
     )
 
-    // 锁屏 Activity 在运行 → 更新锁屏
-    if (LockScreenAlertActivity.isRunning()) {
+    // 锁屏 Activity 正在显示此事件 → 仅更新（同 ID 报告更新）
+    // 注意：必须同时满足 containsEvent，否则「Activity 运行中但未显示此事件」
+    // 会无条件 addEvent 低阈值事件（P0-B），故未显示的事件走下方门槛分支。
+    if (LockScreenAlertActivity.isRunning() &&
+        LockScreenAlertActivity.instance?.containsEvent(event.eventId) == true) {
       val eventData = LockScreenAlertActivity.LockScreenEvent(
         eventId = event.eventId,
         magnitude = event.magnitude,
@@ -666,11 +680,12 @@ class EewBackgroundService : Service() {
       return
     }
 
-    // 屏幕已锁屏但 Activity 未运行 → 启动锁屏 Activity
-    // 场景：之前在后台显示悬浮窗，屏幕随后锁屏，同 ID 新报告到来时应切换到锁屏 Activity
+    // 屏幕已锁屏但 Activity 未运行/未显示此事件 → 走完整触发门槛（防 P0-C 无条件误弹窗）
+    // 场景：之前在后台显示悬浮窗，屏幕随后锁屏，同 ID 新报告到来时应切换到锁屏 Activity。
+    // 但不无条件启动：必须通过 evaluateTriggerGate（震级/烈度/silent/开关），否则低阈值事件被误弹。
     if (isScreenLocked()) {
-      Log.i(TAG, "屏幕已锁屏但 Activity 未运行，启动锁屏 Activity: eventId=${event.eventId}")
-      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs, sourceName)
+      Log.i(TAG, "屏幕已锁屏，走触发门槛: eventId=${event.eventId}")
+      tryTriggerFloatingWindow(event, sourceName)
       return
     }
 
@@ -774,43 +789,59 @@ class EewBackgroundService : Service() {
     Log.i(TAG, "标记事件 $eventId 为用户已关闭（来自锁屏界面），已从后台队列移除")
   }
 
+  /** 统一触发门槛评估结果 */
+  private data class TriggerGateResult(
+    val passed: Boolean,
+    val intensity: Double = 0.0,
+    val distance: Double = 0.0,
+    val alertLevel: String = EewAlertEngine.LEVEL_SILENT,
+    val arrivalMs: Long = 0L,
+    val screenLocked: Boolean = false,
+    val reason: String = "",
+  )
+
   /**
-   * 检查触发条件并触发悬浮窗（App 不在前台时调用）
+   * 统一触发门槛评估：所有预警触发路径（[tryTriggerFloatingWindow]、
+   * [handleSourceData] 前台分支、[updateDisplayedEvent]）共用，避免各分支
+   * 阈值判断不一致导致绕过（P0：后台锁屏误触发）。
    *
-   * 触发条件：
-   * - alert.lockScreenEnabled == true
-   * - alert.floatingWindowEnabled == true
-   * - 事件震级 >= alert.minMagnitude
-   * - 计算预估烈度 >= alert.lockScreenIntensity
+   * 依次检查：
+   * 1. 用户位置已同步（存在 userLat key；否则用默认北京坐标算烈度无意义）—— S-3
+   * 2. 屏幕开关（锁屏→lockScreenEnabled；未锁屏→floatingWindowEnabled；两者均关→跳过）
+   * 3. 事件震级 >= minMagnitude
+   * 4. 预估烈度 >= lockScreenIntensity
+   * 5. 预警级别 != silent
    *
    * @param event 解析后的事件
-   * @param sourceName 数据源名称（用于锁屏/悬浮窗显示）
+   * @param prefs SharedPreferences（eew_alert_config）
+   * @returns 评估结果（passed=true 时携带计算出的 intensity/distance/alertLevel/arrivalMs）
    */
-  private fun tryTriggerFloatingWindow(event: ParsedCencEvent, sourceName: String?): Boolean {
-    val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-
+  private fun evaluateTriggerGate(
+    event: ParsedCencEvent,
+    prefs: SharedPreferences,
+  ): TriggerGateResult {
+    // S-3：位置从未同步时不用默认北京坐标算烈度
+    if (!prefs.contains("userLat")) {
+      return TriggerGateResult(false, reason = "用户位置未同步")
+    }
     val lockScreenEnabled = prefs.getBoolean("lockScreenEnabled", true)
     val floatingWindowEnabled = prefs.getBoolean("floatingWindowEnabled", true)
     // 按屏幕状态分别检查：锁屏时需要 lockScreenEnabled，未锁屏时需要 floatingWindowEnabled
     // 两者都关闭才跳过（避免用户关闭锁屏但保留悬浮窗时后台也不弹窗的 bug）
     val screenLocked = isScreenLocked()
     if (screenLocked && !lockScreenEnabled) {
-      Log.i(TAG, "跳过触发: 锁屏状态下 lockScreenEnabled=false")
-      return false
+      return TriggerGateResult(false, screenLocked = screenLocked, reason = "锁屏状态下 lockScreenEnabled=false")
     }
     if (!screenLocked && !floatingWindowEnabled) {
-      Log.i(TAG, "跳过触发: 未锁屏状态下 floatingWindowEnabled=false")
-      return false
+      return TriggerGateResult(false, screenLocked = screenLocked, reason = "未锁屏状态下 floatingWindowEnabled=false")
     }
     if (!lockScreenEnabled && !floatingWindowEnabled) {
-      Log.i(TAG, "跳过触发: lockScreenEnabled 和 floatingWindowEnabled 均为 false")
-      return false
+      return TriggerGateResult(false, screenLocked = screenLocked, reason = "lockScreenEnabled 和 floatingWindowEnabled 均为 false")
     }
 
     val minMagnitude = prefs.getFloat("minMagnitude", 3.0f).toDouble()
     if (event.magnitude < minMagnitude) {
-      Log.i(TAG, "跳过触发: 震级 ${event.magnitude} < $minMagnitude")
-      return false
+      return TriggerGateResult(false, screenLocked = screenLocked, reason = "震级 ${event.magnitude} < $minMagnitude")
     }
 
     val lockScreenIntensity = prefs.getFloat("lockScreenIntensity", 4.0f).toDouble()
@@ -821,33 +852,51 @@ class EewBackgroundService : Service() {
     val intensity = EewAlertEngine.calcCsis(event.magnitude, event.depth, distance)
 
     if (intensity < lockScreenIntensity) {
-      Log.i(TAG, "跳过触发: 烈度 $intensity < $lockScreenIntensity (mag=${event.magnitude} depth=${event.depth} distance=${distance}km userLat=$userLat userLng=$userLng evtLat=${event.lat} evtLng=${event.lng})")
-      return false
+      return TriggerGateResult(
+        false, intensity, distance, screenLocked = screenLocked,
+        reason = "烈度 $intensity < $lockScreenIntensity (mag=${event.magnitude} depth=${event.depth} distance=${distance}km)"
+      )
     }
 
     val alertLevel = EewAlertEngine.computeAlertLevelByIntensity(intensity)
     if (alertLevel == EewAlertEngine.LEVEL_SILENT) {
-      Log.i(TAG, "跳过触发: 预警级别 silent (intensity=$intensity)")
-      return false
+      return TriggerGateResult(false, intensity, distance, alertLevel, screenLocked = screenLocked, reason = "预警级别 silent")
     }
 
-    // 计算 S 波到达时间（使用真实 arrivalMs，不保底）
     val arrivalMs = EewAlertEngine.computeSWaveArrivalMs(
       event.originTime, event.lat, event.lng, userLat, userLng
     )
-    val remainSec = ((arrivalMs - System.currentTimeMillis()) / 1000.0).toInt()
+    return TriggerGateResult(true, intensity, distance, alertLevel, arrivalMs, screenLocked)
+  }
 
-    Log.i(TAG, "触发预警: mag=${event.magnitude} intensity=$intensity level=$alertLevel remain=${remainSec}s distance=${distance}km")
+  /**
+   * 检查触发条件并触发悬浮窗/锁屏预警（App 不在前台时调用）
+   *
+   * 通过 [evaluateTriggerGate] 做完整阈值校验后，按屏幕状态选择 UI：
+   * - 锁屏 → LockScreenAlertActivity（setShowWhenLocked，可点亮屏幕）
+   * - 不锁屏（后台）→ 悬浮窗 FloatingWindowModule（TYPE_APPLICATION_OVERLAY）
+   *
+   * @param event 解析后的事件
+   * @param sourceName 数据源名称（用于锁屏/悬浮窗显示）
+   * @returns 是否触发成功
+   */
+  private fun tryTriggerFloatingWindow(event: ParsedCencEvent, sourceName: String?): Boolean {
+    val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    val gate = evaluateTriggerGate(event, prefs)
+    if (!gate.passed) {
+      Log.i(TAG, "跳过触发: ${gate.reason}")
+      return false
+    }
 
-    // 根据屏幕状态选择 UI：
-    // - 锁屏 → LockScreenAlertActivity（setShowWhenLocked，可点亮屏幕）
-    // - 不锁屏（后台）→ 悬浮窗 FloatingWindowModule（TYPE_APPLICATION_OVERLAY）
-    if (screenLocked) {
+    val remainSec = ((gate.arrivalMs - System.currentTimeMillis()) / 1000.0).toInt()
+    Log.i(TAG, "触发预警: mag=${event.magnitude} intensity=${gate.intensity} level=${gate.alertLevel} remain=${remainSec}s distance=${gate.distance}km")
+
+    if (gate.screenLocked) {
       Log.i(TAG, "屏幕已锁屏，启动 LockScreenAlertActivity")
-      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs, sourceName)
+      startLockScreenActivity(event, gate.intensity, gate.distance, gate.alertLevel, gate.arrivalMs, sourceName)
     } else {
       Log.i(TAG, "屏幕未锁屏（后台），显示悬浮窗 FloatingWindowModule")
-      showFloatingWindowFromBackground(event, intensity, distance, alertLevel, arrivalMs, sourceName)
+      showFloatingWindowFromBackground(event, gate.intensity, gate.distance, gate.alertLevel, gate.arrivalMs, sourceName)
     }
     return true
   }
@@ -1042,15 +1091,16 @@ class EewBackgroundService : Service() {
   ) {
     val module = ReactContextProvider.floatingWindowModule
     if (module == null) {
-      Log.w(TAG, "FloatingWindowModule 未初始化，回退到 LockScreenAlertActivity")
-      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs, sourceName)
+      // 不回退 LockScreenAlertActivity：本方法仅在「屏幕未锁屏」时被调用，
+      // 未锁屏时启动锁屏 Activity 语义错误且会绕过 lockScreenEnabled（S-2）。
+      Log.w(TAG, "FloatingWindowModule 未初始化，跳过（不回退锁屏 Activity）")
       return
     }
 
     // 检查悬浮窗权限
     if (!Settings.canDrawOverlays(this)) {
-      Log.w(TAG, "无悬浮窗权限（SYSTEM_ALERT_WINDOW），回退到 LockScreenAlertActivity")
-      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs, sourceName)
+      // 无悬浮窗权限 → 跳过（与 JS 层「无权限则不显示」一致），不绕过 lockScreenEnabled 回退锁屏 Activity
+      Log.w(TAG, "无悬浮窗权限（SYSTEM_ALERT_WINDOW），跳过（不回退锁屏 Activity）")
       return
     }
 
@@ -1091,8 +1141,12 @@ class EewBackgroundService : Service() {
         triggerAlertsFromBackground(topEvent)
       }
     } catch (e: Exception) {
-      Log.e(TAG, "显示悬浮窗失败: ${e.message}，回退到 LockScreenAlertActivity")
-      startLockScreenActivity(event, intensity, distance, alertLevel, arrivalMs, sourceName)
+      // 不回退 LockScreenAlertActivity（S-2，与上方 module==null / 无权限两处保持一致）：
+      // 本方法仅在「屏幕未锁屏」时被调用，未锁屏时启动锁屏 Activity 语义错误，
+      // 且会绕过 lockScreenEnabled 造成误弹全屏界面。
+      // 上面已入队的事件需移除，避免残留幽灵事件继续占用后台悬浮窗队列。
+      Log.e(TAG, "显示悬浮窗失败: ${e.message}，跳过（不回退锁屏 Activity）")
+      backgroundEvents.remove(event.eventId)
     }
   }
 
